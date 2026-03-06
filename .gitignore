@@ -25,12 +25,8 @@
 !LICENSE
 !docs/
 docs/*
-!docs/README.md
 !docs/submission_storyteller.md
 !docs/submission_live_agent.md
-!docs/awards.txt
-!docs/rules.txt
-!docs/CONTEST_STRATEGY.md
 !.env.example
 !.dockerignore
 !.gitignore
