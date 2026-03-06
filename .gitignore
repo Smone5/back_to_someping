@@ -22,6 +22,8 @@
 
 # Documentation and config examples
 !README.md
+!LICENSE
+!docs/
 !.env.example
 !.dockerignore
 !.gitignore
