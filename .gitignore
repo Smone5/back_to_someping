@@ -1,0 +1,66 @@
+# ──────────────────────────────────────────────────────────────────────────────
+# Interactive Storyteller — Git Ignore
+# ──────────────────────────────────────────────────────────────────────────────
+
+# Ignore everything by default
+/*
+
+# ── Allow-list (Files and Folders to Keep) ────────────────────────────────────
+
+# Directories
+!agent/
+!backend/
+!frontend/
+!google_terraform/
+!shared/
+
+# Shell scripts
+!deploy-backend.sh
+!deploy-ffmpeg.sh
+!deploy-frontend.sh
+!deploy.sh
+
+# Documentation and config examples
+!README.md
+!.env.example
+!.dockerignore
+!.gitignore
+
+# ── Dependency-specific ignores (Inner Folder Contents) ───────────────────────
+
+# Frontend dependencies and builds
+**/node_modules/
+**/.next/
+**/out/
+**/.vercel/
+frontend/tsconfig.tsbuildinfo
+
+# Python environments and caches
+**/.venv/
+**/venv/
+**/env/
+**/__pycache__/
+**/*.pyc
+**/*.pyo
+**/*.pyd
+.pytest_cache/
+
+# Backend/Agent extras
+backend/output/
+agent/output/
+
+# Terraform local state and vars
+**/.terraform/
+**/*.tfstate
+**/*.tfstate.backup
+**/*.tfvars
+**/*.tfplan
+**/tfplan-*
+
+# ── Environment Secrets (CRITICAL) ───────────────────────────────────────────
+.env
+.env.local
+.env.production
+.env.development
+.env.test
+*.secret

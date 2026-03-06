@@ -1,0 +1,7 @@
+*
+!agent/
+!agent/**
+!backend/
+!backend/**
+!shared/
+!shared/**

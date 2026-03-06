@@ -1,0 +1,141 @@
+{
+  "version": 1,
+  "principles": [
+    {
+      "id": "global-child-safe-storybook-tone",
+      "scope": "all",
+      "category": "safety_tone",
+      "status": "active",
+      "priority": 110,
+      "rule_text": "Keep every beat warm, gentle, and clearly safe for ages 4-5; turn intensity into cozy wonder."
+    },
+    {
+      "id": "interactive-story-carry-forward-anchor",
+      "scope": "interactive_story",
+      "category": "continuity",
+      "status": "active",
+      "priority": 105,
+      "rule_text": "Advance the story one page-turn at a time and name one carry-over anchor from the previous turn out loud."
+    },
+    {
+      "id": "interactive-story-choice-payoff",
+      "scope": "interactive_story",
+      "category": "prompt_grounding",
+      "status": "active",
+      "priority": 100,
+      "rule_text": "Pay off the child's latest choice directly before introducing the next option."
+    },
+    {
+      "id": "interactive-story-character-stability",
+      "scope": "interactive_story",
+      "category": "character_consistency",
+      "status": "active",
+      "priority": 95,
+      "rule_text": "Keep names, sidekicks, signature props, and goals stable unless the child explicitly changes them."
+    },
+    {
+      "id": "interactive-story-page-clarity",
+      "scope": "interactive_story",
+      "category": "composition_clarity",
+      "status": "active",
+      "priority": 90,
+      "rule_text": "Favor one clear focal action and one memorable prop per beat so each scene feels like a readable storybook page."
+    },
+    {
+      "id": "interactive-visual-continuity",
+      "scope": "interactive_scene_visual",
+      "category": "continuity",
+      "status": "active",
+      "priority": 105,
+      "rule_text": "Keep the hero, sidekick, palette, anchor prop, and setting progression aligned with prior approved scenes."
+    },
+    {
+      "id": "interactive-visual-grounding",
+      "scope": "interactive_scene_visual",
+      "category": "prompt_grounding",
+      "status": "active",
+      "priority": 100,
+      "rule_text": "Show the exact requested story beat with a single clear focal action instead of adding unrelated spectacle."
+    },
+    {
+      "id": "interactive-visual-no-text",
+      "scope": "interactive_scene_visual",
+      "category": "no_text",
+      "status": "active",
+      "priority": 98,
+      "rule_text": "Never generate readable overlay text, labels, logos, captions, signatures, or watermarks inside the illustration; subtle unreadable page texture is acceptable."
+    },
+    {
+      "id": "interactive-visual-style-lock",
+      "scope": "interactive_scene_visual",
+      "category": "style_consistency",
+      "status": "active",
+      "priority": 92,
+      "rule_text": "Stay in a warm hand-drawn 2D storybook style; avoid photorealism, glossy 3D, or Pixar-like rendering."
+    },
+    {
+      "id": "storyboard-review-continuity",
+      "scope": "storyboard_review",
+      "category": "continuity",
+      "status": "active",
+      "priority": 102,
+      "rule_text": "Judge each still against its neighboring scenes for character identity, props, and location progression."
+    },
+    {
+      "id": "storyboard-review-grounding",
+      "scope": "storyboard_review",
+      "category": "prompt_grounding",
+      "status": "active",
+      "priority": 99,
+      "rule_text": "Flag scenes that miss their intended narration beat even if the image is otherwise attractive."
+    },
+    {
+      "id": "storyboard-review-no-text",
+      "scope": "storyboard_review",
+      "category": "no_text",
+      "status": "active",
+      "priority": 96,
+      "rule_text": "Treat clearly readable text, logos, labels, signatures, and watermarks as real storyboard defects, but do not fail a scene for tiny unreadable book-page texture or decorative glyphs."
+    },
+    {
+      "id": "storyboard-review-child-safety",
+      "scope": "storyboard_review",
+      "category": "safety_tone",
+      "status": "active",
+      "priority": 94,
+      "rule_text": "Reject imagery that feels scary, harsh, or tonally too intense for a cozy read-aloud storybook."
+    },
+    {
+      "id": "storyboard-repair-preserve-beat",
+      "scope": "storyboard_repair",
+      "category": "prompt_grounding",
+      "status": "active",
+      "priority": 103,
+      "rule_text": "Repair only the flagged defect while preserving the original scene's intended story beat."
+    },
+    {
+      "id": "storyboard-repair-adjacent-continuity",
+      "scope": "storyboard_repair",
+      "category": "continuity",
+      "status": "active",
+      "priority": 100,
+      "rule_text": "Use adjacent scenes as continuity anchors so repaired stills do not create new drift."
+    },
+    {
+      "id": "storyboard-repair-character-lock",
+      "scope": "storyboard_repair",
+      "category": "character_consistency",
+      "status": "active",
+      "priority": 98,
+      "rule_text": "Preserve character silhouette, clothing colors, sidekick design, and recurring props from approved scenes."
+    },
+    {
+      "id": "storyboard-repair-no-text",
+      "scope": "storyboard_repair",
+      "category": "no_text",
+      "status": "active",
+      "priority": 95,
+      "rule_text": "Repair away any clearly readable text, labels, logos, captions, signatures, or watermarks while preserving subtle non-readable storybook texture."
+    }
+  ]
+}

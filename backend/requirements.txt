@@ -1,0 +1,26 @@
+# Google Cloud & ADK
+google-adk[live]>=1.0.0
+google-cloud-aiplatform>=1.70.0
+google-cloud-storage>=2.18.0
+google-cloud-firestore>=2.16.0
+google-cloud-texttospeech>=2.16.3
+google-auth>=2.29.0
+google-auth-httplib2>=0.2.0
+
+# FastAPI & web server
+fastapi>=0.115.0
+uvicorn[standard]>=0.30.0
+websockets>=12.0
+
+# Pydantic & settings
+pydantic>=2.7.0
+pydantic-settings>=2.3.0
+
+# Async HTTP (for Veo, Home Assistant, Cloud Run Jobs)
+httpx>=0.27.0
+
+# Retry logic for Veo 503s (Iter 7 #5)
+tenacity>=8.4.0
+
+# Image compression
+Pillow>=10.0.0
