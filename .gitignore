@@ -23,10 +23,6 @@
 # Documentation and config examples
 !README.md
 !LICENSE
-!docs/
-docs/*
-!docs/submission_storyteller.md
-!docs/submission_live_agent.md
 !.env.example
 !.dockerignore
 !.gitignore
