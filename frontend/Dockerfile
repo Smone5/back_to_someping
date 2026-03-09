@@ -5,6 +5,8 @@ RUN npm ci
 
 FROM node:20-alpine AS builder
 WORKDIR /app
+ARG NEXT_PUBLIC_REQUIRE_MATH=false
+ENV NEXT_PUBLIC_REQUIRE_MATH=${NEXT_PUBLIC_REQUIRE_MATH}
 COPY --from=deps /app/node_modules ./node_modules
 COPY . .
 RUN npm run build
@@ -13,6 +15,7 @@ FROM node:20-alpine AS runner
 WORKDIR /app
 
 ENV NODE_ENV=production \
+    NEXT_PUBLIC_REQUIRE_MATH=false \
     PORT=8080 \
     HOSTNAME=0.0.0.0
 

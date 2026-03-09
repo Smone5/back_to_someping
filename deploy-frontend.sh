@@ -6,12 +6,18 @@ PROJECT="interactive-story-gemini"
 REGION="us-central1"
 TAG="${1:-$(date +%Y%m%d-%H%M%S)}"
 FRONTEND_IMAGE="gcr.io/$PROJECT/storyteller-frontend:$TAG"
+REQUIRE_MATH="${NEXT_PUBLIC_REQUIRE_MATH:-false}"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 
 echo "🔨 Building frontend ($TAG)..."
-docker build --platform linux/amd64 -t "$FRONTEND_IMAGE" -f frontend/Dockerfile frontend/
+docker build \
+  --platform linux/amd64 \
+  --build-arg NEXT_PUBLIC_REQUIRE_MATH="$REQUIRE_MATH" \
+  -t "$FRONTEND_IMAGE" \
+  -f frontend/Dockerfile \
+  frontend/
 echo "📤 Pushing frontend..."
 docker push "$FRONTEND_IMAGE"
 echo "🚀 Deploying frontend to Cloud Run..."

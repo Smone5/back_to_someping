@@ -11,8 +11,8 @@ const inter = Inter({
 export const metadata: Metadata = {
     title: 'Back to Some-ping, back to Dody Land!',
     description:
-        'An AI-powered interactive storytelling experience for young children. Tell your story, build your world, watch your movie!',
-    keywords: ['kids stories', 'interactive AI', 'storytelling', 'children', 'educational'],
+        'A voice-first AI picture-storytelling experience for young children. Imagine, create, tell, and watch the storybook movie.',
+    keywords: ['kids stories', 'interactive AI', 'storytelling', 'children', 'educational', 'picture stories', 'early literacy'],
     authors: [{ name: 'Back to Some-ping, back to Dody Land!' }],
     robots: 'noindex, nofollow', // Private app — no public indexing (COPPA)
     manifest: '/manifest.json',

@@ -42,6 +42,14 @@
       "rule_text": "Favor one clear focal action and one memorable prop per beat so each scene feels like a readable storybook page."
     },
     {
+      "id": "interactive-story-no-default-rainbows",
+      "scope": "interactive_story",
+      "category": "prompt_grounding",
+      "status": "active",
+      "priority": 88,
+      "rule_text": "Do not default to rainbow imagery, rainbow arches, or rainbow sparkles unless the child or current story beat explicitly asks for them."
+    },
+    {
       "id": "interactive-visual-continuity",
       "scope": "interactive_scene_visual",
       "category": "continuity",
@@ -63,7 +71,7 @@
       "category": "no_text",
       "status": "active",
       "priority": 98,
-      "rule_text": "Never generate readable overlay text, labels, logos, captions, signatures, or watermarks inside the illustration; subtle unreadable page texture is acceptable."
+      "rule_text": "Never generate readable overlay text, labels, logos, captions, signatures, or watermarks inside the illustration; subtle page texture, isolated alphabet motifs, and short diegetic book markings are acceptable when physically part of a book-centric scene."
     },
     {
       "id": "interactive-visual-style-lock",
@@ -72,6 +80,14 @@
       "status": "active",
       "priority": 92,
       "rule_text": "Stay in a warm hand-drawn 2D storybook style; avoid photorealism, glossy 3D, or Pixar-like rendering."
+    },
+    {
+      "id": "interactive-visual-no-default-rainbows",
+      "scope": "interactive_scene_visual",
+      "category": "prompt_grounding",
+      "status": "active",
+      "priority": 91,
+      "rule_text": "Do not add rainbow arches, rainbow color bands, or rainbow effects unless the child or current scene explicitly calls for them."
     },
     {
       "id": "storyboard-review-continuity",
@@ -95,7 +111,7 @@
       "category": "no_text",
       "status": "active",
       "priority": 96,
-      "rule_text": "Treat clearly readable text, logos, labels, signatures, and watermarks as real storyboard defects, but do not fail a scene for tiny unreadable book-page texture or decorative glyphs."
+      "rule_text": "Treat clearly readable overlay text, logos, labels, signatures, captions, UI, and watermarks as storyboard defects, but do not fail a scene for tiny book-page texture, decorative glyphs, isolated letters, short alphabet clusters, or book-spine/page markings that are physically embedded in a book-centric illustration."
     },
     {
       "id": "storyboard-review-child-safety",
@@ -135,7 +151,7 @@
       "category": "no_text",
       "status": "active",
       "priority": 95,
-      "rule_text": "Repair away any clearly readable text, labels, logos, captions, signatures, or watermarks while preserving subtle non-readable storybook texture."
+      "rule_text": "Repair away clearly readable overlay text, labels, logos, captions, signatures, UI, or watermarks while preserving subtle storybook texture and any diegetic alphabet/page markings that belong inside a book-centric scene."
     }
   ]
 }

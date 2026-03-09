@@ -16,6 +16,10 @@ from google.adk.agents import LlmAgent
 from google.adk.agents.readonly_context import ReadonlyContext
 from google.adk.agents.run_config import RunConfig, StreamingMode
 from google.adk.apps import App
+try:
+    from google.adk.apps.app import ResumabilityConfig
+except Exception:  # pragma: no cover - older ADK versions
+    ResumabilityConfig = None
 from google.adk.tools import FunctionTool
 from google.adk.tools.mcp_tool import McpToolset, StdioConnectionParams, SseConnectionParams
 from google.adk.utils import instructions_utils
@@ -41,6 +45,30 @@ def _env_enabled(name: str, default: bool = False) -> bool:
     if raw is None:
         return default
     return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _env_float(name: str, default: float, minimum: float, maximum: float) -> float:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    try:
+        value = float(raw)
+    except Exception:
+        return default
+    return max(minimum, min(maximum, value))
+
+
+def _using_vertex_ai_backend() -> bool:
+    raw = os.environ.get("GOOGLE_GENAI_USE_VERTEXAI")
+    if raw is None:
+        return False
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _default_live_model() -> str:
+    if _using_vertex_ai_backend():
+        return "gemini-live-2.5-flash-native-audio"
+    return "gemini-2.5-flash-native-audio-preview-12-2025"
 
 
 async def _storyteller_instruction(context: ReadonlyContext) -> str:
@@ -93,7 +121,7 @@ from google.adk.agents.run_config import RunConfig, StreamingMode, ToolThreadPoo
 # ── RunConfig ──────────────────────────────────────────────────────────────────
 # StreamingMode.BIDI required for full-duplex "Bidi-streaming" interaction.
 # response_modalities=["AUDIO"] required for native audio model voice output.
-run_config = RunConfig(
+_run_config_kwargs = dict(
     streaming_mode=StreamingMode.BIDI,
     response_modalities=[genai_types.Modality.AUDIO],  # Required for Gemini native audio voice output
     input_audio_transcription=genai_types.AudioTranscriptionConfig(),
@@ -123,13 +151,36 @@ run_config = RunConfig(
         )
     )
 )
+_session_resumption_config_cls = getattr(genai_types, "SessionResumptionConfig", None)
+_session_resumption_config = None
+if _using_vertex_ai_backend() and _session_resumption_config_cls is not None:
+    try:
+        _session_resumption_config = _session_resumption_config_cls(transparent=True)
+    except TypeError:
+        try:
+            _session_resumption_config = _session_resumption_config_cls()
+        except Exception:
+            _session_resumption_config = None
+
+if _session_resumption_config is not None:
+    try:
+        run_config = RunConfig(
+            **_run_config_kwargs,
+            session_resumption=_session_resumption_config,
+        )
+    except TypeError:
+        run_config = RunConfig(**_run_config_kwargs)
+else:
+    run_config = RunConfig(**_run_config_kwargs)
 
 # ── Root Agent ─────────────────────────────────────────────────────────────────
 # Use an explicit, known-live model by default; allow override via env.
 _live_model = os.environ.get(
     "STORYTELLER_LIVE_MODEL",
-    "gemini-2.5-flash-native-audio-preview-12-2025",
-).strip() or "gemini-2.5-flash-native-audio-preview-12-2025"
+    _default_live_model(),
+).strip() or _default_live_model()
+_live_temperature = _env_float("STORYTELLER_LIVE_TEMPERATURE", 0.82, 0.1, 1.5)
+_live_top_p = _env_float("STORYTELLER_LIVE_TOP_P", 0.9, 0.1, 1.0)
 # gemini-2.5-flash-native-audio-preview-12-2025 supports native TTS text-to-speech
 storyteller_agent = LlmAgent(
     name="interactive_storyteller",
@@ -148,10 +199,21 @@ storyteller_agent = LlmAgent(
         thinking_config=genai_types.ThinkingConfig(
             include_thoughts=False
         ),
-        temperature=1.0,   # High creativity for imaginative storytelling
-        top_p=0.95,
+        # Keep responses imaginative, but slightly tighter and more stable for live turn-taking.
+        temperature=_live_temperature,
+        top_p=_live_top_p,
     ),
 )
 
 # ADK app container wrapper for production runtime scope and tooling integration.
-app = App(name="storyteller", root_agent=storyteller_agent)
+_app_kwargs = dict(name="storyteller", root_agent=storyteller_agent)
+if ResumabilityConfig is not None:
+    try:
+        app = App(
+            **_app_kwargs,
+            resumability_config=ResumabilityConfig(is_resumable=True),
+        )
+    except TypeError:
+        app = App(**_app_kwargs)
+else:
+    app = App(**_app_kwargs)

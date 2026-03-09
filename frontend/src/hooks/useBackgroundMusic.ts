@@ -8,6 +8,7 @@ export function useBackgroundMusic() {
     const ctxRef = useRef<AudioContext | null>(null);
     const masterGainRef = useRef<GainNode | null>(null);
     const filterRef = useRef<BiquadFilterNode | null>(null);
+    const highpassRef = useRef<BiquadFilterNode | null>(null);
     const intervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
     const activeOscillatorsRef = useRef<OscillatorNode[]>([]);
     const stepRef = useRef(0);
@@ -15,19 +16,48 @@ export function useBackgroundMusic() {
     const lastIntensityRef = useRef(5);
     const lastMoodChangeAtRef = useRef(0);
     const lastTickAtRef = useRef(0);
+    const musicEnabledRef = useRef(true);
     const resetInProgressRef = useRef(false);
+    const bedGainRef = useRef(0);
+    const listeningFocusRef = useRef(false);
     const MIN_MOOD_HOLD_MS = 7000;
+
+    const applyVoicing = useCallback((ctx: AudioContext, rampSeconds = 0.18) => {
+        const master = masterGainRef.current;
+        const lowpass = filterRef.current;
+        const highpass = highpassRef.current;
+        if (!master || !lowpass || !highpass) return;
+
+        const focusMultiplier = listeningFocusRef.current ? 0.2 : 1;
+        const targetGain = musicEnabledRef.current ? bedGainRef.current * focusMultiplier : 0;
+        const targetLowpass = listeningFocusRef.current ? 820 : 1400;
+        const targetHighpass = listeningFocusRef.current ? 180 : 120;
+
+        master.gain.cancelScheduledValues(ctx.currentTime);
+        master.gain.setTargetAtTime(targetGain, ctx.currentTime, rampSeconds);
+
+        lowpass.frequency.cancelScheduledValues(ctx.currentTime);
+        lowpass.frequency.setTargetAtTime(targetLowpass, ctx.currentTime, rampSeconds);
+
+        highpass.frequency.cancelScheduledValues(ctx.currentTime);
+        highpass.frequency.setTargetAtTime(targetHighpass, ctx.currentTime, rampSeconds);
+    }, []);
 
     const ensureContext = useCallback(async () => {
         if (!ctxRef.current) {
             ctxRef.current = new AudioContext();
             masterGainRef.current = ctxRef.current.createGain();
             masterGainRef.current.gain.value = 0.0;
+            highpassRef.current = ctxRef.current.createBiquadFilter();
+            highpassRef.current.type = 'highpass';
+            highpassRef.current.frequency.value = 120;
+            highpassRef.current.Q.value = 0.5;
             filterRef.current = ctxRef.current.createBiquadFilter();
             filterRef.current.type = 'lowpass';
             filterRef.current.frequency.value = 1400;
             filterRef.current.Q.value = 0.7;
-            masterGainRef.current.connect(filterRef.current);
+            masterGainRef.current.connect(highpassRef.current);
+            highpassRef.current.connect(filterRef.current);
             filterRef.current.connect(ctxRef.current.destination);
         }
         if (ctxRef.current.state === 'suspended') {
@@ -77,6 +107,7 @@ export function useBackgroundMusic() {
             masterGainRef.current.gain.cancelScheduledValues(ctxRef.current.currentTime);
             masterGainRef.current.gain.setValueAtTime(0.0, ctxRef.current.currentTime);
         }
+        bedGainRef.current = 0;
         lastTickAtRef.current = 0;
     }, []);
 
@@ -93,23 +124,33 @@ export function useBackgroundMusic() {
         }
         ctxRef.current = null;
         masterGainRef.current = null;
+        highpassRef.current = null;
         filterRef.current = null;
         resetInProgressRef.current = false;
     }, [stopMusic]);
 
     const setMusicMood = useCallback(async (mood: Mood, intensity: number = 5) => {
+        const previousMood = lastMoodRef.current;
+        const previousIntensity = lastIntensityRef.current;
+        if (!musicEnabledRef.current) {
+            lastMoodRef.current = mood;
+            lastIntensityRef.current = intensity;
+            stopMusic();
+            return;
+        }
+
         const now = performance.now();
         if (
-            lastMoodRef.current === mood &&
-            lastIntensityRef.current === intensity &&
+            previousMood === mood &&
+            previousIntensity === intensity &&
             intervalRef.current
         ) {
             return;
         }
         if (
             intervalRef.current &&
-            lastMoodRef.current &&
-            mood !== lastMoodRef.current &&
+            previousMood &&
+            mood !== previousMood &&
             now - lastMoodChangeAtRef.current < MIN_MOOD_HOLD_MS
         ) {
             return;
@@ -125,9 +166,8 @@ export function useBackgroundMusic() {
         const normalizedIntensity = Math.max(1, Math.min(10, intensity));
         // Louder bed so music is audible under narration on mobile/tablet speakers.
         const bedGain = Math.min(0.16, 0.04 + normalizedIntensity * 0.012);
-        const master = masterGainRef.current!;
-        master.gain.cancelScheduledValues(ctx.currentTime);
-        master.gain.linearRampToValueAtTime(bedGain, ctx.currentTime + 0.25);
+        bedGainRef.current = bedGain;
+        applyVoicing(ctx, 0.25);
 
         if (mood === 'suspenseful') {
             const droneA = ctx.createOscillator();
@@ -140,7 +180,7 @@ export function useBackgroundMusic() {
             droneGain.gain.value = bedGain * 0.5;
             droneA.connect(droneGain);
             droneB.connect(droneGain);
-            droneGain.connect(master);
+            droneGain.connect(masterGainRef.current!);
             droneA.start();
             droneB.start();
             activeOscillatorsRef.current.push(droneA, droneB);
@@ -183,9 +223,10 @@ export function useBackgroundMusic() {
             }
             stepRef.current += 1;
         }, selected.ms);
-    }, [ensureContext, playOneShot, stopMusic]);
+    }, [applyVoicing, ensureContext, playOneShot, stopMusic]);
 
     const reviveMusic = useCallback(async () => {
+        if (!musicEnabledRef.current) return;
         if (!ctxRef.current) return;
         if (ctxRef.current.state === 'suspended') {
             await ctxRef.current.resume();
@@ -207,6 +248,10 @@ export function useBackgroundMusic() {
         document.addEventListener('visibilitychange', onVisibility);
         document.addEventListener('pointerdown', onPointer);
         const watchdog = window.setInterval(() => {
+            if (!musicEnabledRef.current) {
+                stopMusic();
+                return;
+            }
             const now = performance.now();
             if (document.visibilityState !== 'visible') {
                 return;
@@ -234,7 +279,7 @@ export function useBackgroundMusic() {
             document.removeEventListener('pointerdown', onPointer);
             window.clearInterval(watchdog);
         };
-    }, [hardReset, reviveMusic, setMusicMood]);
+    }, [hardReset, reviveMusic, setMusicMood, stopMusic]);
 
     useEffect(() => {
         return () => {
@@ -245,5 +290,25 @@ export function useBackgroundMusic() {
         };
     }, [stopMusic]);
 
-    return { setMusicMood, stopMusic };
+    const setMusicEnabled = useCallback((enabled: boolean) => {
+        musicEnabledRef.current = enabled;
+        if (!enabled) {
+            stopMusic();
+            return;
+        }
+        if (lastMoodRef.current) {
+            void setMusicMood(lastMoodRef.current, lastIntensityRef.current);
+        }
+    }, [setMusicMood, stopMusic]);
+
+    const setListeningFocus = useCallback((focused: boolean) => {
+        listeningFocusRef.current = focused;
+        if (ctxRef.current) {
+            void ensureContext().then((ctx) => {
+                applyVoicing(ctx, 0.12);
+            });
+        }
+    }, [applyVoicing, ensureContext]);
+
+    return { setMusicMood, stopMusic, setMusicEnabled, setListeningFocus };
 }

@@ -19,6 +19,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import base64
+import html
 import json
 import logging
 import os
@@ -50,6 +51,35 @@ if str(_IMPORT_ROOT) not in sys.path:
     sys.path.insert(0, str(_IMPORT_ROOT))
 
 from shared.meta_learning import build_principles_injection_text, record_prompt_feedback
+from shared.storybook_assembly_workflow import (
+    build_storyboard_report_from_workflow_state,
+    run_storybook_director_workflow,
+)
+from shared.storybook_movie_quality import (
+    BURNED_CAPTIONS_DEFAULT,
+    PAGE_SECONDS_DEFAULT,
+    PAGE_SECONDS_NARRATION_BUFFER,
+    StoryboardShotPlan,
+    child_age_band,
+    clamp_music_volume,
+    clamp_narration_volume,
+    clamp_page_seconds,
+    clamp_sfx_cooldown_pages,
+    clamp_sfx_max,
+    clamp_sfx_volume,
+    motion_profile,
+    motion_timing,
+    narration_max_words_for_age,
+    narration_required_default,
+    plan_storyboard_shots,
+    storybook_release_gate,
+)
+from shared.storybook_pages import story_pages_from_state_data
+from shared.storybook_studio_workflow import (
+    build_storybook_studio_plan_from_workflow_state,
+    build_storybook_studio_summary,
+    run_storybook_studio_workflow,
+)
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
@@ -60,6 +90,7 @@ PROJECT = os.environ.get("GOOGLE_CLOUD_PROJECT", "")
 FIRESTORE_DATABASE = os.environ.get("FIRESTORE_DATABASE", "(default)")
 DEFAULT_VERTEX_TEXT_MODEL = "gemini-2.5-flash"
 DEFAULT_VERTEX_IMAGE_MODEL = "gemini-2.0-flash-preview-image-generation"
+DEFAULT_ELEVENLABS_VOICE_ID = "JBFqnCBsd6RMkjVDRZzb"
 _ELEVENLABS_TTS_DISABLED_REASON: str | None = None
 _ELEVENLABS_AUDIO_DISABLED_REASON: str | None = None
 
@@ -77,6 +108,192 @@ def _env_enabled(name: str, default: bool = False) -> bool:
     if raw is None:
         return default
     return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _storybook_studio_enabled() -> bool:
+    return _env_enabled("ENABLE_STORYBOOK_STUDIO_WORKFLOW", default=True)
+
+
+def _storybook_studio_max_revisions() -> int:
+    return _clamp_int(os.environ.get("STORYBOOK_STUDIO_MAX_REVISIONS", "1"), 1, 0, 2)
+
+
+async def _run_storybook_studio_async(
+    *,
+    session_id: str,
+    title: str,
+    child_name: str,
+    child_age: int | str | None,
+    story_summary: str,
+    scene_descriptions: list[str],
+    scene_count: int,
+    max_music_cues: int,
+    max_sfx_cues: int,
+    fallback_narration_lines: list[str] | None = None,
+) -> dict[str, Any]:
+    workflow_state = await run_storybook_studio_workflow(
+        session_id=session_id,
+        initial_state={
+            "story_title": title,
+            "child_name": child_name or "friend",
+            "child_age": child_age or 4,
+            "child_age_band": child_age_band(child_age),
+            "story_summary": story_summary or "No summary available.",
+            "studio_scene_count": max(0, int(scene_count)),
+            "scene_descriptions_json": json.dumps(scene_descriptions, ensure_ascii=True),
+            "studio_max_music_cues": max(0, int(max_music_cues)),
+            "studio_max_sfx_cues": max(0, int(max_sfx_cues)),
+        },
+        max_revision_rounds=_storybook_studio_max_revisions(),
+    )
+    return build_storybook_studio_plan_from_workflow_state(
+        workflow_state,
+        scene_count=scene_count,
+        fallback_narration_lines=fallback_narration_lines,
+    )
+
+
+def _apply_storybook_mix_guidance(
+    guidance: dict[str, Any] | None,
+    *,
+    narration_volume: float,
+    music_volume: float,
+    sfx_volume: float,
+    enable_ducking: bool,
+) -> tuple[float, float, float, bool]:
+    guidance = dict(guidance or {})
+    try:
+        narration_volume = clamp_narration_volume(guidance.get("narration_volume", narration_volume))
+    except Exception:
+        pass
+    try:
+        music_volume = clamp_music_volume(guidance.get("music_volume", music_volume))
+    except Exception:
+        pass
+    try:
+        sfx_volume = clamp_sfx_volume(guidance.get("sfx_volume", sfx_volume))
+    except Exception:
+        pass
+    ducking = str(guidance.get("ducking") or "").strip().lower()
+    if ducking == "off":
+        enable_ducking = False
+    elif ducking in {"strong", "medium", "light"}:
+        enable_ducking = True
+    return narration_volume, music_volume, sfx_volume, enable_ducking
+
+
+def _storybook_burned_captions_enabled() -> bool:
+    return _env_enabled("ENABLE_STORYBOOK_CAPTIONS", default=BURNED_CAPTIONS_DEFAULT)
+
+
+def _storybook_music_provider() -> str:
+    raw = os.environ.get("STORYBOOK_MUSIC_PROVIDER", "auto").strip().lower()
+    if raw in {"auto", "lyria", "elevenlabs", "off"}:
+        return raw
+    return "auto"
+
+
+def _storybook_sfx_provider() -> str:
+    raw = os.environ.get("STORYBOOK_SFX_PROVIDER", "auto").strip().lower()
+    if raw in {"auto", "elevenlabs", "off"}:
+        return raw
+    return "auto"
+
+
+def _normalize_story_tone(raw: Any) -> str:
+    text = str(raw or "").strip().lower().replace("-", "_").replace(" ", "_")
+    alias_map = {
+        "": "cozy",
+        "cozy": "cozy",
+        "gentle": "gentle_spooky",
+        "gentle_spooky": "gentle_spooky",
+        "soft_spooky": "gentle_spooky",
+        "spooky": "gentle_spooky",
+        "adventure": "adventure_spooky",
+        "adventure_spooky": "adventure_spooky",
+        "brave_spooky": "adventure_spooky",
+    }
+    normalized = alias_map.get(text, text)
+    if normalized in {"cozy", "gentle_spooky", "adventure_spooky"}:
+        return normalized
+    return "cozy"
+
+
+def _story_tone_art_guidance(story_tone: str) -> str:
+    tone = _normalize_story_tone(story_tone)
+    if tone == "gentle_spooky":
+        return (
+            "Allow gentle spooky preschool mystery like moonlit forests, creaky towers, silly goblins, "
+            "friendly dragons, glowing caves, and magical shadows, but keep visible safety, warmth, and quick reassurance."
+        )
+    if tone == "adventure_spooky":
+        return (
+            "Allow a slightly bolder preschool fantasy adventure with brave castle towers, magical storms, "
+            "shadowy paths, and suspenseful discoveries, but keep it hopeful, age 4 safe, and never horrifying."
+        )
+    return "Keep the art fully cozy, bright, warm, and never spooky."
+
+
+def _story_tone_veo_negative_prompt(story_tone: str) -> str:
+    tone = _normalize_story_tone(story_tone)
+    if tone == "cozy":
+        return "scary, horror, violent, creepy, threatening monsters, dark menace, text, logos"
+    return "horror, jump scares, violent, gore, nightmare imagery, realistic menace, text, logos"
+
+
+def _lyria_negative_prompt() -> str:
+    return (
+        "vocals, lyrics, singing, speech, chanting, harsh, abrasive, "
+        "distorted noise, horror, jump scares, aggressive percussion"
+    )
+
+
+def _lyria_generate_music_sync(
+    prompt: str,
+    seed: int | None = None,
+) -> tuple[bytes, str] | None:
+    if not PROJECT or not prompt:
+        return None
+    location = os.environ.get("GOOGLE_CLOUD_LOCATION", "us-central1").strip() or "us-central1"
+    creds, _ = google.auth.default(scopes=["https://www.googleapis.com/auth/cloud-platform"])
+    auth_req = google.auth.transport.requests.Request()
+    creds.refresh(auth_req)
+
+    endpoint = (
+        f"https://{location}-aiplatform.googleapis.com/v1/projects/{PROJECT}/locations/{location}/"
+        "publishers/google/models/lyria-002:predict"
+    )
+    instance: dict[str, Any] = {
+        "prompt": prompt[:1200],
+        "negative_prompt": _lyria_negative_prompt(),
+    }
+    if seed is not None:
+        instance["seed"] = int(seed)
+    payload = {"instances": [instance], "parameters": {}}
+    try:
+        resp = httpx.post(
+            endpoint,
+            headers={
+                "Authorization": f"Bearer {creds.token}",
+                "Content-Type": "application/json",
+            },
+            json=payload,
+            timeout=90,
+        )
+        resp.raise_for_status()
+        predictions = list(resp.json().get("predictions", []) or [])
+        if not predictions:
+            return None
+        first = dict(predictions[0] or {})
+        audio_b64 = str(first.get("audioContent") or first.get("bytesBase64Encoded") or "").strip()
+        if not audio_b64:
+            return None
+        mime_type = str(first.get("mimeType", "audio/wav")).strip().lower()
+        suffix = ".wav" if "wav" in mime_type else ".bin"
+        return base64.b64decode(audio_b64), suffix
+    except Exception as exc:
+        logger.warning("Lyria music generation failed: %s", exc)
+        return None
 
 
 def _clamp_int(value: str, default: int, minimum: int, maximum: int) -> int:
@@ -383,6 +600,7 @@ def _review_storyboard_pass(
     child_name: str,
     still_paths: list[Path],
     direction: str,
+    story_tone: str = "cozy",
 ) -> dict[str, Any] | None:
     if not PROJECT or not still_paths:
         return None
@@ -426,9 +644,11 @@ Story summary:
 Review goals:
 - Keep character appearance, props, sidekicks, and locations temporally coherent.
 - Make sure each still matches its own scene description and does not contradict adjacent scenes.
-- Keep the art gentle, G-rated, warm, and book-like for ages 4-5.
+- Keep the art G-rated and book-like for ages 4-5. {_story_tone_art_guidance(story_tone)}
 - Reject clearly readable overlay text, logos, labels, signatures, UI text, or watermarks.
-- Ignore tiny unreadable book-page texture, abstract glyphs, and decorative letter-like motifs unless they are prominent and child-readable.
+- Ignore tiny unreadable book-page texture, abstract glyphs, and decorative letter-like motifs unless they are prominent and clearly pasted on top of the art.
+- If a scene is intentionally book-centric (libraries, pages, alphabet rivers, floating words, magical letters, book spines), treat isolated letters, short alphabet clusters like "A B C", spine markings, and page callouts as valid diegetic story elements unless they look like subtitles, UI, modern branding, signatures, or watermark text layered over the illustration.
+- Do not fail a strong storybook scene only because a few readable letters are physically embedded in books, pages, tiles, stars, or magical language effects.
 - Only flag scenes that truly need regeneration and are worth the repair cost.
 
 Return JSON only in this schema:
@@ -489,6 +709,7 @@ def _generate_repaired_story_still(
     previous_image_bytes: bytes | None,
     hero_anchor_description: str,
     hero_anchor_image_bytes: bytes | None,
+    story_tone: str = "cozy",
 ) -> bytes | None:
     if not PROJECT:
         return None
@@ -523,11 +744,14 @@ Continuity anchors:
 
 Rules:
 - Hand-drawn, painterly 2D storybook look.
-- Warm, gentle, child-safe, reading-rainbow-style read-aloud energy.
+- Preschool-safe, classic read-aloud storybook energy. {_story_tone_art_guidance(story_tone)}
 - Keep character identity, clothing, colors, props, and setting progression coherent.
 - Preserve the scene's intended story beat.
+- Do not introduce rainbow arches, rainbow color bands, or rainbow effects unless the scene description explicitly calls for them.
 - No readable text, logos, labels, captions, signatures, or watermarks.
 - Decorative storybook marks or unreadable page texture are acceptable only if they stay subtle and non-dominant.
+- Diegetic letters, page markings, and magical word motifs are acceptable when the scene is explicitly about books or language.
+- Preserve isolated letters, short alphabet clusters, book-spine marks, and page details when they are physically part of the scene; only remove text that reads like overlays, captions, UI, signatures, branding, or watermarks pasted on top of the art.
 """.strip()
 
     contents: list[Any] = [prompt]
@@ -561,11 +785,13 @@ Rules:
 
 
 async def _review_and_refine_storyboard(
+    session_id: str,
     scene_descriptions: list[str],
     story_summary: str,
     child_name: str,
     still_paths: list[Path],
     tmp: Path,
+    story_tone: str = "cozy",
 ) -> tuple[list[Path], dict[str, Any]]:
     report: dict[str, Any] = {
         "status": "skipped",
@@ -590,6 +816,7 @@ async def _review_and_refine_storyboard(
             child_name=child_name,
             still_paths=refined_paths,
             direction="FORWARD",
+            story_tone=story_tone,
         )
         backward_review = _review_storyboard_pass(
             scene_descriptions=scene_descriptions,
@@ -597,6 +824,7 @@ async def _review_and_refine_storyboard(
             child_name=child_name,
             still_paths=refined_paths,
             direction="BACKWARD",
+            story_tone=story_tone,
         )
         merged = _merge_storyboard_reviews(
             [("FORWARD", forward_review), ("BACKWARD", backward_review)],
@@ -629,12 +857,14 @@ async def _review_and_refine_storyboard(
             ),
             issues=feedback_issues,
             prompt_text=story_summary or " | ".join(scene_descriptions[:4]),
+            session_id=session_id,
             metadata={
                 "pass": pass_index,
                 "fix_count": len(actionable_fixes),
                 "warning_count": len(warning_fixes),
                 "global_feedback": merged.get("global_feedback", [])[:3],
             },
+            force_log=True,
         )
         if feedback_issues:
             record_prompt_feedback(
@@ -642,6 +872,7 @@ async def _review_and_refine_storyboard(
                 outcome="movie_review_fix_required",
                 issues=feedback_issues,
                 prompt_text=story_summary or " | ".join(scene_descriptions[:4]),
+                session_id=session_id,
                 metadata={
                     "source": "storyboard_review",
                     "pass": pass_index,
@@ -653,6 +884,7 @@ async def _review_and_refine_storyboard(
                 outcome="movie_review_fix_required",
                 issues=feedback_issues,
                 prompt_text=story_summary or " | ".join(scene_descriptions[:4]),
+                session_id=session_id,
                 metadata={
                     "source": "storyboard_review",
                     "pass": pass_index,
@@ -709,6 +941,7 @@ async def _review_and_refine_storyboard(
                 previous_image_bytes=previous_image_bytes,
                 hero_anchor_description=hero_anchor_description,
                 hero_anchor_image_bytes=hero_anchor_image_bytes,
+                story_tone=story_tone,
             )
             if not repaired_bytes:
                 record_prompt_feedback(
@@ -716,6 +949,7 @@ async def _review_and_refine_storyboard(
                     outcome="repair_failed",
                     issues=[str(fix.get("issue") or fix.get("repair_prompt") or "").strip()],
                     prompt_text=current_desc,
+                    session_id=session_id,
                     metadata={
                         "pass": pass_index,
                         "scene_index": idx + 1,
@@ -742,6 +976,7 @@ async def _review_and_refine_storyboard(
                 outcome="repair_applied",
                 issues=[str(fix.get("issue") or fix.get("repair_prompt") or "").strip()],
                 prompt_text=current_desc,
+                session_id=session_id,
                 metadata={
                     "pass": pass_index,
                     "scene_index": idx + 1,
@@ -762,6 +997,7 @@ async def _review_and_refine_storyboard(
                 outcome=_unresolved_storyboard_status(actionable_fixes),
                 issues=feedback_issues,
                 prompt_text=story_summary or " | ".join(scene_descriptions[:4]),
+                session_id=session_id,
                 metadata={
                     "pass": pass_index,
                     "fix_count": len(actionable_fixes),
@@ -924,7 +1160,7 @@ def _heuristic_audio_cues(
 
     if max_sfx > 0:
         min_score = _clamp_int(os.environ.get("STORYBOOK_SFX_MIN_SCORE", "2"), 2, 1, 6)
-        cooldown = _clamp_int(os.environ.get("STORYBOOK_SFX_COOLDOWN", "1"), 1, 0, 3)
+        cooldown = clamp_sfx_cooldown_pages(os.environ.get("STORYBOOK_SFX_COOLDOWN", "1"))
         sfx_indices = _choose_sfx_indices(
             total=total,
             max_count=max_sfx,
@@ -946,7 +1182,7 @@ def _plan_audio_cues(
     still_paths: list[Path] | None = None,
 ) -> tuple[dict[int, dict[str, Any]], dict[int, dict[str, Any]]]:
     max_music = _clamp_int(os.environ.get("STORYBOOK_MUSIC_MAX", "2"), 2, 0, 4)
-    max_sfx = _clamp_int(os.environ.get("STORYBOOK_SFX_MAX", "3"), 3, 0, 6)
+    max_sfx = clamp_sfx_max(os.environ.get("STORYBOOK_SFX_MAX", "2"))
     plan = _llm_audio_cue_plan(scene_descriptions, story_summary, max_music, max_sfx, still_paths)
     if plan:
         return plan
@@ -967,8 +1203,31 @@ def _clean_story_text(text: str) -> str:
     return cleaned.strip()
 
 
+def _apply_preschool_wording(text: str) -> str:
+    if not text:
+        return ""
+    replacements = [
+        (r"\bmajestic\b", "very tall"),
+        (r"\bglittering\b", "sparkly"),
+        (r"\bshimmering\b", "sparkly"),
+        (r"\bnestled\b", "on"),
+        (r"\bflutter(?:ing)?\b", "flying"),
+        (r"\bglowing\b", "shiny"),
+        (r"\bsprites\b", "little friends"),
+        (r"\btowering\b", "tall"),
+        (r"\bgentle\b", "soft"),
+        (r"\bwhimsical\b", "magical"),
+        (r"\bmajesty\b", "magic"),
+    ]
+    normalized = text
+    for pattern, replacement in replacements:
+        normalized = re.sub(pattern, replacement, normalized, flags=re.IGNORECASE)
+    normalized = re.sub(r"\s+", " ", normalized)
+    return normalized.strip()
+
+
 def _simplify_for_kids(text: str, max_words: int = 28) -> str:
-    cleaned = _clean_story_text(text)
+    cleaned = _apply_preschool_wording(_clean_story_text(text))
     if not cleaned:
         return ""
     sentences = _split_sentences(cleaned)
@@ -981,36 +1240,100 @@ def _simplify_for_kids(text: str, max_words: int = 28) -> str:
     return short
 
 
-def _simplify_for_readalong(text: str, max_words: int = 8) -> str:
-    cleaned = _clean_story_text(text)
+def _simplify_for_readalong(text: str, max_words: int = 12) -> str:
+    cleaned = _apply_preschool_wording(_clean_story_text(text))
     if not cleaned:
         return ""
     sentences = _split_sentences(cleaned)
     if not sentences:
         return ""
     first = sentences[0]
-    first = re.split(r",|;|\\b(and|but|so)\\b", first, maxsplit=1, flags=re.IGNORECASE)[0].strip()
+    first = re.sub(r"[,;:]+", " ", first)
+    first = re.sub(r"\s+", " ", first).strip()
+    first = re.sub(r"^(look|see|wow|hey)\b[!,.:\s]*", "", first, flags=re.IGNORECASE).strip()
     if not first:
         return ""
     words = first.split()
     if len(words) > max_words:
-        first = " ".join(words[:max_words]).rstrip(".,!?") + "."
+        first_words = words[:max_words]
+        while len(first_words) > 4 and first_words[-1].lower() in {
+            "and",
+            "or",
+            "but",
+            "of",
+            "the",
+            "a",
+            "an",
+            "to",
+            "in",
+            "on",
+            "with",
+            "for",
+        }:
+            first_words.pop()
+        first = " ".join(first_words).rstrip(".,!?") + "."
     else:
         first = first.rstrip(".,!?") + "."
-    if not re.match(r"^[\"“'\\(]*?(we|i|you|a|an|the|it|there|look)\\b", first, flags=re.IGNORECASE):
-        first = "Look! " + first[0].upper() + first[1:]
     return first
+
+
+_TEMPORAL_START_RE = re.compile(r"^(then|next|while|as)\b", flags=re.IGNORECASE)
+_SPATIAL_START_RE = re.compile(r"^(here|there|in|on|at)\b", flags=re.IGNORECASE)
+
+
+def _decapitalize(text: str) -> str:
+    if not text:
+        return text
+    return text[0].lower() + text[1:] if text[0].isupper() else text
+
+
+def _apply_readalong_connectors(line: str, idx: int) -> str:
+    if not line:
+        return line
+    stripped = line.lstrip()
+    if idx < 0:
+        return stripped
+    if idx == 0:
+        if _SPATIAL_START_RE.match(stripped) or _TEMPORAL_START_RE.match(stripped):
+            return stripped
+        return f"Here, {_decapitalize(stripped)}"
+    if _TEMPORAL_START_RE.match(stripped):
+        return stripped
+    core = stripped
+    if _SPATIAL_START_RE.match(stripped):
+        core = re.sub(r"^(here|there|in|on|at)\b[:,]?\s*", "", stripped, flags=re.IGNORECASE)
+        if not core:
+            core = stripped
+    return f"Then, {_decapitalize(core)}"
+
+
+def _normalize_storybook_narration_line(
+    text: str,
+    *,
+    fallback: str = "",
+    max_words: int = 12,
+    scene_index: int = 0,
+) -> str:
+    primary = _simplify_for_readalong(text, max_words=max_words)
+    if primary:
+        return _apply_readalong_connectors(primary, scene_index)
+    fallback_line = _simplify_for_readalong(fallback, max_words=max_words)
+    return _apply_readalong_connectors(fallback_line, scene_index) if fallback_line else ""
 
 
 def _build_narration_segments(
     scene_descriptions: list[str],
     story_summary: str,
     scene_count: int,
+    *,
+    child_age: int | str | None = None,
 ) -> list[str]:
     narration: list[str] = []
+    max_words = narration_max_words_for_age(child_age)
     if scene_descriptions:
         for idx, desc in enumerate(scene_descriptions[:scene_count]):
-            line = _simplify_for_readalong(desc)
+            line = _simplify_for_readalong(desc, max_words=max_words)
+            line = _apply_readalong_connectors(line, idx)
             if line:
                 narration.append(line)
     if not narration and story_summary:
@@ -1021,7 +1344,8 @@ def _build_narration_segments(
                 chunk = sentences[i * chunk_size:(i + 1) * chunk_size]
                 if not chunk and sentences:
                     chunk = [sentences[-1]]
-                line = _simplify_for_readalong(" ".join(chunk))
+                line = _simplify_for_readalong(" ".join(chunk), max_words=max_words)
+                line = _apply_readalong_connectors(line, i)
                 narration.append(line)
     if len(narration) < scene_count:
         if narration:
@@ -1045,6 +1369,16 @@ def _build_music_prompt(description: str, idx: int, total: int) -> str:
     return (
         f"{base} for the {position} of a children's adventure. "
         "No vocals, no lyrics, soft bells, warm pads, light marimba."
+    )
+
+
+def _storybook_voice_filter_chain(narration_volume: float) -> str:
+    return (
+        "highpass=f=120,"
+        "lowpass=f=6800,"
+        "dynaudnorm=f=150:g=11:p=0.9,"
+        "acompressor=threshold=0.09:ratio=3:attack=20:release=180:makeup=1.5,"
+        f"volume={narration_volume}"
     )
 
 
@@ -1117,6 +1451,106 @@ def _wrap_caption(text: str, width: int = 26, max_lines: int = 2) -> str:
 
 def _ffmpeg_escape(text: str) -> str:
     return text.replace("\\", "\\\\").replace(":", "\\:").replace("'", "\\'")
+
+
+_STORYBOOK_W = 1280
+_STORYBOOK_H = 720
+_STORYBOOK_FPS = 30
+
+
+def _storybook_x264_args() -> list[str]:
+    return [
+        "-r",
+        str(_STORYBOOK_FPS),
+        "-pix_fmt",
+        "yuv420p",
+        "-c:v",
+        "libx264",
+        "-preset",
+        "veryfast",
+    ]
+
+
+def _storybook_motion_profile(
+    scene_index: int,
+    shot_plan: StoryboardShotPlan | None = None,
+) -> tuple[float, float, float, float, float, float]:
+    if shot_plan is not None:
+        return motion_profile(
+            scene_index,
+            shot_type=shot_plan.shot_type,
+            profile_index=shot_plan.profile_index,
+        )
+    return motion_profile(scene_index)
+
+
+def _storybook_motion_vf(
+    scene_index: int,
+    duration: float,
+    shot_plan: StoryboardShotPlan | None = None,
+) -> str:
+    sx, ex, sy, ey, zoom_start, zoom_end = _storybook_motion_profile(scene_index, shot_plan)
+    duration = max(PAGE_SECONDS_DEFAULT, float(duration))
+    settle_seconds, travel_seconds, motion_factor = motion_timing(duration)
+    ex = sx + ((ex - sx) * motion_factor)
+    ey = sy + ((ey - sy) * motion_factor)
+    zoom_end = zoom_start + ((zoom_end - zoom_start) * motion_factor)
+    progress = f"max(0,min(1,(t-{settle_seconds:.3f})/{travel_seconds:.3f}))"
+    eased = f"(0.5-0.5*cos(PI*{progress}))"
+    zoom = f"({zoom_start:.4f}+({zoom_end - zoom_start:.4f})*{eased})"
+    return (
+        f"scale=w='trunc({_STORYBOOK_W}*{zoom}/2)*2':"
+        f"h='trunc({_STORYBOOK_H}*{zoom}/2)*2':"
+        "force_original_aspect_ratio=increase:flags=lanczos:eval=frame,"
+        f"crop={_STORYBOOK_W}:{_STORYBOOK_H}:"
+        f"x='max(0,min(iw-{_STORYBOOK_W},(iw-{_STORYBOOK_W})*({sx:.4f}+({ex - sx:.4f})*{eased})))':"
+        f"y='max(0,min(ih-{_STORYBOOK_H},(ih-{_STORYBOOK_H})*({sy:.4f}+({ey - sy:.4f})*{eased})))',"
+        "eq=brightness=-0.01:saturation=1.05,unsharp=5:5:0.20:5:5:0.0,setsar=1"
+    )
+
+
+def _render_storybook_image_shot(
+    image_path: Path,
+    output_path: Path,
+    duration: float,
+    vf: str,
+) -> None:
+    subprocess.run(
+        [
+            "ffmpeg",
+            "-y",
+            "-loop",
+            "1",
+            "-framerate",
+            str(_STORYBOOK_FPS),
+            "-t",
+            f"{duration:.3f}",
+            "-i",
+            str(image_path),
+            "-vf",
+            vf,
+            *_storybook_x264_args(),
+            str(output_path),
+        ],
+        check=True,
+        capture_output=True,
+    )
+
+
+def _render_storybook_cinematic_segment(
+    image_path: Path,
+    output_path: Path,
+    duration: float,
+    scene_index: int,
+    shot_plan: StoryboardShotPlan | None = None,
+) -> None:
+    duration = max(1.8, float(duration))
+    _render_storybook_image_shot(
+        image_path,
+        output_path,
+        duration,
+        _storybook_motion_vf(scene_index, duration, shot_plan),
+    )
 
 
 def _clean_title(raw: str) -> str:
@@ -1297,12 +1731,90 @@ def _ffprobe_duration(path: Path) -> float:
         return 0.0
 
 
+def _ffprobe_has_audio_stream(path: Path) -> bool:
+    try:
+        result = subprocess.run(
+            [
+                "ffprobe",
+                "-v",
+                "error",
+                "-show_streams",
+                "-of",
+                "json",
+                str(path),
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        payload = json.loads(result.stdout or "{}")
+        streams = payload.get("streams") or []
+        return any(
+            isinstance(stream, dict) and str(stream.get("codec_type") or "").strip().lower() == "audio"
+            for stream in streams
+        )
+    except Exception as exc:
+        logger.warning("Unable to inspect audio streams for %s: %s", path, exc)
+        return False
+
+
+def _mux_story_video_with_audio(
+    base_video: Path,
+    audio_track: Path,
+    output_path: Path,
+    *,
+    reencode_video: bool = False,
+) -> None:
+    command = [
+        "ffmpeg",
+        "-y",
+        "-i",
+        str(base_video),
+        "-i",
+        str(audio_track),
+        "-map",
+        "0:v:0",
+        "-map",
+        "1:a:0",
+    ]
+    if reencode_video:
+        command.extend(
+            [
+                "-c:v",
+                "libx264",
+                "-preset",
+                os.environ.get("STORYBOOK_MUX_FALLBACK_PRESET", "veryfast").strip() or "veryfast",
+                "-crf",
+                os.environ.get("STORYBOOK_MUX_FALLBACK_CRF", "20").strip() or "20",
+                "-pix_fmt",
+                "yuv420p",
+            ]
+        )
+    else:
+        command.extend(["-c:v", "copy"])
+    command.extend(
+        [
+            "-c:a",
+            "aac",
+            "-b:a",
+            "192k",
+            "-ar",
+            "48000",
+            "-shortest",
+            "-movflags",
+            "+faststart",
+            str(output_path),
+        ]
+    )
+    subprocess.run(command, check=True, capture_output=True)
+
+
 def _synthesize_tts_elevenlabs(text: str) -> bytes | None:
     global _ELEVENLABS_TTS_DISABLED_REASON
     if _ELEVENLABS_TTS_DISABLED_REASON:
         return None
     api_key = os.environ.get("ELEVENLABS_API_KEY", "").strip()
-    voice_id = os.environ.get("ELEVENLABS_VOICE_ID", "").strip()
+    voice_id = os.environ.get("ELEVENLABS_VOICE_ID", "").strip() or DEFAULT_ELEVENLABS_VOICE_ID
     if not api_key or not voice_id or not text:
         if api_key and not voice_id:
             logger.warning(
@@ -1310,10 +1822,10 @@ def _synthesize_tts_elevenlabs(text: str) -> bytes | None:
                 "Set ELEVENLABS_VOICE_ID in env (find IDs at elevenlabs.io/voice-library)."
             )
         return None
-    endpoint = os.environ.get(
-        "ELEVENLABS_TTS_ENDPOINT",
-        f"https://api.elevenlabs.io/v1/text-to-speech/{voice_id}",
-    ).strip()
+    endpoint = (
+        os.environ.get("ELEVENLABS_TTS_ENDPOINT", "").strip()
+        or f"https://api.elevenlabs.io/v1/text-to-speech/{voice_id}"
+    )
     model_id = os.environ.get("ELEVENLABS_TTS_MODEL", "eleven_multilingual_v2").strip()
     payload = {
         "text": text,
@@ -1331,7 +1843,8 @@ def _synthesize_tts_elevenlabs(text: str) -> bytes | None:
     try:
         with httpx.Client(timeout=30.0) as client:
             resp = client.post(endpoint, headers=headers, json=payload)
-            if resp.status_code < 300 and resp.headers.get("content-type", "").startswith("audio"):
+            content_type = resp.headers.get("content-type", "")
+            if resp.status_code < 300 and content_type.startswith("audio"):
                 return resp.content
             if resp.status_code in {401, 402, 403}:
                 _ELEVENLABS_TTS_DISABLED_REASON = f"http_{resp.status_code}"
@@ -1340,18 +1853,24 @@ def _synthesize_tts_elevenlabs(text: str) -> bytes | None:
                     resp.status_code,
                     (resp.text or "")[:240],
                 )
-    except Exception:
+                return None
+            logger.warning(
+                "ElevenLabs TTS returned no audio (status=%s, content-type=%s) for voice=%s model=%s. Body preview: %s",
+                resp.status_code,
+                content_type or "unknown",
+                voice_id,
+                model_id,
+                (resp.text or "")[:240],
+            )
+    except Exception as exc:
+        logger.warning("ElevenLabs TTS request failed: %s", exc)
         return None
     return None
 
 
-def _synthesize_tts_google(text: str) -> bytes | None:
+def _synthesize_tts_google_only(text: str) -> bytes | None:
     if not text:
         return None
-    # Prefer ElevenLabs when available; fall back to Google TTS.
-    audio = _synthesize_tts_elevenlabs(text)
-    if audio:
-        return audio
     try:
         from google.cloud import texttospeech
     except Exception:
@@ -1384,8 +1903,30 @@ def _synthesize_tts_google(text: str) -> bytes | None:
             audio_config=audio_config,
         )
         return response.audio_content
-    except Exception:
+    except Exception as exc:
+        logger.warning("Google TTS request failed: %s", exc)
         return None
+
+
+def _synthesize_tts_google(text: str) -> bytes | None:
+    if not text:
+        return None
+    audio = _synthesize_tts_elevenlabs(text)
+    if audio:
+        return audio
+    return _synthesize_tts_google_only(text)
+
+
+def _synthesize_tts_with_provider(text: str) -> tuple[str | None, bytes | None]:
+    if not text:
+        return None, None
+    audio = _synthesize_tts_elevenlabs(text)
+    if audio:
+        return "elevenlabs", audio
+    audio = _synthesize_tts_google_only(text)
+    if audio:
+        return "google", audio
+    return None, None
 
 
 async def _elevenlabs_generate_music(prompt: str, duration_seconds: float) -> bytes | None:
@@ -1403,13 +1944,14 @@ async def _elevenlabs_generate_music(prompt: str, duration_seconds: float) -> by
     }
     use_music_api = duration_seconds >= 10.0
     if use_music_api:
-        music_endpoint = os.environ.get(
-            "ELEVENLABS_MUSIC_ENDPOINT",
-            "https://api.elevenlabs.io/v1/music",
-        ).strip()
+        music_endpoint = (
+            os.environ.get("ELEVENLABS_MUSIC_ENDPOINT", "").strip()
+            or "https://api.elevenlabs.io/v1/music"
+        )
         payload = {
             "prompt": prompt,
             "music_length_ms": int(duration_seconds * 1000),
+            "force_instrumental": True,
         }
         try:
             async with httpx.AsyncClient(timeout=60.0) as client:
@@ -1427,10 +1969,10 @@ async def _elevenlabs_generate_music(prompt: str, duration_seconds: float) -> by
         except Exception:
             pass
 
-    sound_endpoint = os.environ.get(
-        "ELEVENLABS_SOUND_ENDPOINT",
-        "https://api.elevenlabs.io/v1/sound-generation",
-    ).strip()
+    sound_endpoint = (
+        os.environ.get("ELEVENLABS_SOUND_ENDPOINT", "").strip()
+        or "https://api.elevenlabs.io/v1/sound-generation"
+    )
     payload = {
         "text": prompt,
         "duration_seconds": duration_seconds,
@@ -1465,10 +2007,10 @@ async def _elevenlabs_generate_sfx(prompt: str, duration_seconds: float) -> byte
         "Content-Type": "application/json",
         "Accept": "audio/mpeg",
     }
-    sound_endpoint = os.environ.get(
-        "ELEVENLABS_SOUND_ENDPOINT",
-        "https://api.elevenlabs.io/v1/sound-generation",
-    ).strip()
+    sound_endpoint = (
+        os.environ.get("ELEVENLABS_SOUND_ENDPOINT", "").strip()
+        or "https://api.elevenlabs.io/v1/sound-generation"
+    )
     payload = {
         "text": prompt,
         "duration_seconds": duration_seconds,
@@ -1487,6 +2029,50 @@ async def _elevenlabs_generate_sfx(prompt: str, duration_seconds: float) -> byte
                 )
     except Exception:
         return None
+    return None
+
+
+async def _lyria_generate_music(prompt: str, seed: int | None = None) -> tuple[bytes, str] | None:
+    return await asyncio.to_thread(_lyria_generate_music_sync, prompt, seed)
+
+
+async def _generate_storybook_music_bytes(
+    prompt: str,
+    duration_seconds: float,
+    seed: int | None = None,
+) -> tuple[bytes, str] | None:
+    provider = _storybook_music_provider()
+    attempts = ["elevenlabs", "lyria"] if provider == "auto" else [provider]
+    for idx, name in enumerate(attempts):
+        if name == "off":
+            return None
+        if name == "lyria":
+            result = await _lyria_generate_music(prompt, seed=seed)
+        elif name == "elevenlabs":
+            audio = await _elevenlabs_generate_music(prompt, duration_seconds)
+            result = (audio, ".mp3") if audio else None
+        else:
+            result = None
+        if result and result[0]:
+            if idx > 0:
+                logger.info("Storybook music fallback succeeded with %s", name)
+            return result
+    return None
+
+
+async def _generate_storybook_sfx_bytes(prompt: str, duration_seconds: float) -> tuple[bytes, str] | None:
+    provider = _storybook_sfx_provider()
+    attempts = ["elevenlabs"] if provider == "auto" else [provider]
+    for name in attempts:
+        if name == "off":
+            return None
+        if name == "elevenlabs":
+            audio = await _elevenlabs_generate_sfx(prompt, duration_seconds)
+            result = (audio, ".mp3") if audio else None
+        else:
+            result = None
+        if result and result[0]:
+            return result
     return None
 
 
@@ -1543,6 +2129,11 @@ async def _download_any(
     url: str,
     dest: Path,
 ) -> Path:
+    if url.startswith("data:"):
+        header, data = url.split(",", 1)
+        payload = base64.b64decode(data) if ";base64" in header else data.encode("utf-8")
+        dest.write_bytes(payload)
+        return dest
     if url.startswith("gs://"):
         path = url[5:]
         bucket_name, blob_path = path.split("/", 1)
@@ -1550,6 +2141,99 @@ async def _download_any(
         dest.write_bytes(blob.download_as_bytes())
         return dest
     return await download_blob(session, url, dest)
+
+
+def _scene_sources_from_state_doc(data: dict[str, Any]) -> list[str]:
+    story_pages = story_pages_from_state_data(data)
+    if story_pages:
+        scene_sources: list[str] = []
+        for page in story_pages:
+            gcs_uri = str(page.get("gcs_uri", "") or "").strip()
+            image_url = str(page.get("image_url", "") or "").strip()
+            chosen = gcs_uri or image_url
+            if chosen.startswith("data:image/svg+xml"):
+                chosen = ""
+            if chosen:
+                scene_sources.append(chosen)
+        if scene_sources:
+            return scene_sources
+
+    raw_scene_urls = data.get("scene_asset_urls", [])
+    raw_scene_gcs_uris = data.get("scene_asset_gcs_uris", [])
+    scene_urls = list(raw_scene_urls) if isinstance(raw_scene_urls, list) else []
+    scene_gcs_uris = list(raw_scene_gcs_uris) if isinstance(raw_scene_gcs_uris, list) else []
+    scene_sources: list[str] = []
+    max_scenes = max(len(scene_urls), len(scene_gcs_uris))
+    for idx in range(max_scenes):
+        gcs_uri = str(scene_gcs_uris[idx]).strip() if idx < len(scene_gcs_uris) and scene_gcs_uris[idx] else ""
+        url = str(scene_urls[idx]).strip() if idx < len(scene_urls) and scene_urls[idx] else ""
+        if url.startswith("data:"):
+            url = ""
+        chosen = gcs_uri or url
+        if chosen:
+            scene_sources.append(chosen)
+    return scene_sources
+
+
+def _story_page_fallback_data_url(text: str) -> str:
+    safe_text = html.escape((text or "A magical story page")[:180])
+    svg = f"""<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="720" viewBox="0 0 1280 720">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#1a0d40"/>
+      <stop offset="55%" stop-color="#3c1f72"/>
+      <stop offset="100%" stop-color="#103b62"/>
+    </linearGradient>
+    <radialGradient id="glow" cx="52%" cy="38%" r="42%">
+      <stop offset="0%" stop-color="#ffd166" stop-opacity="0.50"/>
+      <stop offset="100%" stop-color="#ffd166" stop-opacity="0"/>
+    </radialGradient>
+  </defs>
+  <rect width="1280" height="720" fill="url(#bg)"/>
+  <rect width="1280" height="720" fill="url(#glow)"/>
+  <circle cx="280" cy="560" r="180" fill="#ff7fbe" opacity="0.42"/>
+  <circle cx="640" cy="580" r="220" fill="#68f7cf" opacity="0.34"/>
+  <circle cx="1020" cy="550" r="170" fill="#6fc8ff" opacity="0.38"/>
+  <text x="640" y="332" text-anchor="middle" font-family="sans-serif" font-size="34" fill="#fff7d6" opacity="0.92">{safe_text}</text>
+</svg>"""
+    return "data:image/svg+xml;base64," + base64.b64encode(svg.encode("utf-8")).decode("ascii")
+
+
+def _discover_scene_stills_from_bucket(gcs: storage.Client, session_id: str) -> list[str]:
+    if not GCS_ASSETS_BUCKET or not session_id:
+        return []
+    prefix = f"{session_id}/scene_stills/"
+    blobs = list(gcs.bucket(GCS_ASSETS_BUCKET).list_blobs(prefix=prefix))
+    still_paths: list[str] = []
+    for blob in sorted(blobs, key=lambda candidate: candidate.name):
+        name = str(getattr(blob, "name", "") or "")
+        if not name or name.endswith("/"):
+            continue
+        lower_name = name.lower()
+        if not lower_name.endswith((".png", ".jpg", ".jpeg", ".webp")):
+            continue
+        still_paths.append(f"gs://{GCS_ASSETS_BUCKET}/{name}")
+    return still_paths
+
+
+async def _mark_assembly_failed(
+    doc_ref: firestore.AsyncDocumentReference,
+    session_id: str,
+    reason: str,
+) -> None:
+    clean_reason = str(reason or "Unknown assembly failure.").strip()
+    logger.error("%s", clean_reason)
+    try:
+        await doc_ref.update(
+            {
+                "assembly_status": "failed",
+                "assembly_error": clean_reason[:500],
+                "theater_release_ready": False,
+            }
+        )
+    except Exception:
+        pass
+    raise RuntimeError(clean_reason)
 
 
 def _call_veo_api(
@@ -1638,17 +2322,16 @@ async def assemble(session_id: str) -> None:
     doc_ref = db.collection("storyteller_sessions").document(session_id)
     doc = await doc_ref.get()
     if not doc.exists:
-        logger.error(f"Session {session_id} not found in Firestore.")
-        return
+        raise RuntimeError(f"Session {session_id} not found in Firestore.")
 
     data = doc.to_dict()
     video_urls: list[str] = data.get("generated_asset_urls", [])
-    scene_urls: list[str] = data.get("scene_asset_urls", [])
-    scene_gcs_uris: list[str] = data.get("scene_asset_gcs_uris", [])
-    scene_descriptions: list[str] = data.get("scene_descriptions", [])
+    scene_descriptions: list[str] = list(data.get("scene_descriptions", []) or [])
     audio_urls: list[str] = data.get("elevenlabs_audio_chunks", [])
     story_summary = str(data.get("story_summary", "")).strip()
     child_name = str(data.get("child_name", "")).strip()
+    child_age = data.get("child_age")
+    story_tone = _normalize_story_tone(data.get("story_tone"))
     raw_title = str(
         data.get("story_title")
         or data.get("title")
@@ -1659,24 +2342,73 @@ async def assemble(session_id: str) -> None:
     else:
         title = raw_title
 
-    if not scene_urls and not scene_gcs_uris and not video_urls:
-        logger.error(f"No scene assets for session {session_id}.")
-        return
+    story_pages = story_pages_from_state_data(data)
+    if story_pages:
+        raw_scene_urls = list(data.get("scene_asset_urls", []) or [])
+        raw_scene_gcs_uris = list(data.get("scene_asset_gcs_uris", []) or [])
+        resolved_page_sources: list[str] = []
+        resolved_page_descriptions: list[str] = []
+        for idx, page in enumerate(story_pages):
+            page_description = (
+                str(page.get("scene_description", "") or "").strip()
+                or str(page.get("storybeat_text", "") or "").strip()
+                or (str(scene_descriptions[idx]).strip() if idx < len(scene_descriptions) else "")
+            )
+            source = (
+                str(page.get("gcs_uri", "") or "").strip()
+                or str(page.get("image_url", "") or "").strip()
+            )
+            if not source:
+                array_gcs = str(raw_scene_gcs_uris[idx]).strip() if idx < len(raw_scene_gcs_uris) and raw_scene_gcs_uris[idx] else ""
+                array_url = str(raw_scene_urls[idx]).strip() if idx < len(raw_scene_urls) and raw_scene_urls[idx] else ""
+                if array_url.startswith("data:"):
+                    source = array_url
+                else:
+                    source = array_gcs or array_url
+            if source.startswith("data:image/svg+xml"):
+                source = ""
+            if source:
+                resolved_page_sources.append(source)
+                if page_description:
+                    resolved_page_descriptions.append(page_description)
+        if resolved_page_sources:
+            scene_source_urls = resolved_page_sources
+            scene_descriptions = resolved_page_descriptions or scene_descriptions
+        else:
+            scene_source_urls = _scene_sources_from_state_doc(data)
+    else:
+        scene_source_urls = _scene_sources_from_state_doc(data)
+    if not scene_source_urls:
+        recovered_scene_sources = await asyncio.to_thread(_discover_scene_stills_from_bucket, gcs, session_id)
+        if recovered_scene_sources:
+            scene_source_urls = recovered_scene_sources
+            logger.warning(
+                "Recovered %d scene stills for %s directly from gs://%s/%s/scene_stills/ because Firestore scene arrays were empty.",
+                len(scene_source_urls),
+                session_id,
+                GCS_ASSETS_BUCKET,
+                session_id,
+            )
+            try:
+                await doc_ref.set(
+                    {
+                        "scene_asset_gcs_uris": scene_source_urls,
+                        "assembly_asset_recovery": "scene_stills_prefix",
+                    },
+                    merge=True,
+                )
+            except Exception:
+                pass
 
-    if not isinstance(scene_urls, list):
-        scene_urls = []
-    if not isinstance(scene_gcs_uris, list):
-        scene_gcs_uris = []
-
-    scene_source_urls: list[str] = []
-    max_scenes = max(len(scene_urls), len(scene_gcs_uris))
-    for i in range(max_scenes):
-        gcs_uri = scene_gcs_uris[i] if i < len(scene_gcs_uris) else ""
-        url = scene_urls[i] if i < len(scene_urls) else ""
-        gcs_uri = str(gcs_uri).strip() if gcs_uri else ""
-        url = str(url).strip() if url else ""
-        scene_source_urls.append(gcs_uri or url)
-    scene_source_urls = [u for u in scene_source_urls if u]
+    if not scene_source_urls and not video_urls:
+        await _mark_assembly_failed(
+            doc_ref,
+            session_id,
+            (
+                f"No scene assets found for session {session_id}. "
+                "Firestore scene arrays were empty and no files were found under the scene_stills bucket prefix."
+            ),
+        )
 
     storyboard_review_report: dict[str, Any] = {
         "status": "skipped",
@@ -1712,18 +2444,234 @@ async def assemble(session_id: str) -> None:
                 ]
                 downloaded_videos = await asyncio.gather(*video_tasks)
 
+        scene_count = len(still_paths) if still_paths else len(downloaded_videos)
+        try:
+            max_music_cues = _clamp_int(os.environ.get("STORYBOOK_MUSIC_MAX", "2"), 2, 0, 4)
+        except Exception:
+            max_music_cues = 2
+        try:
+            max_sfx_cues = clamp_sfx_max(os.environ.get("STORYBOOK_SFX_MAX", "2"))
+        except Exception:
+            max_sfx_cues = clamp_sfx_max(None)
+        default_narration_lines = (
+            _build_narration_segments(
+                scene_descriptions,
+                story_summary,
+                scene_count,
+                child_age=child_age,
+            )
+            if scene_count
+            else []
+        )
+        studio_plan_task: asyncio.Task[dict[str, Any]] | None = None
+        if scene_count and _storybook_studio_enabled():
+            logger.info("Starting storybook studio planning in parallel for %s (%s scenes).", session_id, scene_count)
+            studio_plan_task = asyncio.create_task(
+                _run_storybook_studio_async(
+                    session_id=session_id,
+                    title=title,
+                    child_name=child_name,
+                    child_age=child_age,
+                    story_summary=story_summary,
+                    scene_descriptions=scene_descriptions,
+                    scene_count=scene_count,
+                    max_music_cues=max_music_cues,
+                    max_sfx_cues=max_sfx_cues,
+                    fallback_narration_lines=default_narration_lines,
+                )
+            )
+
         try:
             await doc_ref.update({"assembly_status": "reviewing_storyboard"})
         except Exception:
             pass
 
-        if still_paths:
+        if still_paths and _env_enabled("ENABLE_STORYBOOK_DIRECTOR_WORKFLOW", default=True):
+            async def _director_review_callback(_workflow_state: dict[str, Any], iteration: int) -> dict[str, Any]:
+                forward_review = await asyncio.to_thread(
+                    _review_storyboard_pass,
+                    scene_descriptions,
+                    story_summary,
+                    child_name,
+                    still_paths,
+                    "FORWARD",
+                    story_tone,
+                )
+                backward_review = await asyncio.to_thread(
+                    _review_storyboard_pass,
+                    scene_descriptions,
+                    story_summary,
+                    child_name,
+                    still_paths,
+                    "BACKWARD",
+                    story_tone,
+                )
+                merged = _merge_storyboard_reviews(
+                    [("FORWARD", forward_review), ("BACKWARD", backward_review)],
+                    total_scenes=len(still_paths),
+                )
+                actionable_fixes = [
+                    fix
+                    for fix in (merged.get("scene_fixes", []) or [])
+                    if isinstance(fix, dict) and bool(fix.get("actionable"))
+                ]
+                warning_fixes = [
+                    fix
+                    for fix in (merged.get("scene_fixes", []) or [])
+                    if isinstance(fix, dict) and not bool(fix.get("actionable"))
+                ]
+                review_status = (
+                    "passed_with_warnings"
+                    if warning_fixes and not actionable_fixes
+                    else "passed"
+                    if not actionable_fixes
+                    else "fix_required"
+                )
+                return {
+                    "pass": iteration,
+                    "status": review_status,
+                    "fix_count": len(actionable_fixes),
+                    "warning_count": len(warning_fixes),
+                    "global_feedback": list(merged.get("global_feedback", []) or []),
+                    "scene_fixes": list(merged.get("scene_fixes", []) or []),
+                }
+
+            async def _director_repair_callback(
+                review: dict[str, Any],
+                decision: dict[str, Any],
+                iteration: int,
+            ) -> dict[str, Any]:
+                selected_indices: list[int] = []
+                for raw in decision.get("selected_scene_indices", []) or []:
+                    try:
+                        idx = int(raw)
+                    except Exception:
+                        continue
+                    if idx > 0 and idx not in selected_indices:
+                        selected_indices.append(idx)
+                if not selected_indices:
+                    for fix in (review.get("scene_fixes", []) or []):
+                        if not isinstance(fix, dict) or not bool(fix.get("actionable")):
+                            continue
+                        try:
+                            selected_indices.append(int(fix.get("scene_index", 0) or 0))
+                        except Exception:
+                            continue
+
+                try:
+                    repair_limit = int(decision.get("selected_repair_limit", 2) or 2)
+                except Exception:
+                    repair_limit = 2
+                repair_limit = max(1, min(repair_limit, 4))
+
+                repairs_applied: list[dict[str, Any]] = []
+                selected_set = {idx for idx in selected_indices if idx > 0}
+                actionable_fixes = [
+                    fix
+                    for fix in (review.get("scene_fixes", []) or [])
+                    if isinstance(fix, dict) and bool(fix.get("actionable"))
+                ]
+
+                for fix in actionable_fixes:
+                    try:
+                        scene_index = int(fix.get("scene_index", 0) or 0)
+                    except Exception:
+                        scene_index = 0
+                    if scene_index <= 0:
+                        continue
+                    if selected_set and scene_index not in selected_set:
+                        continue
+                    idx = scene_index - 1
+                    if idx < 0 or idx >= len(still_paths):
+                        continue
+
+                    current_image_bytes: bytes | None
+                    previous_image_bytes: bytes | None = None
+                    hero_anchor_image_bytes: bytes | None = None
+                    try:
+                        current_image_bytes = still_paths[idx].read_bytes()
+                    except Exception:
+                        current_image_bytes = None
+                    if idx > 0:
+                        try:
+                            previous_image_bytes = still_paths[idx - 1].read_bytes()
+                        except Exception:
+                            previous_image_bytes = None
+                    hero_anchor_description = _scene_text_for_index(scene_descriptions, 0, story_summary)
+                    if idx != 0 and still_paths:
+                        try:
+                            hero_anchor_image_bytes = still_paths[0].read_bytes()
+                        except Exception:
+                            hero_anchor_image_bytes = None
+
+                    current_desc = _scene_text_for_index(scene_descriptions, idx, story_summary)
+                    previous_desc = _scene_text_for_index(scene_descriptions, idx - 1, story_summary) if idx > 0 else ""
+                    next_desc = _scene_text_for_index(scene_descriptions, idx + 1, story_summary) if idx + 1 < len(still_paths) else ""
+
+                    repaired_bytes = await asyncio.to_thread(
+                        _generate_repaired_story_still,
+                        current_desc,
+                        str(fix.get("repair_prompt") or fix.get("issue") or "").strip(),
+                        story_summary,
+                        previous_desc,
+                        next_desc,
+                        current_image_bytes,
+                        previous_image_bytes,
+                        hero_anchor_description,
+                        hero_anchor_image_bytes,
+                        story_tone,
+                    )
+                    if not repaired_bytes:
+                        continue
+
+                    repaired_path = tmp / f"scene_{idx:03d}_repair_pass_{iteration}.png"
+                    repaired_path.write_bytes(repaired_bytes)
+                    still_paths[idx] = repaired_path
+                    repairs_applied.append(
+                        {
+                            "pass": iteration,
+                            "scene_index": scene_index,
+                            "severity": str(fix.get("severity") or "major"),
+                            "issue": str(fix.get("issue") or "")[:240],
+                            "directions": list(fix.get("directions", []) or []),
+                        }
+                    )
+                    if len(repairs_applied) >= repair_limit:
+                        break
+
+                result_status = "passed_with_repairs" if repairs_applied else _unresolved_storyboard_status(actionable_fixes)
+                return {
+                    "status": result_status,
+                    "repairs_applied": len(repairs_applied),
+                    "repairs": repairs_applied,
+                }
+
+            workflow_state = await run_storybook_director_workflow(
+                session_id=session_id,
+                initial_state={
+                    "story_title": title,
+                    "child_name": child_name or "friend",
+                    "child_age": child_age or 4,
+                    "child_age_band": child_age_band(child_age),
+                    "story_tone": story_tone,
+                    "story_summary": story_summary or "No summary available.",
+                    "scene_descriptions_json": json.dumps(scene_descriptions, ensure_ascii=True),
+                },
+                review_callback=_director_review_callback,
+                repair_callback=_director_repair_callback,
+                max_revision_passes=_clamp_int(os.environ.get("STORYBOOK_SCENE_REVIEW_MAX_PASSES", "2"), 2, 1, 3),
+                max_repairs_per_pass=_clamp_int(os.environ.get("STORYBOOK_SCENE_REVIEW_MAX_FIXES", "3"), 3, 1, 4),
+            )
+            storyboard_review_report = build_storyboard_report_from_workflow_state(workflow_state)
+        elif still_paths:
             still_paths, storyboard_review_report = await _review_and_refine_storyboard(
+                session_id=session_id,
                 scene_descriptions=scene_descriptions,
                 story_summary=story_summary,
                 child_name=child_name,
                 still_paths=still_paths,
                 tmp=tmp,
+                story_tone=story_tone,
             )
         else:
             storyboard_review_report = {
@@ -1733,50 +2681,82 @@ async def assemble(session_id: str) -> None:
                 "repairs_applied": [],
             }
 
+        studio_plan: dict[str, Any] = {
+            "status": "not_run",
+            "narration_lines": list(default_narration_lines),
+            "music_cues": {},
+            "sfx_cues": {},
+            "mix_guidance": {},
+        }
+        if studio_plan_task is not None:
+            try:
+                studio_plan = await studio_plan_task
+            except Exception as exc:
+                logger.warning("Storybook studio workflow failed for %s: %s", session_id, exc, exc_info=True)
+        studio_summary = build_storybook_studio_summary(studio_plan)
+        studio_audio_locked = str(studio_plan.get("status") or "").strip().lower() not in {"", "not_run", "disabled"}
+
         try:
             await doc_ref.update(
                 {
                     "assembly_status": "assembling",
                     "storyboard_review": storyboard_review_report,
+                    "storybook_studio": studio_summary,
                 }
             )
         except Exception:
             pass
 
         valid_audios = [a for a in downloaded_audios if isinstance(a, Path) and a.exists()]
+        expected_scene_pages = max(len(story_pages), len(scene_source_urls), len(downloaded_videos))
+        if still_paths and expected_scene_pages and len(still_paths) < expected_scene_pages:
+            await _mark_assembly_failed(
+                doc_ref,
+                session_id,
+                (
+                    f"Storybook assembly only recovered {len(still_paths)} page images for {expected_scene_pages} story pages. "
+                    "The movie would have dropped pages, so the worker aborted."
+                ),
+            )
         enable_tts = _env_enabled("ENABLE_STORYBOOK_TTS", default=True)
-        enable_captions = _env_enabled("ENABLE_STORYBOOK_CAPTIONS", default=True)
-        force_tts = _env_enabled("FORCE_STORYBOOK_TTS", default=False)
-        enable_music = _env_enabled("ENABLE_STORYBOOK_MUSIC", default=False)
-        enable_sfx = _env_enabled("ENABLE_STORYBOOK_SFX", default=False)
+        enable_captions = _storybook_burned_captions_enabled()
+        force_tts = _env_enabled("FORCE_STORYBOOK_TTS", default=True)
+        enable_music = _env_enabled("ENABLE_STORYBOOK_MUSIC", default=True)
+        enable_sfx = _env_enabled("ENABLE_STORYBOOK_SFX", default=True)
+        if studio_audio_locked:
+            enable_music = enable_music and bool(studio_plan.get("music_enabled", True))
         try:
-            music_volume = float(os.environ.get("STORYBOOK_MUSIC_VOLUME", "0.25"))
+            music_volume = clamp_music_volume(os.environ.get("STORYBOOK_MUSIC_VOLUME", "0.10"))
         except Exception:
-            music_volume = 0.25
-        music_volume = max(0.0, min(music_volume, 1.0))
+            music_volume = clamp_music_volume(None)
         try:
-            sfx_volume = float(os.environ.get("STORYBOOK_SFX_VOLUME", "0.6"))
+            sfx_volume = clamp_sfx_volume(os.environ.get("STORYBOOK_SFX_VOLUME", "0.22"))
         except Exception:
-            sfx_volume = 0.6
-        sfx_volume = max(0.0, min(sfx_volume, 1.0))
+            sfx_volume = clamp_sfx_volume(None)
         try:
-            narration_volume = float(os.environ.get("STORYBOOK_NARRATION_VOLUME", "1.6"))
+            narration_volume = clamp_narration_volume(os.environ.get("STORYBOOK_NARRATION_VOLUME", "1.6"))
         except Exception:
-            narration_volume = 1.6
-        narration_volume = max(0.5, min(narration_volume, 3.0))
+            narration_volume = clamp_narration_volume(None)
         enable_ducking = _env_enabled("ENABLE_STORYBOOK_DUCKING", default=True)
+        narration_volume, music_volume, sfx_volume, enable_ducking = _apply_storybook_mix_guidance(
+            studio_plan.get("mix_guidance"),
+            narration_volume=narration_volume,
+            music_volume=music_volume,
+            sfx_volume=sfx_volume,
+            enable_ducking=enable_ducking,
+        )
         try:
-            sfx_max = int(os.environ.get("STORYBOOK_SFX_MAX", "3"))
+            sfx_max = clamp_sfx_max(os.environ.get("STORYBOOK_SFX_MAX", "2"))
         except Exception:
-            sfx_max = 3
+            sfx_max = clamp_sfx_max(None)
         try:
             sfx_min_score = int(os.environ.get("STORYBOOK_SFX_MIN_SCORE", "2"))
         except Exception:
             sfx_min_score = 2
         try:
-            sfx_cooldown = int(os.environ.get("STORYBOOK_SFX_COOLDOWN", "1"))
+            sfx_cooldown = clamp_sfx_cooldown_pages(os.environ.get("STORYBOOK_SFX_COOLDOWN", "1"))
         except Exception:
-            sfx_cooldown = 1
+            sfx_cooldown = clamp_sfx_cooldown_pages(None)
         use_existing_audio = bool(valid_audios) and not force_tts
         cover_enabled = _env_enabled("ENABLE_STORYBOOK_COVER", default=False)
         cover_seconds = _clamp_float(os.environ.get("STORYBOOK_COVER_SECONDS", "3.5"), 3.5, 2.0, 6.0)
@@ -1798,28 +2778,156 @@ async def assemble(session_id: str) -> None:
         cover_author = f"by {child_name}" if child_name else ""
         cover_image_bytes = _generate_cover_image(scene_descriptions, story_summary) if cover_enabled else None
 
-        scene_count = len(still_paths) if still_paths else len(downloaded_videos)
-        narration_lines = (
-            _build_narration_segments(scene_descriptions, story_summary, scene_count)
-            if scene_count
-            else []
-        )
+        narration_lines = list(studio_plan.get("narration_lines", []) or default_narration_lines)
         if cover_enabled:
             narration_lines = [cover_narration or ""] + narration_lines
+        normalized_narration_lines: list[str] = []
+        scene_max_words = narration_max_words_for_age(child_age)
+        cover_max_words = narration_max_words_for_age(child_age, cover=True)
+        for idx, line in enumerate(narration_lines):
+            if cover_enabled and idx == 0:
+                normalized_narration_lines.append(
+                    _simplify_for_readalong(
+                        str(line or "") or cover_narration or "Our story is about to begin.",
+                        max_words=cover_max_words,
+                    )
+                )
+                continue
+            scene_idx = idx - 1 if cover_enabled else idx
+            fallback_description = (
+                scene_descriptions[scene_idx]
+                if 0 <= scene_idx < len(scene_descriptions)
+                else ""
+            )
+            normalized_narration_lines.append(
+                _normalize_storybook_narration_line(
+                    str(line or ""),
+                    fallback=fallback_description,
+                    max_words=scene_max_words,
+                    scene_index=max(0, scene_idx),
+                )
+            )
+        narration_lines = normalized_narration_lines
+        expected_narration_count = sum(1 for line in narration_lines if str(line or "").strip())
+        rendered_narration_count = expected_narration_count if use_existing_audio else 0
 
         tts_audio_paths: list[Path | None] = []
         tts_audio_durations: list[float] = []
         if enable_tts and not use_existing_audio and narration_lines:
-            for idx, line in enumerate(narration_lines):
-                audio_bytes = _synthesize_tts_google(line) if line else None
-                if audio_bytes:
-                    audio_path = tmp / f"tts_{idx:03d}.mp3"
+            tts_audio_paths = [None] * len(narration_lines)
+            tts_audio_durations = [0.0] * len(narration_lines)
+            tts_providers: list[str | None] = [None] * len(narration_lines)
+            try:
+                tts_concurrency = int(os.environ.get("STORYBOOK_TTS_CONCURRENCY", "4"))
+            except Exception:
+                tts_concurrency = 4
+            tts_semaphore = asyncio.Semaphore(max(1, min(tts_concurrency, 6)))
+
+            async def _render_tts_line(idx: int, line: str) -> tuple[int, Path | None, float, str | None]:
+                if not line:
+                    return idx, None, 0.0, None
+                async with tts_semaphore:
+                    provider, audio_bytes = await asyncio.to_thread(_synthesize_tts_with_provider, line)
+                if not audio_bytes:
+                    return idx, None, 0.0, provider
+                audio_path = tmp / f"tts_{idx:03d}.mp3"
+                audio_path.write_bytes(audio_bytes)
+                duration = await asyncio.to_thread(_ffprobe_duration, audio_path)
+                return idx, audio_path, duration, provider
+
+            async def _render_google_tts_bundle(
+                prefix: str,
+            ) -> tuple[list[Path | None], list[float], list[str | None]]:
+                bundle_paths: list[Path | None] = [None] * len(narration_lines)
+                bundle_durations: list[float] = [0.0] * len(narration_lines)
+                bundle_providers: list[str | None] = [None] * len(narration_lines)
+                for idx, line in enumerate(narration_lines):
+                    if not line:
+                        continue
+                    audio_bytes = await asyncio.to_thread(_synthesize_tts_google_only, line)
+                    if not audio_bytes:
+                        continue
+                    audio_path = tmp / f"{prefix}_{idx:03d}.mp3"
                     audio_path.write_bytes(audio_bytes)
-                    tts_audio_paths.append(audio_path)
-                    tts_audio_durations.append(_ffprobe_duration(audio_path))
-                else:
-                    tts_audio_paths.append(None)
-                    tts_audio_durations.append(0.0)
+                    duration = await asyncio.to_thread(_ffprobe_duration, audio_path)
+                    bundle_paths[idx] = audio_path
+                    bundle_durations[idx] = duration
+                    bundle_providers[idx] = "google"
+                return bundle_paths, bundle_durations, bundle_providers
+
+            tts_results = await asyncio.gather(
+                *(_render_tts_line(idx, line) for idx, line in enumerate(narration_lines)),
+                return_exceptions=True,
+            )
+            for result in tts_results:
+                if isinstance(result, Exception):
+                    logger.warning("Storybook narration TTS failed for %s: %s", session_id, result)
+                    continue
+                idx, audio_path, duration, provider = result
+                if 0 <= idx < len(tts_audio_paths):
+                    tts_audio_paths[idx] = audio_path
+                    tts_audio_durations[idx] = duration
+                    tts_providers[idx] = provider
+            missing_tts_indexes = [
+                idx
+                for idx, line in enumerate(narration_lines)
+                if line and idx < len(tts_audio_paths) and tts_audio_paths[idx] is None
+            ]
+            if missing_tts_indexes:
+                logger.info(
+                    "Retrying %d narration lines with Google TTS fallback for %s.",
+                    len(missing_tts_indexes),
+                    session_id,
+                )
+            for idx in missing_tts_indexes:
+                audio_bytes = await asyncio.to_thread(_synthesize_tts_google_only, narration_lines[idx])
+                if not audio_bytes:
+                    continue
+                audio_path = tmp / f"tts_{idx:03d}.mp3"
+                audio_path.write_bytes(audio_bytes)
+                duration = await asyncio.to_thread(_ffprobe_duration, audio_path)
+                tts_audio_paths[idx] = audio_path
+                tts_audio_durations[idx] = duration
+                tts_providers[idx] = "google"
+            rendered_narration_count = sum(1 for path in tts_audio_paths if path is not None)
+            provider_counts = Counter(provider for provider in tts_providers if provider)
+            logger.info(
+                "Storybook narration plan for %s: %d/%d lines rendered | providers=%s",
+                session_id,
+                rendered_narration_count,
+                len(tts_audio_paths),
+                dict(provider_counts),
+            )
+            if expected_narration_count and rendered_narration_count < expected_narration_count:
+                logger.warning(
+                    "Incomplete narration rendered for %s: %d/%d lines.",
+                    session_id,
+                    rendered_narration_count,
+                    expected_narration_count,
+                )
+                fallback_paths, fallback_durations, fallback_providers = await _render_google_tts_bundle("tts_fallback")
+                fallback_rendered_narration_count = sum(1 for path in fallback_paths if path is not None)
+                if fallback_rendered_narration_count > rendered_narration_count:
+                    logger.info(
+                        "Deterministic Google narration fallback improved %s to %d/%d lines.",
+                        session_id,
+                        fallback_rendered_narration_count,
+                        expected_narration_count,
+                    )
+                    tts_audio_paths = fallback_paths
+                    tts_audio_durations = fallback_durations
+                    tts_providers = fallback_providers
+                    rendered_narration_count = fallback_rendered_narration_count
+                if force_tts or narration_required_default():
+                    await _mark_assembly_failed(
+                        doc_ref,
+                        session_id,
+                        (
+                            "Storybook narration failed before final assembly. "
+                            f"Rendered {rendered_narration_count}/{expected_narration_count} narration lines, "
+                            "so the worker aborted instead of publishing a partially silent movie."
+                        ),
+                    )
         cover_audio_path: Path | None = None
         cover_audio_duration = 0.0
         if cover_enabled and enable_tts and use_existing_audio and cover_narration:
@@ -1858,7 +2966,7 @@ async def assemble(session_id: str) -> None:
                     f"drawtext=text='{subtitle_text}':fontcolor=white:fontsize=28:x=(w-text_w)/2:y=h*0.56:shadowcolor=black:shadowx=2:shadowy=2"
                 )
             fade_out_start = max(0.2, cover_duration - 0.4)
-            vf_parts.append(f"fade=t=in:st=0:d=0.4,fade=t=out:st={fade_out_start:.3f}:d=0.4")
+            vf_parts.append(f"fade=t=in:st=0:d=0.4,fade=t=out:st={fade_out_start:.3f}:d=0.4,setsar=1")
             cover_vf = ",".join(vf_parts)
             cover_path = tmp / "segment_cover.mp4"
             if cover_image_bytes:
@@ -1868,6 +2976,7 @@ async def assemble(session_id: str) -> None:
                     [
                         "ffmpeg", "-y",
                         "-loop", "1",
+                        "-framerate", str(_STORYBOOK_FPS),
                         "-i", str(cover_image_path),
                         "-t", f"{cover_duration:.3f}",
                         "-vf", cover_vf,
@@ -1897,11 +3006,15 @@ async def assemble(session_id: str) -> None:
             segments.append(cover_path)
             scene_durations.append(cover_duration)
         if still_paths:
+            render_scene_descriptions = [
+                str(scene_descriptions[idx]).strip() if idx < len(scene_descriptions) else ""
+                for idx in range(len(still_paths))
+            ]
+            scene_shot_plans = plan_storyboard_shots(render_scene_descriptions)
             try:
-                still_seconds = int(os.environ.get("FINAL_SCENE_SECONDS", "3"))
+                still_seconds = clamp_page_seconds(os.environ.get("FINAL_SCENE_SECONDS", "4"))
             except Exception:
-                still_seconds = 3
-            still_seconds = max(2, min(still_seconds, 6))
+                still_seconds = clamp_page_seconds(None)
 
             use_veo = _env_enabled("ENABLE_VEO_FINAL", default=False)
             try:
@@ -1940,7 +3053,7 @@ async def assemble(session_id: str) -> None:
                             location,
                             img_bytes,
                             prompt,
-                            "scary, dark, violent, creepy, text, logos",
+                            _story_tone_veo_negative_prompt(story_tone),
                         )
                         raw_url = await asyncio.to_thread(
                             _poll_veo_operation, PROJECT, location, op_name
@@ -1961,7 +3074,7 @@ async def assemble(session_id: str) -> None:
                 if tts_audio_durations and audio_idx < len(tts_audio_durations):
                     audio_len = tts_audio_durations[audio_idx]
                     if audio_len > 0:
-                        base_duration = max(base_duration, audio_len + 0.4)
+                        base_duration = max(base_duration, audio_len + PAGE_SECONDS_NARRATION_BUFFER)
                 scene_durations.append(base_duration)
                 if idx in veo_clips:
                     # Normalize Veo clip to common codec/size
@@ -1970,7 +3083,7 @@ async def assemble(session_id: str) -> None:
                         "ffmpeg", "-y",
                         "-i", str(veo_clips[idx]),
                         "-vf", "scale=1280:720:force_original_aspect_ratio=decrease,"
-                               "pad=1280:720:(ow-iw)/2:(oh-ih)/2:color=#0b2d5b",
+                               "pad=1280:720:(ow-iw)/2:(oh-ih)/2:color=#0b2d5b,setsar=1",
                         "-r", "30",
                         "-pix_fmt", "yuv420p",
                         "-c:v", "libx264",
@@ -1982,10 +3095,11 @@ async def assemble(session_id: str) -> None:
                         subprocess.run([
                             "ffmpeg", "-y",
                             "-loop", "1",
+                            "-framerate", str(_STORYBOOK_FPS),
                             "-t", f"{extra:.3f}",
                             "-i", str(still_path),
                             "-vf", "scale=1280:720:force_original_aspect_ratio=decrease,"
-                                   "pad=1280:720:(ow-iw)/2:(oh-ih)/2:color=#0b2d5b",
+                                   "pad=1280:720:(ow-iw)/2:(oh-ih)/2:color=#0b2d5b,setsar=1",
                             "-r", "30",
                             "-pix_fmt", "yuv420p",
                             "-c:v", "libx264",
@@ -1999,26 +3113,27 @@ async def assemble(session_id: str) -> None:
                             "ffmpeg", "-y",
                             "-f", "concat", "-safe", "0",
                             "-i", str(concat_hold),
-                            "-c", "copy",
+                            "-an",
+                            "-vf", "fps=30,format=yuv420p,setsar=1",
+                            "-c:v", "libx264",
+                            "-preset", "veryfast",
+                            "-crf", "18",
+                            "-pix_fmt", "yuv420p",
                             str(segment_path),
                         ], check=True, capture_output=True)
                     else:
                         segment_path.write_bytes(normalized_path.read_bytes())
                 else:
-                    # Create a short video from still
-                    subprocess.run([
-                        "ffmpeg", "-y",
-                        "-loop", "1",
-                        "-t", f"{base_duration:.3f}",
-                        "-i", str(still_path),
-                        "-vf", "scale=1280:720:force_original_aspect_ratio=decrease,"
-                               "pad=1280:720:(ow-iw)/2:(oh-ih)/2:color=#0b2d5b",
-                        "-r", "30",
-                        "-pix_fmt", "yuv420p",
-                        "-c:v", "libx264",
-                        str(segment_path),
-                    ], check=True, capture_output=True)
+                    _render_storybook_cinematic_segment(
+                        still_path,
+                        segment_path,
+                        base_duration,
+                        idx,
+                        scene_shot_plans[idx] if idx < len(scene_shot_plans) else None,
+                    )
                 segments.append(segment_path)
+        else:
+            scene_shot_plans = []
 
         if downloaded_videos and not still_paths:
             for clip in downloaded_videos:
@@ -2039,14 +3154,39 @@ async def assemble(session_id: str) -> None:
         if cover_enabled:
             audio_scene_descriptions = [cover_description] + scene_descriptions
             still_paths_for_audio = None
-        music_cues, sfx_cues = _plan_audio_cues(
-            audio_scene_descriptions,
-            story_summary,
-            len(scene_durations),
-            still_paths=still_paths_for_audio,
-        )
-        if cover_enabled:
-            sfx_cues.pop(0, None)
+        cover_offset = 1 if cover_enabled else 0
+        studio_music_cues = {
+            idx + cover_offset: cue
+            for idx, cue in dict(studio_plan.get("music_cues", {}) or {}).items()
+            if isinstance(idx, int)
+        }
+        studio_sfx_cues = {
+            idx + cover_offset: cue
+            for idx, cue in dict(studio_plan.get("sfx_cues", {}) or {}).items()
+            if isinstance(idx, int)
+        }
+        if studio_audio_locked:
+            music_cues, sfx_cues = studio_music_cues, studio_sfx_cues
+            if enable_music and not music_cues and bool(studio_plan.get("music_enabled", True)) and scene_durations:
+                arc_prompt = str(studio_plan.get("music_arc_prompt") or "").strip()
+                default_indices = [0]
+                if len(scene_durations) > 1:
+                    default_indices.append(len(scene_durations) - 1)
+                for idx in dict.fromkeys(default_indices):
+                    desc = audio_scene_descriptions[idx] if idx < len(audio_scene_descriptions) else ""
+                    music_cues[idx] = {
+                        "prompt": arc_prompt or _build_music_prompt(desc, idx, len(scene_durations)),
+                        "duration_seconds": min(10.0, max(2.0, scene_durations[idx])),
+                    }
+        else:
+            music_cues, sfx_cues = _plan_audio_cues(
+                audio_scene_descriptions,
+                story_summary,
+                len(scene_durations),
+                still_paths=still_paths_for_audio,
+            )
+            if cover_enabled:
+                sfx_cues.pop(0, None)
 
         music_cue_default = _clamp_float(
             os.environ.get("STORYBOOK_MUSIC_CUE_SECONDS", "10"),
@@ -2061,54 +3201,99 @@ async def assemble(session_id: str) -> None:
             6.0,
         )
 
-        if enable_music and os.environ.get("ELEVENLABS_API_KEY") and scene_durations:
-            for idx, duration in enumerate(scene_durations):
-                cue = music_cues.get(idx)
-                if not cue:
-                    music_paths.append(None)
+        async def _generate_music_path(
+            idx: int,
+            duration: float,
+            cue: dict[str, Any],
+        ) -> tuple[int, Path | None]:
+            desc = audio_scene_descriptions[idx] if idx < len(audio_scene_descriptions) else ""
+            prompt = str(cue.get("prompt") or "").strip() or _build_music_prompt(desc, idx, len(scene_durations))
+            cue_seconds = cue.get("duration_seconds")
+            try:
+                cue_seconds = float(cue_seconds)
+            except Exception:
+                cue_seconds = music_cue_default
+            cue_seconds = max(2.0, min(float(cue_seconds), duration))
+            music_seed = sum(ord(ch) for ch in f"{session_id}:{idx}") or None
+            music_result = await _generate_storybook_music_bytes(prompt, cue_seconds, seed=music_seed)
+            if not music_result:
+                return idx, None
+            audio_bytes, suffix = music_result
+            music_path = tmp / f"music_{idx:03d}{suffix or '.wav'}"
+            music_path.write_bytes(audio_bytes)
+            return idx, music_path
+
+        async def _generate_sfx_path(
+            idx: int,
+            duration: float,
+            cue: dict[str, Any],
+        ) -> tuple[int, Path | None]:
+            desc = audio_scene_descriptions[idx] if idx < len(audio_scene_descriptions) else ""
+            prompt = str(cue.get("prompt") or "").strip() or _build_sfx_prompt(desc)
+            cue_seconds = cue.get("duration_seconds")
+            try:
+                cue_seconds = float(cue_seconds)
+            except Exception:
+                cue_seconds = sfx_cue_default
+            cue_seconds = max(0.6, min(float(cue_seconds), duration))
+            sfx_result = await _generate_storybook_sfx_bytes(prompt, cue_seconds)
+            if not sfx_result:
+                return idx, None
+            audio_bytes, suffix = sfx_result
+            sfx_path = tmp / f"sfx_{idx:03d}{suffix or '.mp3'}"
+            sfx_path.write_bytes(audio_bytes)
+            return idx, sfx_path
+
+        if enable_music and scene_durations:
+            music_paths = [None] * len(scene_durations)
+            music_tasks = [
+                _generate_music_path(idx, duration, cue)
+                for idx, duration in enumerate(scene_durations)
+                if (cue := music_cues.get(idx))
+            ]
+            for result in await asyncio.gather(*music_tasks, return_exceptions=True):
+                if isinstance(result, Exception):
+                    logger.warning("Storybook music cue generation failed: %s", result)
                     continue
-                desc = audio_scene_descriptions[idx] if idx < len(audio_scene_descriptions) else ""
-                prompt = str(cue.get("prompt") or "").strip() or _build_music_prompt(desc, idx, len(scene_durations))
-                cue_seconds = cue.get("duration_seconds")
-                try:
-                    cue_seconds = float(cue_seconds)
-                except Exception:
-                    cue_seconds = music_cue_default
-                cue_seconds = max(2.0, min(float(cue_seconds), duration))
-                audio_bytes = await _elevenlabs_generate_music(prompt, cue_seconds)
-                if audio_bytes:
-                    music_path = tmp / f"music_{idx:03d}.mp3"
-                    music_path.write_bytes(audio_bytes)
-                    music_paths.append(music_path)
-                else:
-                    music_paths.append(None)
+                idx, music_path = result
+                music_paths[idx] = music_path
         else:
             music_paths = [None] * len(scene_durations)
 
-        if enable_sfx and os.environ.get("ELEVENLABS_API_KEY") and scene_durations:
+        if enable_sfx and scene_durations:
             if sfx_cues:
                 logger.info("Storybook SFX scenes selected: %s", sorted(sfx_cues.keys()))
-            for idx, duration in enumerate(scene_durations):
-                cue = sfx_cues.get(idx)
-                if not cue:
+            sfx_tasks = [
+                _generate_sfx_path(idx, duration, cue)
+                for idx, duration in enumerate(scene_durations)
+                if (cue := sfx_cues.get(idx))
+            ]
+            for result in await asyncio.gather(*sfx_tasks, return_exceptions=True):
+                if isinstance(result, Exception):
+                    logger.warning("Storybook SFX cue generation failed: %s", result)
                     continue
-                desc = audio_scene_descriptions[idx] if idx < len(audio_scene_descriptions) else ""
-                prompt = str(cue.get("prompt") or "").strip() or _build_sfx_prompt(desc)
-                cue_seconds = cue.get("duration_seconds")
-                try:
-                    cue_seconds = float(cue_seconds)
-                except Exception:
-                    cue_seconds = sfx_cue_default
-                cue_seconds = max(0.6, min(float(cue_seconds), duration))
-                audio_bytes = await _elevenlabs_generate_sfx(prompt, cue_seconds)
-                if audio_bytes:
-                    sfx_path = tmp / f"sfx_{idx:03d}.mp3"
-                    sfx_path.write_bytes(audio_bytes)
-                    sfx_paths[idx] = sfx_path
+                idx, sfx_path = result
+                sfx_paths[idx] = sfx_path
+
+        logger.info(
+            "FFmpeg storybook audio plan for %s: narration=%d/%d music=%d/%d sfx=%d/%d force_tts=%s reused_audio=%s",
+            session_id,
+            sum(1 for path in tts_audio_paths if path is not None),
+            len(tts_audio_paths),
+            sum(1 for path in music_paths if path is not None),
+            len(music_paths),
+            sum(1 for path in sfx_paths if path is not None),
+            len(sfx_paths),
+            force_tts,
+            use_existing_audio,
+        )
 
         if not segments:
-            logger.error(f"No renderable segments for session {session_id}.")
-            return
+            await _mark_assembly_failed(
+                doc_ref,
+                session_id,
+                f"No renderable segments could be built for session {session_id}.",
+            )
 
         # Create FFmpeg concat list
         concat_list = tmp / "concat.txt"
@@ -2120,7 +3305,12 @@ async def assemble(session_id: str) -> None:
         subprocess.run([
             "ffmpeg", "-y",
             "-f", "concat", "-safe", "0", "-i", str(concat_list),
-            "-c", "copy",
+            "-an",
+            "-vf", "fps=30,format=yuv420p,setsar=1",
+            "-c:v", "libx264",
+            "-preset", "veryfast",
+            "-crf", "18",
+            "-pix_fmt", "yuv420p",
             "-movflags", "+faststart",
             str(base_video),
         ], check=True, capture_output=True)
@@ -2189,6 +3379,17 @@ async def assemble(session_id: str) -> None:
             return audio_full
 
         audio_track: Path | None = None
+        if tts_audio_paths and scene_durations and len(tts_audio_paths) != len(scene_durations):
+            logger.warning(
+                "Aligning narration tracks for %s: tts_paths=%d scene_durations=%d",
+                session_id,
+                len(tts_audio_paths),
+                len(scene_durations),
+            )
+            if len(tts_audio_paths) < len(scene_durations):
+                tts_audio_paths = tts_audio_paths + [None] * (len(scene_durations) - len(tts_audio_paths))
+            else:
+                tts_audio_paths = tts_audio_paths[:len(scene_durations)]
         if tts_audio_paths and len(tts_audio_paths) == len(scene_durations) and any(tts_audio_paths):
             audio_track = _build_padded_audio(tts_audio_paths, scene_durations)
         elif use_existing_audio and valid_audios:
@@ -2196,6 +3397,9 @@ async def assemble(session_id: str) -> None:
             if cover_enabled:
                 existing_paths = [cover_audio_path] + existing_paths
             audio_track = _build_padded_audio(existing_paths, scene_durations)
+        narration_audio_available = bool(audio_track and audio_track.exists())
+        if narration_audio_available:
+            narration_audio_available = _ffprobe_duration(audio_track) > 0.1
 
         music_track: Path | None = None
         if enable_music and music_paths and any(music_paths):
@@ -2204,6 +3408,9 @@ async def assemble(session_id: str) -> None:
         sfx_track: Path | None = None
         if enable_sfx and sfx_paths and any(sfx_paths):
             sfx_track = _build_padded_audio(sfx_paths, scene_durations, fade_in=0.15, fade_out=0.25)
+
+        master_chain = ",alimiter=limit=0.95,loudnorm=I=-17:TP=-2:LRA=6" if _env_enabled("ENABLE_STORYBOOK_AUDIO_MASTERING", default=True) else ""
+        voice_filter = _storybook_voice_filter_chain(narration_volume)
 
         if music_track and music_track.exists():
             if audio_track and audio_track.exists() and sfx_track and sfx_track.exists():
@@ -2225,7 +3432,7 @@ async def assemble(session_id: str) -> None:
                         "-i", str(music_track),
                         "-i", str(sfx_track),
                         "-filter_complex",
-                        f"[0:a]volume={narration_volume}[voice];[1:a]volume={music_volume}[music];[2:a]volume={sfx_volume}[sfx];{duck}{mix}",
+                        f"[0:a]{voice_filter}[voice];[1:a]volume={music_volume}[music];[2:a]volume={sfx_volume}[sfx];{duck}{mix}{master_chain}",
                         "-c:a", "pcm_s16le",
                         str(mixed_audio),
                     ],
@@ -2251,7 +3458,7 @@ async def assemble(session_id: str) -> None:
                         "-i", str(audio_track),
                         "-i", str(music_track),
                         "-filter_complex",
-                        f"[0:a]volume={narration_volume}[voice];[1:a]volume={music_volume}[music];{duck}{mix}",
+                        f"[0:a]{voice_filter}[voice];[1:a]volume={music_volume}[music];{duck}{mix}{master_chain}",
                         "-c:a", "pcm_s16le",
                         str(mixed_audio),
                     ],
@@ -2267,7 +3474,7 @@ async def assemble(session_id: str) -> None:
                         "-i", str(music_track),
                         "-i", str(sfx_track),
                         "-filter_complex",
-                        f"[0:a]volume={music_volume}[music];[1:a]volume={sfx_volume}[sfx];[music][sfx]amix=inputs=2:duration=shortest:dropout_transition=0",
+                        f"[0:a]volume={music_volume}[music];[1:a]volume={sfx_volume}[sfx];[music][sfx]amix=inputs=2:duration=shortest:dropout_transition=0{master_chain}",
                         "-c:a", "pcm_s16le",
                         str(mixed_audio),
                     ],
@@ -2281,7 +3488,7 @@ async def assemble(session_id: str) -> None:
                     [
                         "ffmpeg", "-y",
                         "-i", str(music_track),
-                        "-filter:a", f"volume={music_volume}",
+                        "-filter:a", f"volume={music_volume}{master_chain}",
                         "-c:a", "pcm_s16le",
                         str(music_only),
                     ],
@@ -2298,7 +3505,7 @@ async def assemble(session_id: str) -> None:
                         "-i", str(audio_track),
                         "-i", str(sfx_track),
                         "-filter_complex",
-                        f"[0:a]volume={narration_volume}[voice];[1:a]volume={sfx_volume}[sfx];[voice][sfx]amix=inputs=2:duration=shortest:dropout_transition=0",
+                        f"[0:a]{voice_filter}[voice];[1:a]volume={sfx_volume}[sfx];[voice][sfx]amix=inputs=2:duration=shortest:dropout_transition=0{master_chain}",
                         "-c:a", "pcm_s16le",
                         str(mixed_audio),
                     ],
@@ -2312,7 +3519,7 @@ async def assemble(session_id: str) -> None:
                     [
                         "ffmpeg", "-y",
                         "-i", str(sfx_track),
-                        "-filter:a", f"volume={sfx_volume}",
+                        "-filter:a", f"volume={sfx_volume}{master_chain}",
                         "-c:a", "pcm_s16le",
                         str(sfx_only),
                     ],
@@ -2334,7 +3541,7 @@ async def assemble(session_id: str) -> None:
                 [
                     "ffmpeg", "-y",
                     "-i", str(audio_track),
-                    "-filter:a", f"volume={narration_volume}",
+                    "-filter:a", f"{voice_filter}{master_chain}",
                     "-c:a", "pcm_s16le",
                     str(boosted),
                 ],
@@ -2343,20 +3550,76 @@ async def assemble(session_id: str) -> None:
             )
             audio_track = boosted
 
+        expected_narration_audio = bool(enable_tts and narration_required_default())
+        audio_available = narration_audio_available
+
         output_path = tmp / "story_final.mp4"
         if audio_track and audio_track.exists():
-            subprocess.run([
-                "ffmpeg", "-y",
-                "-i", str(base_video),
-                "-i", str(audio_track),
-                "-c:v", "copy", "-c:a", "aac", "-b:a", "192k",
-                "-map", "0:v:0", "-map", "1:a:0",
-                "-shortest",
-                "-movflags", "+faststart",
-                str(output_path),
-            ], check=True, capture_output=True)
+            _mux_story_video_with_audio(base_video, audio_track, output_path, reencode_video=False)
         else:
             output_path = base_video
+
+        final_has_audio_stream = _ffprobe_has_audio_stream(output_path)
+        if audio_track and audio_track.exists() and audio_available and not final_has_audio_stream:
+            logger.warning(
+                "Final video for %s is missing an audio stream after the fast mux path. "
+                "Retrying with defensive video re-encode.",
+                session_id,
+            )
+            remux_output_path = tmp / "story_final_remux.mp4"
+            _mux_story_video_with_audio(base_video, audio_track, remux_output_path, reencode_video=True)
+            remux_has_audio_stream = _ffprobe_has_audio_stream(remux_output_path)
+            if remux_has_audio_stream:
+                output_path = remux_output_path
+                final_has_audio_stream = True
+            else:
+                logger.warning(
+                    "Defensive remux also failed to produce an audio stream for %s.",
+                    session_id,
+                )
+        if audio_available and not final_has_audio_stream:
+            audio_available = False
+            if expected_narration_audio:
+                await _mark_assembly_failed(
+                    doc_ref,
+                    session_id,
+                    (
+                        "Storybook narration was generated, but the final MP4 still had no audio stream after muxing. "
+                        "The worker aborted instead of publishing a silent movie."
+                    ),
+                )
+        final_video_duration_sec = _ffprobe_duration(output_path)
+        theater_release_ready, release_gate_issues = storybook_release_gate(
+            scene_count=len(still_paths) or len(downloaded_videos),
+            final_video_duration_sec=final_video_duration_sec,
+            expected_audio=expected_narration_audio,
+            audio_available=audio_available,
+            final_has_audio_stream=final_has_audio_stream,
+            expected_narration_count=expected_narration_count,
+            rendered_narration_count=rendered_narration_count,
+            shot_types=[plan.shot_type for plan in scene_shot_plans],
+        )
+        logger.info(
+            "FFmpeg storybook final media audit for %s: narration_audio_available=%s final_has_audio_stream=%s narration_lines=%d release_issues=%s",
+            session_id,
+            narration_audio_available,
+            final_has_audio_stream,
+            sum(1 for line in narration_lines if line),
+            release_gate_issues,
+        )
+        if not theater_release_ready:
+            await _mark_assembly_failed(
+                doc_ref,
+                session_id,
+                (
+                    "The final storybook movie failed the release gate. "
+                    f"duration={final_video_duration_sec:.2f}s "
+                    f"audio_expected={expected_narration_audio} "
+                    f"audio_available={audio_available} "
+                    f"final_has_audio_stream={final_has_audio_stream} "
+                    f"issues={'; '.join(release_gate_issues)}"
+                ),
+            )
 
         if enable_captions and narration_lines and scene_durations:
             # Build a drawtext filtergraph with one entry per scene, each time-gated
@@ -2425,8 +3688,23 @@ async def assemble(session_id: str) -> None:
         await doc_ref.update({
             "final_video_url": final_url,
             "final_video_gcs_uri": final_gcs_uri,
+            "narration_lines": [line for line in narration_lines if line] or [line for line in default_narration_lines if line],
+            "audio_expected": expected_narration_audio,
+            "audio_available": audio_available,
+            "expected_narration_count": expected_narration_count,
+            "rendered_narration_count": rendered_narration_count,
+            "final_has_audio_stream": final_has_audio_stream,
+            "final_video_duration_sec": final_video_duration_sec,
+            "final_scene_count": len(still_paths) or len(downloaded_videos),
+            "final_shot_types": [plan.shot_type for plan in scene_shot_plans],
+            "theater_release_ready": theater_release_ready,
             "assembly_status": "complete",
             "storyboard_review": storyboard_review_report,
+            "storybook_studio": studio_summary,
+            "post_movie_meta_review": {
+                **storyboard_review_report,
+                "source": "assembly_review",
+            },
         })
 
         logger.info(f"Session {session_id} assembly complete.")

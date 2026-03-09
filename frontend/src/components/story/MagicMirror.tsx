@@ -15,9 +15,11 @@
 
 import { useEffect, useRef } from 'react';
 
-interface MagicMirrorProps {
+export type MagicMirrorMode = 'idle' | 'user-speaking' | 'thinking' | 'speaking';
+
+export interface MagicMirrorProps {
     voiceRms: number;       // 0–1, updated per audio frame
-    isActive: boolean;      // Show when AI is speaking or thinking
+    mode: MagicMirrorMode;
 }
 
 const VERTEX_SHADER = `#version 300 es
@@ -90,35 +92,105 @@ void main() {
   fragColor = vec4(color, 0.9);
 }`;
 
-export default function MagicMirror({ voiceRms, isActive }: MagicMirrorProps) {
+function deriveVisualEnergy(mode: MagicMirrorMode, voiceRms: number): number {
+    const clampedRms = Math.min(1, Math.max(0, voiceRms));
+    switch (mode) {
+        case 'speaking':
+            return Math.min(1, Math.max(0.28, clampedRms * 2.2));
+        case 'thinking':
+            return Math.min(0.72, Math.max(0.18, clampedRms * 1.6 + 0.08));
+        case 'user-speaking':
+            return Math.min(0.9, Math.max(0.16, clampedRms * 2.4));
+        case 'idle':
+        default:
+            return Math.min(0.22, Math.max(0.06, clampedRms * 1.2));
+    }
+}
+
+function getCanvasOpacity(mode: MagicMirrorMode): number {
+    switch (mode) {
+        case 'speaking':
+            return 1;
+        case 'thinking':
+            return 0.9;
+        case 'user-speaking':
+            return 0.82;
+        case 'idle':
+        default:
+            return 0.58;
+    }
+}
+
+export default function MagicMirror({ voiceRms, mode }: MagicMirrorProps) {
     const canvasRef = useRef<HTMLCanvasElement>(null);
     const glRef = useRef<WebGL2RenderingContext | null>(null);
     const programRef = useRef<WebGLProgram | null>(null);
     const rafRef = useRef<number | null>(null);
-    const startTimeRef = useRef(performance.now());
+    const voiceRmsRef = useRef(voiceRms);
+    const modeRef = useRef<MagicMirrorMode>(mode);
+    const startTimeRef = useRef(0);
+    const lowPowerModeRef = useRef(false);
+    const forceCssFallbackRef = useRef(false);
+    const lastFrameAtRef = useRef(0);
+
+    useEffect(() => {
+        voiceRmsRef.current = voiceRms;
+    }, [voiceRms]);
+
+    useEffect(() => {
+        modeRef.current = mode;
+    }, [mode]);
 
     useEffect(() => {
         const canvas = canvasRef.current;
         if (!canvas) return;
+        startTimeRef.current = performance.now();
+        lastFrameAtRef.current = 0;
+        const connection = (
+            navigator as Navigator & {
+                connection?: {
+                    saveData?: boolean;
+                };
+            }
+        ).connection;
+        const prefersReducedMotion = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+        const isCompact = window.matchMedia('(max-width: 900px)').matches;
+        lowPowerModeRef.current = isCompact || prefersReducedMotion || Boolean(connection?.saveData);
+        forceCssFallbackRef.current = prefersReducedMotion || Boolean(connection?.saveData);
+
+        const stopRenderLoop = () => {
+            if (rafRef.current) {
+                cancelAnimationFrame(rafRef.current);
+                rafRef.current = null;
+            }
+        };
 
         // WebGL2 Context Loss handling (Iter 5 #4)
         const handleContextLost = (e: Event) => {
             e.preventDefault();
-            if (rafRef.current) cancelAnimationFrame(rafRef.current);
+            stopRenderLoop();
             glRef.current = null;
         };
         const handleContextRestored = () => {
             initWebGL();
+            startRenderLoop();
         };
         canvas.addEventListener('webglcontextlost', handleContextLost);
         canvas.addEventListener('webglcontextrestored', handleContextRestored);
 
         function initWebGL() {
+            if (forceCssFallbackRef.current) {
+                canvas!.style.background = 'radial-gradient(circle, #6310e0, #0097d9)';
+                canvas!.style.animation = 'pulse 2s ease-in-out infinite';
+                programRef.current = null;
+                return;
+            }
             const gl = canvas!.getContext('webgl2');
             if (!gl) {
                 // Fallback: CSS animation (Iter 2 #8)
                 canvas!.style.background = 'radial-gradient(circle, #6310e0, #0097d9)';
                 canvas!.style.animation = 'pulse 1.5s ease-in-out infinite';
+                programRef.current = null;
                 return;
             }
 
@@ -131,6 +203,7 @@ export default function MagicMirror({ voiceRms, isActive }: MagicMirrorProps) {
                 glCtx.compileShader(s);
                 if (!glCtx.getShaderParameter(s, glCtx.COMPILE_STATUS)) {
                     console.error('Shader compile error:', glCtx.getShaderInfoLog(s));
+                    glCtx.deleteShader(s);
                     return null;
                 }
                 return s;
@@ -144,7 +217,17 @@ export default function MagicMirror({ voiceRms, isActive }: MagicMirrorProps) {
             glCtx.attachShader(prog, vs);
             glCtx.attachShader(prog, fs);
             glCtx.linkProgram(prog);
+            if (!glCtx.getProgramParameter(prog, glCtx.LINK_STATUS)) {
+                console.error('Program link error:', glCtx.getProgramInfoLog(prog));
+                glCtx.deleteProgram(prog);
+                glCtx.deleteShader(vs);
+                glCtx.deleteShader(fs);
+                programRef.current = null;
+                return;
+            }
             programRef.current = prog;
+            glCtx.deleteShader(vs);
+            glCtx.deleteShader(fs);
 
             // Full-screen quad
             const buf = glCtx.createBuffer();
@@ -155,40 +238,61 @@ export default function MagicMirror({ voiceRms, isActive }: MagicMirrorProps) {
             glCtx.vertexAttribPointer(loc, 2, glCtx.FLOAT, false, 0, 0);
         }
 
+        function startRenderLoop() {
+            stopRenderLoop();
+
+            const render = () => {
+                const activeCanvas = canvasRef.current;
+                const gl = glRef.current;
+                const prog = programRef.current;
+                if (!activeCanvas) return;
+                const now = performance.now();
+                const minFrameIntervalMs = lowPowerModeRef.current
+                    ? (modeRef.current === 'idle' ? 1000 / 12 : 1000 / 24)
+                    : 1000 / 60;
+                if (lastFrameAtRef.current && now - lastFrameAtRef.current < minFrameIntervalMs) {
+                    rafRef.current = requestAnimationFrame(render);
+                    return;
+                }
+                lastFrameAtRef.current = now;
+
+                if (gl && prog) {
+                    const width = Math.max(1, activeCanvas.clientWidth);
+                    const height = Math.max(1, activeCanvas.clientHeight);
+                    if (activeCanvas.width !== width || activeCanvas.height !== height) {
+                        activeCanvas.width = width;
+                        activeCanvas.height = height;
+                    }
+
+                    gl.viewport(0, 0, activeCanvas.width, activeCanvas.height);
+                    gl.useProgram(prog);
+                    gl.uniform1f(
+                        gl.getUniformLocation(prog, 'u_time'),
+                        (now - startTimeRef.current) / 1000
+                    );
+                    gl.uniform1f(
+                        gl.getUniformLocation(prog, 'u_rms'),
+                        deriveVisualEnergy(modeRef.current, voiceRmsRef.current)
+                    );
+                    gl.uniform2f(gl.getUniformLocation(prog, 'u_resolution'), activeCanvas.width, activeCanvas.height);
+                    gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+                }
+
+                rafRef.current = requestAnimationFrame(render);
+            };
+
+            rafRef.current = requestAnimationFrame(render);
+        }
+
         initWebGL();
+        startRenderLoop();
+
         return () => {
             canvas.removeEventListener('webglcontextlost', handleContextLost);
             canvas.removeEventListener('webglcontextrestored', handleContextRestored);
-            if (rafRef.current) cancelAnimationFrame(rafRef.current);
+            stopRenderLoop();
         };
     }, []);
-
-    // Animation loop — reads voiceRms via closure
-    useEffect(() => {
-        if (!isActive) {
-            if (rafRef.current) cancelAnimationFrame(rafRef.current);
-            return;
-        }
-        const canvas = canvasRef.current!;
-        const gl = glRef.current;
-        const prog = programRef.current;
-        if (!gl || !prog) return;
-
-        function render() {
-            if (!gl || !prog) return;
-            canvas.width = canvas.offsetWidth;
-            canvas.height = canvas.offsetHeight;
-            gl.viewport(0, 0, canvas.width, canvas.height);
-            gl.useProgram(prog);
-            gl.uniform1f(gl.getUniformLocation(prog, 'u_time'), (performance.now() - startTimeRef.current) / 1000);
-            gl.uniform1f(gl.getUniformLocation(prog, 'u_rms'), voiceRms);
-            gl.uniform2f(gl.getUniformLocation(prog, 'u_resolution'), canvas.width, canvas.height);
-            gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
-            rafRef.current = requestAnimationFrame(render);
-        }
-        rafRef.current = requestAnimationFrame(render);
-        return () => { if (rafRef.current) cancelAnimationFrame(rafRef.current); };
-    }, [isActive, voiceRms]);
 
     return (
         <canvas
@@ -200,7 +304,7 @@ export default function MagicMirror({ voiceRms, isActive }: MagicMirrorProps) {
                 inset: 0,
                 width: '100%',
                 height: '100%',
-                opacity: isActive ? 1 : 0,
+                opacity: getCanvasOpacity(mode),
                 transition: 'opacity 0.5s ease',
                 pointerEvents: 'none',
                 borderRadius: '50%',

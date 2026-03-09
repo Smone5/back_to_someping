@@ -1,4 +1,4 @@
-FROM python:3.12-slim
+FROM python:3.11-slim
 
 # Install FFmpeg (with GPU support hints for faster Veo clip processing)
 RUN apt-get update && apt-get install -y --no-install-recommends \

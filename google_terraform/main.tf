@@ -44,11 +44,19 @@ resource "google_cloud_run_v2_service" "backend" {
       }
       env {
         name  = "GOOGLE_GENAI_USE_VERTEXAI"
-        value = "FALSE"
+        value = var.google_genai_use_vertexai ? "TRUE" : "FALSE"
       }
       env {
         name  = "GOOGLE_CLOUD_LOCATION"
         value = var.region
+      }
+      env {
+        name  = "STORYTELLER_LIVE_MODEL"
+        value = var.storyteller_live_model
+      }
+      env {
+        name  = "IMAGE_MODEL"
+        value = var.interactive_scene_image_model
       }
       env {
         name  = "ENABLE_PROMPT_META_LEARNING"
@@ -87,6 +95,10 @@ resource "google_cloud_run_v2_service" "backend" {
         value = google_cloud_run_v2_job.ffmpeg_worker.name
       }
       env {
+        name  = "FIRESTORE_DATABASE"
+        value = google_firestore_database.storyteller_db.name
+      }
+      env {
         name  = "PROD_FRONTEND_ORIGIN"
         value = "https://storyteller-frontend-119014819686.us-central1.run.app"
       }
@@ -113,6 +125,86 @@ resource "google_cloud_run_v2_service" "backend" {
       env {
         name  = "LOCAL_STORYBOOK_MODE"
         value = tostring(var.local_storybook_mode)
+      }
+      env {
+        name  = "ENABLE_FAST_STORYBOOK_ASSEMBLY"
+        value = tostring(var.enable_fast_storybook_assembly)
+      }
+      env {
+        name  = "ENABLE_CLIENT_DIRECT_LIVE"
+        value = tostring(var.enable_client_direct_live)
+      }
+      env {
+        name  = "CLIENT_DIRECT_LIVE_MODEL"
+        value = var.client_direct_live_model
+      }
+      env {
+        name  = "CLIENT_DIRECT_LIVE_VOICE"
+        value = var.client_direct_live_voice
+      }
+      env {
+        name  = "CLIENT_DIRECT_LIVE_TEMPERATURE"
+        value = tostring(var.client_direct_live_temperature)
+      }
+      env {
+        name  = "CLIENT_DIRECT_LIVE_TOP_P"
+        value = tostring(var.client_direct_live_top_p)
+      }
+      env {
+        name  = "CLIENT_DIRECT_LIVE_EXPIRE_MINUTES"
+        value = tostring(var.client_direct_live_expire_minutes)
+      }
+      env {
+        name  = "CLIENT_DIRECT_LIVE_NEW_SESSION_MINUTES"
+        value = tostring(var.client_direct_live_new_session_minutes)
+      }
+      env {
+        name  = "ENABLE_STORYBOOK_MUSIC"
+        value = "1"
+      }
+      env {
+        name  = "STORYBOOK_MUSIC_PROVIDER"
+        value = "auto"
+      }
+      env {
+        name  = "STORYBOOK_MUSIC_VOLUME"
+        value = "0.10"
+      }
+      env {
+        name  = "ENABLE_STORYBOOK_SFX"
+        value = "1"
+      }
+      env {
+        name  = "STORYBOOK_SFX_PROVIDER"
+        value = "elevenlabs"
+      }
+      env {
+        name  = "STORYBOOK_SFX_VOLUME"
+        value = "0.22"
+      }
+      env {
+        name  = "STORYBOOK_SFX_MAX"
+        value = "2"
+      }
+      env {
+        name  = "STORYBOOK_SFX_MIN_SCORE"
+        value = "2"
+      }
+      env {
+        name  = "STORYBOOK_SFX_COOLDOWN"
+        value = "1"
+      }
+      env {
+        name  = "STORYBOOK_NARRATION_VOLUME"
+        value = "1.8"
+      }
+      env {
+        name  = "ENABLE_STORYBOOK_DUCKING"
+        value = "1"
+      }
+      env {
+        name  = "ENABLE_STORYBOOK_AUDIO_MASTERING"
+        value = "1"
       }
       env {
         name  = "IMAGE_SIZE"
@@ -270,6 +362,10 @@ resource "google_cloud_run_v2_job" "ffmpeg_worker" {
           value = var.region
         }
         env {
+          name  = "GOOGLE_GENAI_USE_VERTEXAI"
+          value = var.google_genai_use_vertexai ? "TRUE" : "FALSE"
+        }
+        env {
           name  = "ENABLE_PROMPT_META_LEARNING"
           value = "1"
         }
@@ -307,7 +403,7 @@ resource "google_cloud_run_v2_job" "ffmpeg_worker" {
         }
         env {
           name  = "FINAL_SCENE_SECONDS"
-          value = "3"
+          value = "4"
         }
         env {
           name  = "ENABLE_STORYBOOK_TTS"
@@ -318,16 +414,28 @@ resource "google_cloud_run_v2_job" "ffmpeg_worker" {
           value = "1"
         }
         env {
+          name  = "ENABLE_STORYBOOK_DIRECTOR_WORKFLOW"
+          value = var.enable_storybook_director_workflow ? "1" : "0"
+        }
+        env {
           name  = "STORYBOOK_SCENE_REVIEW_MODEL"
           value = "gemini-2.5-flash"
         }
         env {
           name  = "STORYBOOK_SCENE_REVIEW_MAX_PASSES"
-          value = "2"
+          value = tostring(var.storybook_scene_review_max_passes)
         }
         env {
           name  = "STORYBOOK_SCENE_REVIEW_MAX_FIXES"
           value = "3"
+        }
+        env {
+          name  = "ENABLE_STORYBOOK_STUDIO_WORKFLOW"
+          value = var.enable_storybook_studio_workflow ? "1" : "0"
+        }
+        env {
+          name  = "STORYBOOK_STUDIO_MAX_REVISIONS"
+          value = tostring(var.storybook_studio_max_revisions)
         }
         env {
           name  = "STORYBOOK_SCENE_IMAGE_MODEL"
@@ -339,7 +447,7 @@ resource "google_cloud_run_v2_job" "ffmpeg_worker" {
         }
         env {
           name  = "ENABLE_STORYBOOK_CAPTIONS"
-          value = "1"
+          value = "0"
         }
         env {
           name  = "ENABLE_STORYBOOK_COVER"
@@ -387,15 +495,19 @@ resource "google_cloud_run_v2_job" "ffmpeg_worker" {
         }
         env {
           name  = "FORCE_STORYBOOK_TTS"
-          value = "0"
+          value = "1"
         }
         env {
           name  = "ENABLE_STORYBOOK_MUSIC"
-          value = "0"
+          value = "1"
+        }
+        env {
+          name  = "STORYBOOK_MUSIC_PROVIDER"
+          value = "auto"
         }
         env {
           name  = "STORYBOOK_MUSIC_VOLUME"
-          value = "0.12"
+          value = "0.10"
         }
         env {
           name  = "STORYBOOK_MUSIC_CUE_SECONDS"
@@ -407,11 +519,15 @@ resource "google_cloud_run_v2_job" "ffmpeg_worker" {
         }
         env {
           name  = "ENABLE_STORYBOOK_SFX"
-          value = "0"
+          value = "1"
+        }
+        env {
+          name  = "STORYBOOK_SFX_PROVIDER"
+          value = "elevenlabs"
         }
         env {
           name  = "STORYBOOK_SFX_VOLUME"
-          value = "0.28"
+          value = "0.22"
         }
         env {
           name  = "STORYBOOK_SFX_CUE_SECONDS"
@@ -419,7 +535,7 @@ resource "google_cloud_run_v2_job" "ffmpeg_worker" {
         }
         env {
           name  = "STORYBOOK_SFX_MAX"
-          value = "3"
+          value = "2"
         }
         env {
           name  = "STORYBOOK_SFX_MIN_SCORE"
@@ -435,6 +551,10 @@ resource "google_cloud_run_v2_job" "ffmpeg_worker" {
         }
         env {
           name  = "ENABLE_STORYBOOK_DUCKING"
+          value = "1"
+        }
+        env {
+          name  = "ENABLE_STORYBOOK_AUDIO_MASTERING"
           value = "1"
         }
         env {
@@ -468,6 +588,15 @@ resource "google_cloud_run_v2_job" "ffmpeg_worker" {
         env {
           name  = "ELEVENLABS_TTS_ENDPOINT"
           value = var.elevenlabs_tts_endpoint
+        }
+        env {
+          name = "GOOGLE_API_KEY"
+          value_source {
+            secret_key_ref {
+              secret  = google_secret_manager_secret.google_api_key.secret_id
+              version = "latest"
+            }
+          }
         }
         env {
           name = "ELEVENLABS_API_KEY"

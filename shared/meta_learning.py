@@ -397,6 +397,7 @@ def record_prompt_feedback(
     prompt_text: str = "",
     session_id: str = "",
     metadata: Mapping[str, Any] | None = None,
+    force_log: bool = False,
 ) -> None:
     """Persists prompt feedback and promotes repeated issue patterns into rules."""
     if not _env_enabled("ENABLE_PROMPT_META_LEARNING", default=True):
@@ -405,7 +406,7 @@ def record_prompt_feedback(
     issue_tags = _normalize_issue_tags(issues)
     normalized_scope = _normalize_scope(scope)
     normalized_outcome = str(outcome or "").strip().lower() or "observed"
-    if not issue_tags and normalized_outcome in {"success", "passed"} and not _env_enabled(
+    if not force_log and not issue_tags and normalized_outcome in {"success", "passed"} and not _env_enabled(
         "PROMPT_META_LEARNING_LOG_SUCCESSES",
         default=False,
     ):

@@ -62,8 +62,9 @@ class PlaybackProcessor extends AudioWorkletProcessor {
         if (!output || !output[0]) return true;
 
         const framesPerBlock = output[0].length;
+        const shouldDrainTail = this._isFlushing && this._filled > 0;
 
-        if (!this._ready || this._filled === 0) {
+        if (this._filled === 0) {
             // Silence while buffering
             output[0].fill(0);
             if (output.length > 1) output[1].fill(0);
@@ -72,6 +73,11 @@ class PlaybackProcessor extends AudioWorkletProcessor {
                 this.port.postMessage({ type: 'flushed' });
                 this._isFlushing = false;
             }
+            return true;
+        }
+        if (!this._ready && !shouldDrainTail) {
+            output[0].fill(0);
+            if (output.length > 1) output[1].fill(0);
             return true;
         }
 
@@ -91,7 +97,7 @@ class PlaybackProcessor extends AudioWorkletProcessor {
                     output[1][frame] = 0;
                 }
                 this._ready = false; // Re-enter buffering state on starvation
-                if (this._isFlushing) {
+                if (this._isFlushing && this._filled === 0) {
                     this.port.postMessage({ type: 'flushed' });
                     this._isFlushing = false;
                 }

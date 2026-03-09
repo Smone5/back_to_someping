@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import re
 import struct
 
@@ -31,8 +32,9 @@ _PII_PATTERNS = [
      "[magic address]"),
 ]
 
-# Lowered for soft child voices; frontend VAD now gates active speech windows.
-_NOISE_GATE_RMS_THRESHOLD = 90
+# Keep the backend gate slightly conservative so accidental bumps/background hum
+# do not become full Gemini turns after the frontend VAD already fired.
+_NOISE_GATE_RMS_THRESHOLD = max(1, int(os.environ.get("NOISE_GATE_RMS_THRESHOLD", "110")))
 
 
 def _scrub_pii_sync(text: str) -> str:

@@ -47,10 +47,51 @@ class StorySession(BaseModel):
 
     schema_version: int = Field(default=1)
     child_name: str = Field(default="friend")
+    child_age: int = Field(default=4)
+    child_age_band: str = Field(default="4-5")
     sidekick_description: str = Field(default="a brave sidekick")
+    toy_share_active: bool = Field(default=False)
+    toy_share_turns_remaining: int = Field(default=0)
+    toy_reference_visual_summary: str = Field(default="")
     story_summary: str = Field(default="The adventure is just beginning...")
+    story_tone: str = Field(default="cozy")
+    story_phase: str = Field(default="opening")
+    assembly_kind: str = Field(default="initial")
+    scene_render_pending: bool = Field(default=False)
+    theater_release_ready: bool = Field(default=False)
+    child_delight_anchors: list[str] = Field(default_factory=list)
+    child_delight_anchors_text: str = Field(default="None saved yet.")
+    continuity_entity_registry: dict[str, Any] = Field(
+        default_factory=lambda: {"characters": {}, "locations": {}, "props": {}}
+    )
+    continuity_world_state: dict[str, Any] = Field(
+        default_factory=lambda: {
+            "scene_index": 0,
+            "current_location_key": "",
+            "current_location_label": "",
+            "previous_location_key": "",
+            "previous_location_label": "",
+            "active_character_keys": [],
+            "active_prop_keys": [],
+            "goal": "",
+            "last_transition": "",
+            "pending_request": "",
+            "pending_location_key": "",
+            "pending_location_label": "",
+            "pending_transition": "",
+            "pending_character_keys": [],
+            "pending_prop_keys": [],
+        }
+    )
+    continuity_scene_history: list[dict[str, Any]] = Field(default_factory=list)
+    continuity_registry_text: str = Field(default="No recurring entities tracked yet.")
+    continuity_world_state_text: str = Field(default="No scene-to-scene world state established yet.")
+    current_scene_visual_summary: str = Field(default="")
+    previous_scene_visual_summary: str = Field(default="")
+    canonical_scene_visual_summary: str = Field(default="")
     character_facts: list[CharacterFact] = Field(default_factory=list)
     turn_number: int = Field(default=0)
+    response_turn_number: int = Field(default=0)
     generated_asset_urls: list[str] = Field(
         default_factory=list,
         description="GCS URLs of all Veo 3.1 / Nano Banana 2 generated assets this session.",
@@ -82,6 +123,58 @@ class StorySession(BaseModel):
             # v1 didn't have elevenlabs_audio_chunks
             if "elevenlabs_audio_chunks" not in data:
                 data["elevenlabs_audio_chunks"] = []
+            if "story_tone" not in data:
+                data["story_tone"] = "cozy"
+            if "child_age" not in data:
+                data["child_age"] = 4
+            if "child_age_band" not in data:
+                data["child_age_band"] = "4-5"
+            if "story_phase" not in data:
+                data["story_phase"] = "opening"
+            if "assembly_kind" not in data:
+                data["assembly_kind"] = "initial"
+            if "scene_render_pending" not in data:
+                data["scene_render_pending"] = False
+            if "theater_release_ready" not in data:
+                data["theater_release_ready"] = False
+            if "child_delight_anchors" not in data:
+                data["child_delight_anchors"] = []
+            if "child_delight_anchors_text" not in data:
+                data["child_delight_anchors_text"] = "None saved yet."
+            if "continuity_entity_registry" not in data:
+                data["continuity_entity_registry"] = {"characters": {}, "locations": {}, "props": {}}
+            if "continuity_world_state" not in data:
+                data["continuity_world_state"] = {
+                    "scene_index": 0,
+                    "current_location_key": "",
+                    "current_location_label": "",
+                    "previous_location_key": "",
+                    "previous_location_label": "",
+                    "active_character_keys": [],
+                    "active_prop_keys": [],
+                    "goal": "",
+                    "last_transition": "",
+                    "pending_request": "",
+                    "pending_location_key": "",
+                    "pending_location_label": "",
+                    "pending_transition": "",
+                    "pending_character_keys": [],
+                    "pending_prop_keys": [],
+                }
+            if "continuity_scene_history" not in data:
+                data["continuity_scene_history"] = []
+            if "continuity_registry_text" not in data:
+                data["continuity_registry_text"] = "No recurring entities tracked yet."
+            if "continuity_world_state_text" not in data:
+                data["continuity_world_state_text"] = "No scene-to-scene world state established yet."
+            if "current_scene_visual_summary" not in data:
+                data["current_scene_visual_summary"] = ""
+            if "previous_scene_visual_summary" not in data:
+                data["previous_scene_visual_summary"] = ""
+            if "canonical_scene_visual_summary" not in data:
+                data["canonical_scene_visual_summary"] = ""
+            if "response_turn_number" not in data:
+                data["response_turn_number"] = data.get("turn_number", 0)
         return data
 
     def take_snapshot(self) -> None:

@@ -27,9 +27,15 @@ from pydantic import BaseModel, ConfigDict, Field
 
 class ClientCommandType(StrEnum):
     REWIND = "rewind"
+    BRANCH_TO_SCENE = "branch_to_scene" # Jump back to an earlier saved story scene/page
     SPYGLASS_IMAGE = "spyglass_image"   # GCS URL of an optional shared item photo
+    TOY_SHARE_START = "toy_share_start" # Child opened guided toy show-and-tell
+    TOY_SHARE_END = "toy_share_end"     # Guided toy show-and-tell closed
+    ASSEMBLY_PLAY_PROMPT = "assembly_play_prompt" # Waiting-room mini activity during movie assembly
     RESUME_SESSION = "resume_session"   # For reconnect rehydration
     HEARTBEAT = "heartbeat"
+    MOVIE_FEEDBACK = "movie_feedback"   # Parent feedback after the final movie
+    MOVIE_REMAKE = "movie_remake"       # Parent asked for a better rebuilt movie
     THEATER_CLOSE = "theater_close"     # Child closed the theater — terminate stream
     END_STORY = "end_story"             # Child/parent requested story ending now
     IOT_CONFIG = "iot_config"           # Parent provided HA url/token override
@@ -59,6 +65,7 @@ class ServerEventType(StrEnum):
     QUEUE_POSITION = "queue_position"   # Graceful "you are #3 in line" UX
     SESSION_REHYDRATED = "session_rehydrated"
     REWIND_COMPLETE = "rewind_complete"  # Rewind completed — session rolled back
+    UI_COMMAND = "ui_command"
     ERROR = "error"
     LIGHTING_COMMAND = "lighting_command"
     USER_TRANSCRIPTION = "user_transcription"
@@ -84,12 +91,21 @@ def theater_mode_event(
     trading_card_url: str | None = None,
     narration_lines: list[str] | None = None,
     audio_available: bool | None = None,
+    story_title: str | None = None,
+    child_name: str | None = None,
+    story_phase: str | None = None,
 ) -> ServerEvent:
     payload: dict[str, Any] = {"mp4_url": mp4_url, "trading_card_url": trading_card_url}
     if narration_lines is not None:
         payload["narration_lines"] = narration_lines
     if audio_available is not None:
         payload["audio_available"] = audio_available
+    if story_title:
+        payload["story_title"] = story_title
+    if child_name:
+        payload["child_name"] = child_name
+    if story_phase:
+        payload["story_phase"] = story_phase
     return ServerEvent(type=ServerEventType.THEATER_MODE, payload=payload)
 
 

@@ -17,13 +17,27 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 
 // Singleton AudioContext — NEVER create inside React render
 let _globalAudioContext: AudioContext | null = null;
+let _audioWorkletModulesPromise: Promise<void> | null = null;
 
 function getAudioContext(): AudioContext {
     if (!_globalAudioContext) {
         // Output format is natively 24kHz.
-        _globalAudioContext = new AudioContext({ sampleRate: 24000 });
+        _globalAudioContext = new AudioContext({
+            sampleRate: 24000,
+            latencyHint: 'interactive',
+        });
     }
     return _globalAudioContext;
+}
+
+function ensureAudioWorkletModules(ctx: AudioContext): Promise<void> {
+    if (!_audioWorkletModulesPromise) {
+        _audioWorkletModulesPromise = Promise.all([
+            ctx.audioWorklet.addModule('/worklets/downsampler-processor.js'),
+            ctx.audioWorklet.addModule('/worklets/playback-processor.js'),
+        ]).then(() => undefined);
+    }
+    return _audioWorkletModulesPromise;
 }
 
 export type AudioState = 'idle' | 'listening' | 'speaking' | 'buffering';
@@ -37,12 +51,35 @@ interface UseAudioWorkletOptions {
     onFlushComplete?: () => void;
 }
 
-const SPEECH_START_RMS = 0.0075;
-const SPEECH_END_RMS = 0.0038;
-const SPEECH_MIN_ACTIVE_MS = 140;
-const SPEECH_END_SILENCE_MS = 1400;
+// Slightly stricter onset gating cuts random bumps/background sounds without
+// forcing kids to shout before Amelia listens.
+const SPEECH_START_RMS = 0.0082;
+const SPEECH_END_RMS = 0.0042;
+const SPEECH_MIN_ACTIVE_MS = 160;
+const SPEECH_END_SILENCE_MS = 950;
 const SPEECH_PREROLL_CHUNKS = 15; // ~300ms with 20ms PCM chunks
 const SPEECH_MAX_UTTERANCE_MS = 9000;
+
+function readClientNumber(value: string | undefined, fallback: number): number {
+    const parsed = Number(value);
+    if (!Number.isFinite(parsed)) {
+        return fallback;
+    }
+    return Math.max(0, parsed);
+}
+
+const NORMAL_BARGE_IN_BLOCK_MS = readClientNumber(
+    process.env.NEXT_PUBLIC_BARGE_IN_BLOCK_MS,
+    220,
+);
+const GREETING_BARGE_IN_BLOCK_MS = readClientNumber(
+    process.env.NEXT_PUBLIC_GREETING_BARGE_IN_BLOCK_MS,
+    900,
+);
+const FLUSH_COMPLETE_GRACE_MS = readClientNumber(
+    process.env.NEXT_PUBLIC_FLUSH_COMPLETE_GRACE_MS,
+    140,
+);
 
 export function useAudioWorklet({
     onPcmChunk,
@@ -68,10 +105,25 @@ export function useAudioWorklet({
     const voiceActiveStartedAtRef = useRef<number | null>(null);
     const preRollRef = useRef<ArrayBuffer[]>([]);
     const duckedForUserRef = useRef(false);
+    const outputMutedRef = useRef(false);
     const noiseFloorRef = useRef(0.002);
     const captureBoostUntilRef = useRef<number | null>(null);
     const bargeInBlockUntilRef = useRef<number | null>(null);
     const greetingShieldRef = useRef(true);
+    const onPcmChunkRef = useRef(onPcmChunk);
+    const onVoiceVolumeRef = useRef(onVoiceVolume);
+    const onVoiceActivityStartRef = useRef(onVoiceActivityStart);
+    const onVoiceActivityEndRef = useRef(onVoiceActivityEnd);
+    const onFlushCompleteRef = useRef(onFlushComplete);
+
+    onPcmChunkRef.current = onPcmChunk;
+    onVoiceVolumeRef.current = onVoiceVolume;
+    onVoiceActivityStartRef.current = onVoiceActivityStart;
+    onVoiceActivityEndRef.current = onVoiceActivityEnd;
+    onFlushCompleteRef.current = onFlushComplete;
+
+    const getNarrationCeiling = useCallback(() => (outputMutedRef.current ? 0 : 0.8), []);
+    const getNarrationDucked = useCallback(() => (outputMutedRef.current ? 0 : 0.25), []);
 
     const initAudio = useCallback(async () => {
         if (audioInitializedRef.current) {
@@ -81,13 +133,12 @@ export function useAudioWorklet({
         if (ctx.state === 'suspended') await ctx.resume();
 
         // Load AudioWorklet processors
-        await ctx.audioWorklet.addModule('/worklets/downsampler-processor.js');
-        await ctx.audioWorklet.addModule('/worklets/playback-processor.js');
+        await ensureAudioWorkletModules(ctx);
 
         // Playback path: PlaybackProcessor -> GainNode (ceiling 0.8) -> speakers
         const playbackNode = new AudioWorkletNode(ctx, 'playback-processor');
         const gainNode = ctx.createGain();
-        gainNode.gain.value = 0.8; // Hard ceiling (Iter 5 #5 — hearing damage prevention)
+        gainNode.gain.value = getNarrationCeiling(); // Hard ceiling (Iter 5 #5 — hearing damage prevention)
         playbackNode.connect(gainNode);
         gainNode.connect(ctx.destination);
 
@@ -97,12 +148,21 @@ export function useAudioWorklet({
                 if (greetingShieldRef.current) {
                     greetingShieldRef.current = false;
                 }
-                setAudioState('listening');
-                if (gainNodeRef.current && duckedForUserRef.current) {
-                    gainNodeRef.current.gain.linearRampToValueAtTime(0.8, gainNodeRef.current.context.currentTime + 0.15);
-                    duckedForUserRef.current = false;
-                }
-                onFlushComplete?.();
+                const flushDelayMs = Math.max(
+                    FLUSH_COMPLETE_GRACE_MS,
+                    Math.min(400, Math.round((ctx.outputLatency ?? 0) * 1000) + 40),
+                );
+                window.setTimeout(() => {
+                    setAudioState('listening');
+                    if (gainNodeRef.current && duckedForUserRef.current) {
+                        gainNodeRef.current.gain.linearRampToValueAtTime(
+                            getNarrationCeiling(),
+                            gainNodeRef.current.context.currentTime + 0.15,
+                        );
+                        duckedForUserRef.current = false;
+                    }
+                    onFlushCompleteRef.current?.();
+                }, flushDelayMs);
             }
         };
 
@@ -122,7 +182,7 @@ export function useAudioWorklet({
 
         audioInitializedRef.current = true;
         return ctx;
-    }, []);
+    }, [getNarrationCeiling]);
 
     const primeAudio = useCallback(async () => {
         await initAudio();
@@ -166,9 +226,7 @@ export function useAudioWorklet({
             const rms = Math.sqrt(sum / Math.max(samples.length, 1)) / 32768;
 
             // Feed volume to visualizer regardless of speaking/listening phase.
-            if (onVoiceVolume) {
-                onVoiceVolume(rms);
-            }
+            onVoiceVolumeRef.current?.(rms);
 
             const now = performance.now();
             const noiseFloor = noiseFloorRef.current;
@@ -211,12 +269,15 @@ export function useAudioWorklet({
                             playbackNodeRef.current.port.postMessage({ type: 'interrupt' });
                         }
                         if (gainNodeRef.current && !duckedForUserRef.current) {
-                            gainNodeRef.current.gain.linearRampToValueAtTime(0.25, gainNodeRef.current.context.currentTime + 0.1);
+                            gainNodeRef.current.gain.linearRampToValueAtTime(
+                                getNarrationDucked(),
+                                gainNodeRef.current.context.currentTime + 0.1,
+                            );
                             duckedForUserRef.current = true;
                         }
-                        onVoiceActivityStart?.();
+                        onVoiceActivityStartRef.current?.();
                         for (const chunk of preRollRef.current) {
-                            onPcmChunk(chunk);
+                            onPcmChunkRef.current(chunk);
                         }
                         preRollRef.current = [];
                     }
@@ -227,7 +288,7 @@ export function useAudioWorklet({
             }
 
             // Voice active: stream chunks continuously until end-of-speech silence.
-            onPcmChunk(pcm);
+            onPcmChunkRef.current(pcm);
             if (
                 voiceActiveStartedAtRef.current !== null &&
                 now - voiceActiveStartedAtRef.current >= SPEECH_MAX_UTTERANCE_MS
@@ -238,10 +299,13 @@ export function useAudioWorklet({
                 silenceStartedAtRef.current = null;
                 preRollRef.current = [];
                 if (gainNodeRef.current && duckedForUserRef.current) {
-                    gainNodeRef.current.gain.linearRampToValueAtTime(0.8, gainNodeRef.current.context.currentTime + 0.15);
+                    gainNodeRef.current.gain.linearRampToValueAtTime(
+                        getNarrationCeiling(),
+                        gainNodeRef.current.context.currentTime + 0.15,
+                    );
                     duckedForUserRef.current = false;
                 }
-                onVoiceActivityEnd?.();
+                onVoiceActivityEndRef.current?.();
                 return;
             }
             if (rms <= dynamicEnd) {
@@ -255,10 +319,13 @@ export function useAudioWorklet({
                     silenceStartedAtRef.current = null;
                     preRollRef.current = [];
                     if (gainNodeRef.current && duckedForUserRef.current) {
-                        gainNodeRef.current.gain.linearRampToValueAtTime(0.8, gainNodeRef.current.context.currentTime + 0.15);
+                        gainNodeRef.current.gain.linearRampToValueAtTime(
+                            getNarrationCeiling(),
+                            gainNodeRef.current.context.currentTime + 0.15,
+                        );
                         duckedForUserRef.current = false;
                     }
-                    onVoiceActivityEnd?.();
+                    onVoiceActivityEndRef.current?.();
                 }
             } else {
                 silenceStartedAtRef.current = null;
@@ -269,12 +336,12 @@ export function useAudioWorklet({
         downsamplerNodeRef.current = downsamplerNode;
 
         setAudioState('listening');
-    }, [initAudio, onPcmChunk, onVoiceVolume]);
+    }, [getNarrationCeiling, getNarrationDucked, initAudio]);
 
     const stopListening = useCallback(() => {
         if (voiceActiveRef.current) {
             voiceActiveRef.current = false;
-            onVoiceActivityEnd?.();
+            onVoiceActivityEndRef.current?.();
         }
         voiceRiseStartedAtRef.current = null;
         silenceStartedAtRef.current = null;
@@ -287,18 +354,20 @@ export function useAudioWorklet({
         micStreamRef.current?.getTracks().forEach((t) => t.stop());
         micStreamRef.current = null;
         if (gainNodeRef.current) {
-            gainNodeRef.current.gain.value = 0.8;
+            gainNodeRef.current.gain.value = getNarrationCeiling();
         }
         duckedForUserRef.current = false;
         setAudioState('idle');
-    }, [onVoiceActivityEnd]);
+    }, [getNarrationCeiling]);
 
     /** Feed raw 24kHz int16 PCM bytes from the backend into the playback worklet. */
     const playPcmChunk = useCallback((pcmBytes: ArrayBuffer) => {
         if (!playbackNodeRef.current) return;
         if (!isSpeakingRef.current) {
             const now = performance.now();
-            const blockMs = greetingShieldRef.current ? 2200 : 650;
+            const blockMs = greetingShieldRef.current
+                ? GREETING_BARGE_IN_BLOCK_MS
+                : NORMAL_BARGE_IN_BLOCK_MS;
             bargeInBlockUntilRef.current = now + blockMs;
         }
         isSpeakingRef.current = true;
@@ -312,6 +381,20 @@ export function useAudioWorklet({
         // We do NOT instantly unlock the microphone here, or else the mic will pick
         // up Amelia's voice coming out of the speakers (Echo/Double-trigger bug).
         playbackNodeRef.current?.port.postMessage({ type: 'flush' });
+    }, []);
+
+    const setNarrationMuted = useCallback((muted: boolean) => {
+        outputMutedRef.current = muted;
+        const gainNode = gainNodeRef.current;
+        if (!gainNode) return;
+
+        const target = muted
+            ? 0
+            : duckedForUserRef.current
+                ? 0.25
+                : 0.8;
+        gainNode.gain.cancelScheduledValues(gainNode.context.currentTime);
+        gainNode.gain.linearRampToValueAtTime(target, gainNode.context.currentTime + 0.08);
     }, []);
 
     // iOS Background Audio Suppression fix (Iter 5 #2)
@@ -343,5 +426,6 @@ export function useAudioWorklet({
         stopListening,
         playPcmChunk,
         flushPlaybackBuffer,
+        setNarrationMuted,
     };
 }
