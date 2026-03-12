@@ -1,1 +1,1 @@
-"""Backend package for the Interactive Storyteller."""
+"""Backend package for StorySpark."""

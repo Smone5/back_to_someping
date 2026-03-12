@@ -2,8 +2,8 @@
 # deploy-frontend.sh — Build, push, and deploy the frontend to Cloud Run
 set -euo pipefail
 
-PROJECT="interactive-story-gemini"
-REGION="us-central1"
+PROJECT="${GOOGLE_CLOUD_PROJECT:-interactive-story-gemini}"
+REGION="${GOOGLE_CLOUD_LOCATION:-us-central1}"
 TAG="${1:-$(date +%Y%m%d-%H%M%S)}"
 FRONTEND_IMAGE="gcr.io/$PROJECT/storyteller-frontend:$TAG"
 REQUIRE_MATH="${NEXT_PUBLIC_REQUIRE_MATH:-false}"

@@ -3,6 +3,7 @@
 import { useEffect, useRef, useState } from 'react';
 
 import { useUiSounds } from '@/hooks/useUiSounds';
+import type { TheaterLightingCue } from './homeAssistant';
 
 type MovieFeedbackRating = 'loved_it' | 'pretty_good' | 'needs_fixing';
 
@@ -38,6 +39,9 @@ interface TheaterModeProps {
     onPlaybackStart?: () => void;
     onPlaybackPause?: () => void;
     onPlaybackEnded?: () => void;
+    lightingCues?: TheaterLightingCue[];
+    onLightingCueChange?: (cue: TheaterLightingCue) => void;
+    onMakeAnotherStory?: () => void;
     onClose: () => void;
 }
 
@@ -65,10 +69,15 @@ export default function TheaterMode({
     onPlaybackStart,
     onPlaybackPause,
     onPlaybackEnded,
+    lightingCues,
+    onLightingCueChange,
+    onMakeAnotherStory,
     onClose,
 }: TheaterModeProps) {
     const videoRef = useRef<HTMLVideoElement>(null);
     const audioProbeTimerRef = useRef<number | null>(null);
+    const lastLightingCueIndexRef = useRef<number | null>(null);
+    const onTheaterOpenedRef = useRef(onTheaterOpened);
     const [videoError, setVideoError] = useState(false);
     const [isPlaying, setIsPlaying] = useState(false);
     const [needsUserGesture, setNeedsUserGesture] = useState(false);
@@ -131,11 +140,15 @@ export default function TheaterMode({
     };
 
     useEffect(() => {
+        onTheaterOpenedRef.current = onTheaterOpened;
+    }, [onTheaterOpened]);
+
+    useEffect(() => {
         const video = videoRef.current;
         if (!video) {
             return;
         }
-        onTheaterOpened?.();
+        onTheaterOpenedRef.current?.();
         setVideoError(false);
         setIsRevealed(false);
         setNeedsUserGesture(false);
@@ -149,10 +162,13 @@ export default function TheaterMode({
         setRemakeSubmitting(false);
         setFeedbackModalOpen(false);
         setHeroCardModalOpen(false);
+        lastLightingCueIndexRef.current = null;
         clearAudioProbe();
         video.pause();
         video.load();
         video.currentTime = 0;
+        video.muted = calmMode;
+        video.volume = calmMode ? 0 : 1;
         video.play().then(() => {
             setIsPlaying(true);
             setNeedsUserGesture(false);
@@ -161,7 +177,7 @@ export default function TheaterMode({
             setIsPlaying(false);
             setNeedsUserGesture(true);
         });
-    }, [mp4Url, onTheaterOpened]);
+    }, [mp4Url]);
 
     useEffect(() => {
         const timer = window.setTimeout(() => {
@@ -194,9 +210,44 @@ export default function TheaterMode({
         };
     }, []);
 
+    const emitLightingCueForCurrentTime = (force: boolean = false) => {
+        if (!onLightingCueChange || !lightingCues?.length) {
+            return;
+        }
+        const video = videoRef.current;
+        if (!video) {
+            return;
+        }
+        const currentTime = Math.max(0, Number(video.currentTime || 0));
+        let cueIndex = -1;
+        for (let idx = 0; idx < lightingCues.length; idx += 1) {
+            const cue = lightingCues[idx];
+            const endSeconds = typeof cue.end_seconds === 'number'
+                ? cue.end_seconds
+                : Number.POSITIVE_INFINITY;
+            if (currentTime >= cue.start_seconds && currentTime < endSeconds) {
+                cueIndex = idx;
+                break;
+            }
+        }
+        if (cueIndex < 0) {
+            if (currentTime >= lightingCues[lightingCues.length - 1].start_seconds) {
+                cueIndex = lightingCues.length - 1;
+            } else {
+                return;
+            }
+        }
+        if (!force && lastLightingCueIndexRef.current === cueIndex) {
+            return;
+        }
+        lastLightingCueIndexRef.current = cueIndex;
+        onLightingCueChange(lightingCues[cueIndex]);
+    };
+
     useEffect(() => {
         if (videoRef.current) {
             videoRef.current.muted = calmMode;
+            videoRef.current.volume = calmMode ? 0 : 1;
         }
         if (calmMode) {
             clearAudioProbe();
@@ -503,6 +554,7 @@ export default function TheaterMode({
                                             setHasVideoEnded(false);
                                             clearAudioProbe();
                                             onPlaybackStart?.();
+                                            emitLightingCueForCurrentTime(true);
                                         }}
                                         onPause={() => {
                                             setIsPlaying(false);
@@ -514,6 +566,12 @@ export default function TheaterMode({
                                             setHasVideoEnded(true);
                                             clearAudioProbe();
                                             onPlaybackEnded?.();
+                                        }}
+                                        onSeeked={() => {
+                                            emitLightingCueForCurrentTime(true);
+                                        }}
+                                        onTimeUpdate={() => {
+                                            emitLightingCueForCurrentTime(false);
                                         }}
                                         aria-label="Your completed story movie"
                                     />
@@ -550,7 +608,11 @@ export default function TheaterMode({
                                                     className="magic-btn magic-btn-gold"
                                                     onClick={() => {
                                                         playUiSound('magic');
-                                                        onClose();
+                                                        if (onMakeAnotherStory) {
+                                                            onMakeAnotherStory();
+                                                        } else {
+                                                            onClose();
+                                                        }
                                                     }}
                                                 >
                                                     ✨ Make Another Story!
@@ -590,7 +652,11 @@ export default function TheaterMode({
                             className="magic-btn magic-btn-gold"
                             onClick={() => {
                                 playUiSound('magic');
-                                onClose();
+                                if (onMakeAnotherStory) {
+                                    onMakeAnotherStory();
+                                } else {
+                                    onClose();
+                                }
                             }}
                         >
                             ✨ Make Another Story!

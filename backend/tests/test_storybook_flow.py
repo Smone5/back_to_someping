@@ -90,6 +90,7 @@ class StorybookFlowTests(unittest.TestCase):
             {
                 "assembly_status": "complete",
                 "final_video_url": "https://example.com/movie.mp4",
+                "final_scene_count": 1,
                 "narration_lines": ["Once upon a time"],
                 "audio_available": True,
                 "final_has_audio_stream": True,

@@ -61,6 +61,14 @@ resource "google_project_iam_member" "backend_logging" {
   member  = "serviceAccount:${google_service_account.backend_sa.email}"
 }
 
+# Allow the backend service account to consume enabled Google APIs such as
+# Cloud Text-to-Speech on behalf of this project.
+resource "google_project_iam_member" "backend_service_usage" {
+  project = var.project_id
+  role    = "roles/serviceusage.serviceUsageConsumer"
+  member  = "serviceAccount:${google_service_account.backend_sa.email}"
+}
+
 # Service Account Token Creator (for Signed URLs and Jobs API tokens)
 resource "google_project_iam_member" "backend_token_creator" {
   project = var.project_id

@@ -13,6 +13,7 @@ locals {
     "run.googleapis.com",
     "secretmanager.googleapis.com",
     "storage.googleapis.com",
+    "texttospeech.googleapis.com",
   ])
 }
 

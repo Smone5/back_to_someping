@@ -65,6 +65,9 @@ _LOCATION_TERMS = [
     "cave",
     "palace",
     "bridge",
+    "path",
+    "trail",
+    "road",
     "boat",
     "ship",
     "slide",
@@ -78,6 +81,7 @@ _ANIMATE_TERMS = [
     "santa",
     "elves",
     "elf",
+    "bubble",
     "dragon",
     "ghost",
     "witch",
@@ -94,6 +98,10 @@ _ANIMATE_TERMS = [
 ]
 
 _PROP_TERMS = [
+    "treasure chest",
+    "chest",
+    "bubble",
+    "bubbles",
     "fireplace",
     "window",
     "throne",
@@ -165,6 +173,32 @@ _EXPLICIT_VISUAL_REQUEST_PATTERNS: tuple[re.Pattern[str], ...] = (
     re.compile(r"\btake me there\b", flags=re.IGNORECASE),
 )
 
+_NAVIGATION_PAGE_TURN_PATTERNS: tuple[re.Pattern[str], ...] = (
+    re.compile(
+        r"\b(?:follow|explore|head|travel|venture|go|walk|run)\b.*\b(?:path|trail|road|way|direction)\b",
+        flags=re.IGNORECASE,
+    ),
+    re.compile(
+        r"\b(?:down|along|through|toward|towards|away from)\s+the\s+(?:path|trail|road|way)\b",
+        flags=re.IGNORECASE,
+    ),
+    re.compile(
+        r"\b(?:opposite direction|other direction|another way)\b",
+        flags=re.IGNORECASE,
+    ),
+    re.compile(
+        r"\bwhere does\b.*\b(?:path|trail|road|way)\b.*\bgo\b",
+        flags=re.IGNORECASE,
+    ),
+)
+
+_ROUTE_FOCUS_TERMS = (
+    "path",
+    "trail",
+    "road",
+    "bridge",
+)
+
 _MAJOR_VISUAL_CHANGE_PATTERNS: tuple[re.Pattern[str], ...] = (
     re.compile(r"\b(?:transform|transformation|turn into|turns into|become|becomes|became)\b", flags=re.IGNORECASE),
     re.compile(r"\b(?:reveal|reveals|discovery|discover|suddenly)\b", flags=re.IGNORECASE),
@@ -212,7 +246,25 @@ def _sentence_case(text: str) -> str:
 
 
 def _canonical_label(text: str) -> str:
-    cleaned = re.sub(r"^(?:inside|outside|at|in|into|through|from|to)\s+", "", _clean_text(text), flags=re.IGNORECASE)
+    cleaned = _clean_text(text)
+    cleaned = re.sub(
+        r"^(?:let'?s|can we|could we|should we|do we|where does|where do|what(?:'s| is)|show me|take me)\s+",
+        "",
+        cleaned,
+        flags=re.IGNORECASE,
+    )
+    cleaned = re.sub(
+        r"^(?:go|walk|run|head|travel|venture|explore|follow|see|look|step|enter)\s+",
+        "",
+        cleaned,
+        flags=re.IGNORECASE,
+    )
+    cleaned = re.sub(
+        r"^(?:inside|outside|at|in|into|through|from|to|toward|towards|along|down|up)\s+",
+        "",
+        cleaned,
+        flags=re.IGNORECASE,
+    )
     cleaned = re.sub(r"^(?:the|a|an)\s+", "", cleaned, flags=re.IGNORECASE)
     return cleaned[:_MAX_ENTITY_TEXT]
 
@@ -268,6 +320,78 @@ def _detect_transition(text: str) -> str:
         if pattern.search(text or ""):
             return name
     return ""
+
+
+def _matching_entity_keys_for_fragment(
+    state: Mapping[str, Any],
+    bucket: str,
+    fragment: str,
+    *,
+    candidate_keys: list[str] | None = None,
+) -> list[str]:
+    fragment_clean = _clean_text(fragment).lower()
+    if not fragment_clean:
+        return []
+    registry = state.get("continuity_entity_registry", {})
+    if not isinstance(registry, Mapping):
+        return []
+    bucket_map = registry.get(bucket, {})
+    if not isinstance(bucket_map, Mapping):
+        return []
+
+    allowed_keys = {str(key).strip() for key in list(candidate_keys or []) if str(key).strip()}
+    matches: list[str] = []
+    for raw_key, raw_entity in bucket_map.items():
+        key = str(raw_key).strip()
+        if not key:
+            continue
+        if allowed_keys and key not in allowed_keys:
+            continue
+        if not isinstance(raw_entity, Mapping):
+            continue
+        label = _clean_text(raw_entity.get("label", "")).lower()
+        aliases = [
+            _clean_text(item).lower()
+            for item in list(raw_entity.get("aliases", []) or [])
+            if _clean_text(item)
+        ]
+        haystacks = [label, *aliases]
+        if any(fragment_clean in candidate for candidate in haystacks if candidate):
+            matches.append(key)
+    return matches
+
+
+def _is_same_place_reveal_request(state: Mapping[str, Any], text: str) -> bool:
+    cleaned = _clean_text(text)
+    if not cleaned:
+        return False
+    lowered = cleaned.lower()
+    if _extract_location_candidates(cleaned) or _is_navigation_page_turn_request(cleaned):
+        return False
+    reveal_action = bool(
+        re.search(
+            r"\b(?:open|unlock|peek|look|see|show|lift|what(?:'s| is))\b",
+            cleaned,
+            flags=re.IGNORECASE,
+        )
+    )
+    if not reveal_action:
+        return False
+    if re.search(r"\b(?:treasure chest|chest)\b", cleaned, flags=re.IGNORECASE):
+        return True
+    if not re.search(r"\b(?:it|inside|in|into)\b", lowered):
+        return False
+    world = state.get("continuity_world_state", {})
+    active_prop_keys = []
+    if isinstance(world, Mapping):
+        active_prop_keys = [str(item).strip() for item in list(world.get("active_prop_keys", []) or []) if str(item).strip()]
+    if _matching_entity_keys_for_fragment(state, "props", "chest", candidate_keys=active_prop_keys):
+        return True
+    current_scene_bits = " ".join(
+        _clean_text(state.get(key, ""))
+        for key in ("current_scene_description", "current_scene_visual_summary", "previous_scene_visual_summary")
+    ).lower()
+    return "treasure chest" in current_scene_bits or re.search(r"\bchest\b", current_scene_bits) is not None
 
 
 def _registry_bucket(state: dict[str, Any], bucket: str) -> dict[str, dict[str, Any]]:
@@ -378,6 +502,36 @@ def _is_explicit_visual_request(text: str) -> bool:
     return any(pattern.search(cleaned) for pattern in _EXPLICIT_VISUAL_REQUEST_PATTERNS)
 
 
+def _is_navigation_page_turn_request(text: str) -> bool:
+    cleaned = _clean_text(text)
+    if not cleaned:
+        return False
+    return any(pattern.search(cleaned) for pattern in _NAVIGATION_PAGE_TURN_PATTERNS)
+
+
+def _is_route_focus_location(label: str) -> bool:
+    lowered = _clean_text(label).lower()
+    return any(term in lowered for term in _ROUTE_FOCUS_TERMS)
+
+
+def _select_location_candidate(
+    text: str,
+    locations: list[str],
+    *,
+    current_location_label: str = "",
+) -> str:
+    if not locations:
+        return ""
+    if _is_navigation_page_turn_request(text):
+        for location in locations:
+            if _is_route_focus_location(location):
+                return location
+        for location in locations:
+            if current_location_label and not _locations_match(location, current_location_label):
+                return location
+    return locations[0]
+
+
 def _has_major_visual_change_signal(*texts: str) -> bool:
     combined = _clean_text(" ".join(text for text in texts if text))
     if not combined:
@@ -400,12 +554,17 @@ def should_render_new_scene_page(
     pending_transition = _clean_text(world.get("pending_transition", ""))
     child_text = _clean_text(state.get("last_child_utterance", "") or world.get("pending_request", ""))
     proposed_location_label = _clean_text(target_location_label)
+    navigation_request = _is_navigation_page_turn_request(child_text)
     child_age_band = _clean_text(state.get("child_age_band", ""))
     younger_child_mode = child_age_band == "4-5"
 
     if not proposed_location_label:
         proposed_locations = _extract_location_candidates(cleaned_description)
-        proposed_location_label = proposed_locations[0] if proposed_locations else ""
+        proposed_location_label = _select_location_candidate(
+            cleaned_description,
+            proposed_locations,
+            current_location_label=current_location_label,
+        )
 
     if not current_location_label and not str(state.get("current_scene_description", "") or "").strip():
         return SceneRenderDecision(True, "first_page")
@@ -436,6 +595,8 @@ def should_render_new_scene_page(
         and _locations_match(current_location_label, proposed_location_label)
     )
     if same_location:
+        if navigation_request:
+            return SceneRenderDecision(True, "navigation_request_same_location")
         if render_in_flight:
             return SceneRenderDecision(False, "same_location_while_rendering")
         if younger_child_mode:
@@ -607,14 +768,21 @@ def update_continuity_from_child_utterance(state: dict[str, Any], child_text: st
 
     ensure_story_continuity_state(state)
     world = state["continuity_world_state"]
+    current_location_key = _clean_text(world.get("current_location_key", ""))
+    current_location_label = _clean_text(world.get("current_location_label", ""))
     world["pending_request"] = cleaned[:160]
     world["goal"] = cleaned[:160]
     world["pending_transition"] = _detect_transition(cleaned)
 
     scene_number = _scene_number_hint(state)
+    same_place_reveal = _is_same_place_reveal_request(state, cleaned)
     locations = _extract_location_candidates(cleaned)
     if locations:
-        label = locations[0]
+        label = _select_location_candidate(
+            cleaned,
+            locations,
+            current_location_label=current_location_label,
+        )
         key = _register_entity(
             state,
             bucket="locations",
@@ -625,6 +793,10 @@ def update_continuity_from_child_utterance(state: dict[str, Any], child_text: st
         )
         world["pending_location_key"] = key
         world["pending_location_label"] = label
+    elif same_place_reveal and current_location_label:
+        world["pending_location_key"] = current_location_key
+        world["pending_location_label"] = current_location_label
+        world["pending_transition"] = world.get("pending_transition") or "same_room"
 
     characters = _extract_character_candidates(cleaned, state)
     pending_character_keys: list[str] = []
@@ -655,6 +827,16 @@ def update_continuity_from_child_utterance(state: dict[str, Any], child_text: st
         )
         if key:
             pending_prop_keys.append(key)
+    if same_place_reveal:
+        carried_chest_keys = _matching_entity_keys_for_fragment(
+            state,
+            "props",
+            "chest",
+            candidate_keys=[str(item).strip() for item in list(world.get("active_prop_keys", []) or []) if str(item).strip()],
+        )
+        for key in carried_chest_keys:
+            if key and key not in pending_prop_keys:
+                pending_prop_keys.append(key)
     if pending_prop_keys:
         world["pending_prop_keys"] = pending_prop_keys[-6:]
 
@@ -675,8 +857,15 @@ def validate_live_scene_request(
     current_visual_summary = _clean_text(state.get("current_scene_visual_summary", ""))
     previous_visual_summary = _clean_text(state.get("previous_scene_visual_summary", ""))
     pending_transition = _clean_text(world.get("pending_transition", ""))
+    child_text = _clean_text(state.get("last_child_utterance", "") or world.get("pending_request", ""))
+    navigation_request = _is_navigation_page_turn_request(child_text)
+    same_place_reveal = _is_same_place_reveal_request(state, child_text)
     proposed_locations = _extract_location_candidates(cleaned)
-    proposed_location_label = proposed_locations[0] if proposed_locations else ""
+    proposed_location_label = _select_location_candidate(
+        cleaned,
+        proposed_locations,
+        current_location_label=current_location_label,
+    )
 
     target_location_label = ""
     if pending_location_label:
@@ -724,10 +913,25 @@ def validate_live_scene_request(
     prompt_notes: list[str] = []
     if carry_character_labels and not any(_mentions_label(resolved_description, label) for label in carry_character_labels):
         issues.append("missing_character_carryover")
+        resolved_description = (
+            resolved_description.rstrip(". ")
+            + ". Keep these same characters in view: "
+            + ", ".join(carry_character_labels)
+            + "."
+        )
         prompt_notes.append(
             "Keep these recurring characters visible and consistent: "
             + ", ".join(carry_character_labels)
             + "."
+        )
+    if carry_character_labels and not pending_character_keys:
+        prompt_notes.append(
+            "Do not invent new named characters, creatures, animals, or vehicles. "
+            "Stay with the already established story cast unless the child explicitly asked for someone new."
+        )
+        prompt_notes.append(
+            "Do not replace the current helper, creature, or guide with a different one. "
+            "Carry the same established cast forward into the new beat."
         )
     if (
         carry_prop_labels
@@ -737,6 +941,12 @@ def validate_live_scene_request(
         and not any(_mentions_label(resolved_description, label) for label in carry_prop_labels)
     ):
         issues.append("missing_prop_carryover")
+        resolved_description = (
+            resolved_description.rstrip(". ")
+            + ". Keep a familiar prop from this same place visible, like "
+            + ", ".join(carry_prop_labels)
+            + "."
+        )
         prompt_notes.append(
             "Retain at least one familiar prop from this place: "
             + ", ".join(carry_prop_labels)
@@ -752,9 +962,37 @@ def validate_live_scene_request(
                 + "."
             )
 
-    if current_location_label and target_location_label and _locations_match(current_location_label, target_location_label):
+    if (
+        pending_transition in {"door", "inside", "tower", "window"}
+        and current_location_label
+        and target_location_label
+        and _locations_match(current_location_label, target_location_label)
+    ):
+        prompt_notes.append(
+            "Treat the next scene as a directly connected space in the same world, like the next room, hidden passage, tower level, or view from the same building."
+        )
+        prompt_notes.append(
+            "Keep the architecture, materials, palette, and lighting family coherent with the current place. Do not jump to an unrelated forest, field, or outdoor biome unless the child explicitly asked to leave."
+        )
+
+    if (
+        current_location_label
+        and target_location_label
+        and _locations_match(current_location_label, target_location_label)
+        and not navigation_request
+    ):
+        if same_place_reveal:
+            prompt_notes.append(
+                "Treat this as a same-place reveal: stay in the exact current setting and focus on what is being opened or discovered there."
+            )
+            prompt_notes.append(
+                "Do not move outdoors or to a different biome just because something new is revealed. Keep the reveal inside the existing cave, room, hall, or hidden nook."
+            )
         prompt_notes.append(
             "Preserve the same room/layout identity from the current scene unless the child clearly changed locations."
+        )
+        prompt_notes.append(
+            "Treat this as the same place from a new angle or focal point. Do not introduce a vehicle ride, train, road trip, portal trip, or any travel montage."
         )
         if current_visual_summary:
             prompt_notes.append(
@@ -762,6 +1000,13 @@ def validate_live_scene_request(
                 + current_visual_summary[:220]
                 + "."
             )
+    elif navigation_request:
+        prompt_notes.append(
+            "Make this feel like moving onward to the next stretch of the journey, not the exact same camera view."
+        )
+        prompt_notes.append(
+            "Shift the composition forward along the route or into the newly explored direction so the child clearly sees progress."
+        )
     elif current_visual_summary and not pending_location_label:
         prompt_notes.append(
             "Use the current image as a continuity anchor: "

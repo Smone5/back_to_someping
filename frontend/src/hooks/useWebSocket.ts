@@ -188,6 +188,9 @@ export function useWebSocket({
             }));
             // Ping/pong for bandwidth monitoring
             pingTimerRef.current = setInterval(() => {
+                if (typeof document !== 'undefined' && document.visibilityState !== 'visible') {
+                    return;
+                }
                 const pingNow = Date.now();
                 if (ws.readyState === WebSocket.OPEN) {
                     lastPingTimeRef.current = pingNow;
@@ -200,6 +203,9 @@ export function useWebSocket({
             }, 10000);
             staleSocketTimerRef.current = setInterval(() => {
                 if (ws.readyState !== WebSocket.OPEN) {
+                    return;
+                }
+                if (typeof document !== 'undefined' && document.visibilityState !== 'visible') {
                     return;
                 }
                 const tickNow = Date.now();
@@ -245,6 +251,11 @@ export function useWebSocket({
             wsRef.current = null;
             clearSocketTimers();
             if (intentionalCloseRef.current) {
+                setState('disconnected');
+                return;
+            }
+            if (typeof document !== 'undefined' && document.visibilityState !== 'visible') {
+                reconnectReasonRef.current = 'hidden_paused';
                 setState('disconnected');
                 return;
             }
@@ -324,6 +335,10 @@ export function useWebSocket({
             if (intentionalCloseRef.current) {
                 return;
             }
+            if (typeof document !== 'undefined' && document.visibilityState !== 'visible' && reason !== 'visibility_resume') {
+                reconnectReasonRef.current = 'hidden_paused';
+                return;
+            }
             reconnectReasonRef.current = reason;
             if (reconnectTimerRef.current) {
                 clearTimeout(reconnectTimerRef.current);
@@ -346,6 +361,16 @@ export function useWebSocket({
 
         const handleVisibilityChange = () => {
             if (document.visibilityState !== 'visible') {
+                reconnectReasonRef.current = 'hidden_paused';
+                clearSocketTimers();
+                const ws = wsRef.current;
+                if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) {
+                    try {
+                        ws.close(1000, 'hidden');
+                    } catch {
+                        // Best-effort visibility pause only.
+                    }
+                }
                 return;
             }
             const ws = wsRef.current;

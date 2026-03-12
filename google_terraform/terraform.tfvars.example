@@ -1,0 +1,25 @@
+# Copy this file to google_terraform/terraform.tfvars and replace the placeholder
+# values before the first terraform apply.
+
+project_id = "your-project-id"
+region     = "us-central1"
+domain_name = "storyspark.example.com"
+
+# These bootstrap image tags should exist before the first terraform apply.
+# After that, deploy.sh will keep the image values updated automatically.
+backend_image  = "gcr.io/your-project-id/storyteller-backend:bootstrap"
+frontend_image = "gcr.io/your-project-id/storyteller-frontend:bootstrap"
+ffmpeg_image   = "gcr.io/your-project-id/storyteller-ffmpeg:bootstrap"
+
+# Common tuning knobs. Everything else can fall back to defaults in variables.tf.
+max_backend_instances  = 10
+max_frontend_instances = 10
+max_live_sessions      = 10
+max_story_turns        = 20
+
+google_genai_use_vertexai       = true
+local_storybook_mode            = false
+enable_fast_storybook_assembly  = false
+enable_client_direct_live       = false
+enable_storybook_director_workflow = false
+enable_storybook_studio_workflow   = true

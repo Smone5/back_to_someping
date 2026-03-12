@@ -1,4 +1,4 @@
-# ── Terraform Variables for Interactive Storyteller ──────────────────────────
+# ── Terraform Variables for StorySpark ───────────────────────────────────────
 
 variable "project_id" {
   description = "Your Google Cloud Project ID."
@@ -80,7 +80,7 @@ variable "local_storybook_mode" {
 }
 
 variable "enable_fast_storybook_assembly" {
-  description = "If true, run storybook assembly inside the backend service instead of the FFmpeg Cloud Run Job."
+  description = "If true, prefer the faster storybook assembly configuration and skip heavier review/planning passes."
   type        = bool
   default     = false
 }
@@ -145,6 +145,24 @@ variable "client_direct_live_new_session_minutes" {
   default     = 1
 }
 
+variable "page_read_aloud_model" {
+  description = "Google Cloud page read-aloud TTS model id."
+  type        = string
+  default     = "gemini-2.5-flash-tts"
+}
+
+variable "page_read_aloud_voice" {
+  description = "Google Cloud page read-aloud voice name."
+  type        = string
+  default     = "Sulafat"
+}
+
+variable "page_read_aloud_language_code" {
+  description = "Language code for page read-aloud synthesis."
+  type        = string
+  default     = "en-GB"
+}
+
 variable "enable_storybook_director_workflow" {
   description = "Enable the heavier storyboard director review/repair workflow in the FFmpeg job."
   type        = bool
@@ -166,7 +184,7 @@ variable "storybook_scene_review_max_passes" {
 variable "storybook_studio_max_revisions" {
   description = "Maximum studio revision rounds for FFmpeg job planning."
   type        = number
-  default     = 0
+  default     = 1
 }
 
 variable "elevenlabs_voice_id" {

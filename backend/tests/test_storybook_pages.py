@@ -42,6 +42,40 @@ class StorybookPagesTests(unittest.TestCase):
         self.assertEqual([page["scene_number"] for page in pages], [1, 2])
         self.assertEqual(pages[0]["request_id"], "req-a")
         self.assertEqual(pages[1]["request_id"], "req-b")
+        self.assertEqual(pages[0]["scene_description"], "Castle")
+
+    def test_story_pages_merge_missing_fields_and_missing_pages_from_branch_points(self) -> None:
+        pages = story_pages_from_state_data(
+            {
+                "story_pages": [
+                    {
+                        "scene_number": 1,
+                        "request_id": "req-a",
+                        "scene_description": "Bubble forest",
+                        "storybeat_text": "Bubbles glow in the forest.",
+                    }
+                ],
+                "scene_branch_points": [
+                    {
+                        "scene_number": 1,
+                        "request_id": "req-a",
+                        "image_url": "https://example.com/forest.png",
+                    },
+                    {
+                        "scene_number": 2,
+                        "request_id": "req-b",
+                        "scene_description": "Secret bubble path",
+                        "storybeat_text": "The bubble shows a secret path.",
+                        "image_url": "https://example.com/path.png",
+                    },
+                ],
+            }
+        )
+
+        self.assertEqual([page["scene_number"] for page in pages], [1, 2])
+        self.assertEqual(pages[0]["image_url"], "https://example.com/forest.png")
+        self.assertEqual(pages[1]["request_id"], "req-b")
+        self.assertEqual(pages[1]["storybeat_text"], "The bubble shows a secret path.")
 
     def test_branch_points_are_normalized_when_explicit_pages_missing(self) -> None:
         pages = story_pages_from_state_data(
@@ -62,7 +96,25 @@ class StorybookPagesTests(unittest.TestCase):
         )
         self.assertEqual([page["scene_number"] for page in pages], [2, 3])
         self.assertEqual(pages[0]["gcs_uri"], "gs://bucket/session/scene_002.jpg")
-        self.assertEqual(pages[1]["storybeat_text"], "Ghost chef cookies")
+        self.assertEqual(pages[1]["storybeat_text"], "")
+
+    def test_branch_labels_do_not_become_storybeat_text_when_pages_missing_it(self) -> None:
+        pages = story_pages_from_state_data(
+            {
+                "scene_branch_points": [
+                    {
+                        "scene_number": 2,
+                        "label": "Go inside the treehouse",
+                        "scene_description": "A cozy treehouse glows at the end of the path.",
+                        "image_url": "https://example.com/treehouse.png",
+                    }
+                ]
+            }
+        )
+
+        self.assertEqual(len(pages), 1)
+        self.assertEqual(pages[0]["storybeat_text"], "")
+        self.assertEqual(pages[0]["scene_description"], "A cozy treehouse glows at the end of the path.")
 
 
 if __name__ == "__main__":

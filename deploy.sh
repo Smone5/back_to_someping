@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ─────────────────────────────────────────────────────────────────────────────
-# deploy.sh — Build, push, deploy the Interactive Storyteller to Cloud Run
+# deploy.sh — Build, push, deploy StorySpark to Cloud Run
 #              AND apply Terraform config changes automatically.
 #
 # Usage:
@@ -13,8 +13,8 @@
 # ─────────────────────────────────────────────────────────────────────────────
 set -euo pipefail
 
-PROJECT="interactive-story-gemini"
-REGION="us-central1"
+PROJECT="${GOOGLE_CLOUD_PROJECT:-interactive-story-gemini}"
+REGION="${GOOGLE_CLOUD_LOCATION:-us-central1}"
 TAG=$(date +%Y%m%d-%H%M%S)
 TARGET="${1:-all}"
 

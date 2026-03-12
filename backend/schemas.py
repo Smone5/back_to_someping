@@ -90,7 +90,11 @@ def theater_mode_event(
     mp4_url: str,
     trading_card_url: str | None = None,
     narration_lines: list[str] | None = None,
+    lighting_cues: list[dict[str, Any]] | None = None,
     audio_available: bool | None = None,
+    final_has_audio_stream: bool | None = None,
+    final_video_duration_sec: float | None = None,
+    theater_release_ready: bool | None = None,
     story_title: str | None = None,
     child_name: str | None = None,
     story_phase: str | None = None,
@@ -98,8 +102,16 @@ def theater_mode_event(
     payload: dict[str, Any] = {"mp4_url": mp4_url, "trading_card_url": trading_card_url}
     if narration_lines is not None:
         payload["narration_lines"] = narration_lines
+    if lighting_cues is not None:
+        payload["lighting_cues"] = lighting_cues
     if audio_available is not None:
         payload["audio_available"] = audio_available
+    if final_has_audio_stream is not None:
+        payload["final_has_audio_stream"] = final_has_audio_stream
+    if final_video_duration_sec is not None:
+        payload["final_video_duration_sec"] = final_video_duration_sec
+    if theater_release_ready is not None:
+        payload["theater_release_ready"] = theater_release_ready
     if story_title:
         payload["story_title"] = story_title
     if child_name:

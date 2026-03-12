@@ -5,7 +5,7 @@ import logging
 import os
 import re
 import uuid
-from typing import Any
+from typing import Any, Literal
 
 from google.adk.agents import BaseAgent, LlmAgent
 from google.adk.agents.callback_context import CallbackContext
@@ -16,9 +16,54 @@ from google.adk.runners import Runner
 from google.adk.sessions import InMemorySessionService
 from google.adk.utils import instructions_utils
 from google.genai import types as genai_types
-from pydantic import ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 
 logger = logging.getLogger(__name__)
+
+
+class StudioMixGuidance(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    music_volume: float | None = None
+    sfx_volume: float | None = None
+    narration_volume: float | None = None
+    ducking: Literal["strong", "medium", "light", "off"] | None = None
+
+
+class StudioNarrationPlan(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    narration_style: str
+    narration_lines: list[str] = Field(default_factory=list)
+
+
+class StudioAudioCue(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    scene_index: int
+    prompt: str
+    duration_seconds: float | None = None
+
+
+class StudioAudioCuePlan(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    music_enabled: bool
+    music_arc_prompt: str
+    music_cues: list[StudioAudioCue] = Field(default_factory=list)
+    sfx_cues: list[StudioAudioCue] = Field(default_factory=list)
+    mix_guidance: StudioMixGuidance = Field(default_factory=StudioMixGuidance)
+
+
+class StudioQualityReport(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    status: Literal["approved", "revise_narration", "revise_audio", "revise_both"]
+    reason: str
+    narration_feedback: list[str] = Field(default_factory=list)
+    audio_feedback: list[str] = Field(default_factory=list)
+    kid_delight_notes: list[str] = Field(default_factory=list)
+    mix_guidance: StudioMixGuidance = Field(default_factory=StudioMixGuidance)
 
 
 def _studio_model() -> str:
@@ -43,6 +88,8 @@ def _extract_json_block(text: str) -> dict[str, Any] | None:
 
 
 def parse_studio_json(raw: Any) -> dict[str, Any] | None:
+    if isinstance(raw, BaseModel):
+        return raw.model_dump(exclude_none=True)
     if isinstance(raw, dict):
         return dict(raw)
     if not isinstance(raw, str):
@@ -246,12 +293,33 @@ Child age band: {child_age_band}
 Story summary: {story_summary}
 Scene count: {studio_scene_count}
 Scene descriptions JSON: {scene_descriptions_json}
+Story pages JSON: {studio_story_pages_json}
+Continuity world-state notes: {studio_continuity_world_state_text}
+Child delight anchors:
+{studio_child_delight_anchors_text}
+Fallback narration draft JSON: {studio_fallback_narration_json}
+Max spoken words per scene line: {studio_scene_max_words}
 
 Revision notes:
 {studio_feedback_notes}
 
 Task:
 - Write one short read-aloud narration line for each scene.
+- Treat the scene descriptions and story pages as raw production notes from a child's live adventure, not as final prose.
+- Your job is to turn those notes into a coherent storybook retelling that makes the whole adventure feel intentional and connected.
+- You are not transcribing the child literally. You are writing the polished storybook version of what happened.
+- Make the lines feel like one connected story from page to page, not isolated captions.
+- Let each line clearly follow the previous scene's action, place, or feeling.
+- Use the continuity notes and child delight anchors to carry recurring characters, props, wishes, and destinations through the story.
+- If the child jumps suddenly to a new place, bridge it in story form so the move feels like the next beat of the same adventure.
+- Prefer concrete details that are actually present in the story pages over generic labels from the raw scene descriptions.
+- Treat the story pages as the visual ground truth for what is on screen.
+- Use the story summary only to connect scenes, never to add a new object, building, room, destination, or character that is missing from the current page notes.
+- Never mention a landmark or prop unless it is supported by the current page's story page notes or the neighboring scene notes.
+- Rewrite command-like fragments such as "go inside the castle" or "let's go the other way" into natural story narration instead of repeating them literally.
+- If the raw notes are messy, contradictory, or incomplete, resolve them into the clearest gentle adventure beat that still matches the pictures and continuity notes.
+- Land the final scene on a satisfying story beat, not a generic label or meta ending.
+- Every scene line must stay at or under {studio_scene_max_words} spoken words.
 - Match the child's age band:
   - `4-5`: very short, concrete, gentle, magical, emotionally safe.
   - `6-7`: still warm and simple, but slightly richer and more adventurous.
@@ -260,6 +328,7 @@ Task:
 - Keep each line to one short sentence.
 - Avoid repeated sentence openings.
 - Do not sound like a prompt, caption, or summary.
+- Never use filler lines like "The end.", "The end appears.", or "This is page three."
 - No scary words, no moralizing, no exposition dump.
 
 Return JSON only:
@@ -320,12 +389,22 @@ Child age: {child_age}
 Child age band: {child_age_band}
 Story summary: {story_summary}
 Scene count: {studio_scene_count}
+Story pages JSON: {studio_story_pages_json}
+Continuity world-state notes: {studio_continuity_world_state_text}
+Child delight anchors:
+{studio_child_delight_anchors_text}
 Narration plan JSON: {studio_narration_plan}
 Audio cue plan JSON: {studio_audio_cue_plan}
+Scene line word limit: {studio_scene_max_words}
 
 Task:
 - Approve if this would feel warm, clear, and magical for the child's age band.
-- Request revision only if narration is too long/repetitive or audio feels too busy.
+- Request revision if narration is too long, repetitive, disconnected between scenes, merely labels the picture, or ends on a generic filler line.
+- Request revision if the narration ignores strong continuity clues or leaves the child's adventure feeling random instead of connected.
+- Request revision if the narration repeats command-like fragments from the raw notes instead of turning them into natural story sentences.
+- Request revision if the narration mentions a place, prop, building, room, character, or landmark that is not supported by the relevant story page notes.
+- Request revision if audio feels too busy or would bury the narration.
+- Request revision if any narration line exceeds {studio_scene_max_words} words or trails off awkwardly.
 - Keep fixes minimal and fast.
 
 Return JSON only:
@@ -457,18 +536,21 @@ def _build_workflow_agent(
         model=model,
         instruction=_narration_instruction,
         output_key="studio_narration_plan",
+        output_schema=StudioNarrationPlan,
     )
     audio_agent = LlmAgent(
         name="studio_audio_director",
         model=model,
         instruction=_audio_instruction,
         output_key="studio_audio_cue_plan",
+        output_schema=StudioAudioCuePlan,
     )
     qa_agent = LlmAgent(
         name="studio_preschool_qa",
         model=model,
         instruction=_qc_instruction,
         output_key="studio_quality_report",
+        output_schema=StudioQualityReport,
     )
     return StorybookStudioWorkflowAgent(
         narration_agent=narration_agent,
@@ -497,6 +579,19 @@ async def run_storybook_studio_workflow(
             **dict(initial_state or {}),
             "studio_max_revisions": max(0, int(max_revision_rounds)),
             "studio_feedback_notes": "No revision notes yet.",
+            "studio_story_pages_json": dict(initial_state or {}).get("studio_story_pages_json", "[]"),
+            "studio_child_delight_anchors_text": dict(initial_state or {}).get(
+                "studio_child_delight_anchors_text",
+                "No child delight anchors recorded.",
+            ),
+            "studio_continuity_world_state_text": dict(initial_state or {}).get(
+                "studio_continuity_world_state_text",
+                "No continuity state recorded.",
+            ),
+            "studio_fallback_narration_json": dict(initial_state or {}).get(
+                "studio_fallback_narration_json",
+                "[]",
+            ),
         },
     )
 

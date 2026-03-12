@@ -18,6 +18,14 @@ export interface HomeAssistantLightCommand {
     scene_description?: string;
 }
 
+export interface TheaterLightingCue extends HomeAssistantLightCommand {
+    start_seconds: number;
+    end_seconds?: number;
+    scene_index?: number;
+    scene_number?: number;
+    cue_source?: string;
+}
+
 export interface HomeAssistantTestResult {
     ok: boolean;
     reason?: string;
@@ -253,6 +261,51 @@ export function getLightingCommandKey(command: HomeAssistantLightCommand): strin
     const entity = normalizeEntityId(command.entity || '');
     const hex = (command.hex_color || '').trim().toLowerCase();
     return `${entity}|${hex}|${rgb}|${command.transition ?? ''}|${command.brightness ?? ''}`;
+}
+
+export function normalizeTheaterLightingCues(raw: unknown): TheaterLightingCue[] {
+    if (!Array.isArray(raw)) {
+        return [];
+    }
+
+    const cues: TheaterLightingCue[] = [];
+    for (const item of raw) {
+        if (!item || typeof item !== 'object') {
+            continue;
+        }
+        const candidate = item as Record<string, unknown>;
+        const startSeconds = Number(candidate.start_seconds ?? 0);
+        if (!Number.isFinite(startSeconds) || startSeconds < 0) {
+            continue;
+        }
+        const endSecondsRaw = Number(candidate.end_seconds ?? NaN);
+        const endSeconds = Number.isFinite(endSecondsRaw) && endSecondsRaw > startSeconds
+            ? endSecondsRaw
+            : undefined;
+        const rgbColor = normalizeRgbColor(candidate.rgb_color);
+        const brightness = Number(candidate.brightness ?? NaN);
+        const transition = Number(candidate.transition ?? NaN);
+        const sceneIndex = Number(candidate.scene_index ?? NaN);
+        const sceneNumber = Number(candidate.scene_number ?? NaN);
+        cues.push({
+            start_seconds: startSeconds,
+            end_seconds: endSeconds,
+            scene_index: Number.isFinite(sceneIndex) ? sceneIndex : undefined,
+            scene_number: Number.isFinite(sceneNumber) ? sceneNumber : undefined,
+            cue_source: typeof candidate.cue_source === 'string' ? candidate.cue_source.trim() : undefined,
+            hex_color: typeof candidate.hex_color === 'string' ? candidate.hex_color.trim() : undefined,
+            rgb_color: rgbColor,
+            entity: typeof candidate.entity === 'string' ? candidate.entity.trim() : undefined,
+            brightness: Number.isFinite(brightness) ? brightness : undefined,
+            transition: Number.isFinite(transition) ? transition : undefined,
+            scene_description: typeof candidate.scene_description === 'string'
+                ? candidate.scene_description.trim()
+                : undefined,
+        });
+    }
+
+    cues.sort((left, right) => left.start_seconds - right.start_seconds);
+    return cues;
 }
 
 export function describeHomeAssistantFailure(reason?: string): string {

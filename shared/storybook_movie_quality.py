@@ -10,21 +10,23 @@ from dataclasses import dataclass
 from math import ceil
 from typing import Final, Literal
 
+from .story_text import normalize_storybeat_text, story_sentence_quality_score, truncate_story_sentence
+
 PAGE_SECONDS_DEFAULT: Final[float] = 4.0
 PAGE_SECONDS_MIN: Final[float] = 3.0
 PAGE_SECONDS_MAX: Final[float] = 6.0
 PAGE_SECONDS_NARRATION_BUFFER: Final[float] = 0.4
 
 NARRATION_REQUIRED_DEFAULT: Final[bool] = True
-BURNED_CAPTIONS_DEFAULT: Final[bool] = False
+BURNED_CAPTIONS_DEFAULT: Final[bool] = True
 
-NARRATION_VOLUME_DEFAULT: Final[float] = 1.6
-NARRATION_VOLUME_MIN: Final[float] = 1.1
-NARRATION_VOLUME_MAX: Final[float] = 2.0
+NARRATION_VOLUME_DEFAULT: Final[float] = 2.0
+NARRATION_VOLUME_MIN: Final[float] = 1.2
+NARRATION_VOLUME_MAX: Final[float] = 2.2
 
-MUSIC_VOLUME_DEFAULT: Final[float] = 0.10
+MUSIC_VOLUME_DEFAULT: Final[float] = 0.14
 MUSIC_VOLUME_MIN: Final[float] = 0.05
-MUSIC_VOLUME_MAX: Final[float] = 0.18
+MUSIC_VOLUME_MAX: Final[float] = 0.20
 
 SFX_VOLUME_DEFAULT: Final[float] = 0.22
 SFX_VOLUME_MIN: Final[float] = 0.08
@@ -34,11 +36,16 @@ SFX_MAX_DEFAULT: Final[int] = 2
 SFX_MAX_MAX: Final[int] = 3
 SFX_COOLDOWN_PAGES_DEFAULT: Final[int] = 1
 
-STORYBOOK_RELEASE_MIN_SCENES: Final[int] = 3
+# A single finished storybook page should still produce a watchable movie.
+# Higher scene counts are better, but they are not a reason to block export.
+STORYBOOK_RELEASE_MIN_SCENES: Final[int] = 1
 STORYBOOK_RELEASE_MIN_SHOT_VARIETY: Final[int] = 3
 STORYBOOK_RELEASE_MIN_NARRATION_COVERAGE: Final[float] = 0.85
 
 ShotType = Literal["establishing", "wide", "reveal", "closeup", "detail", "pullback"]
+StorybookMoviePacingMode = Literal["read_to_me", "read_with_me", "fast_movie"]
+
+STORYBOOK_MOVIE_PACING_DEFAULT: Final[StorybookMoviePacingMode] = "read_with_me"
 
 
 @dataclass(frozen=True)
@@ -47,19 +54,19 @@ class StoryboardShotPlan:
     profile_index: int
 
 KEN_BURNS_MOTION_PROFILES: Final[list[tuple[float, float, float, float, float, float]]] = [
-    (0.08, 0.18, 0.14, 0.12, 1.03, 1.12),
-    (0.22, 0.09, 0.18, 0.16, 1.11, 1.04),
-    (0.10, 0.24, 0.08, 0.22, 1.04, 1.13),
-    (0.24, 0.14, 0.20, 0.08, 1.12, 1.05),
-    (0.06, 0.12, 0.22, 0.12, 1.03, 1.09),
-    (0.20, 0.20, 0.12, 0.18, 1.09, 1.03),
-    (0.14, 0.06, 0.24, 0.20, 1.05, 1.13),
-    (0.18, 0.24, 0.10, 0.06, 1.13, 1.05),
-    (0.12, 0.16, 0.12, 0.24, 1.04, 1.10),
-    (0.24, 0.10, 0.18, 0.18, 1.10, 1.04),
+    (0.10, 0.14, 0.12, 0.11, 1.018, 1.055),
+    (0.16, 0.11, 0.14, 0.12, 1.062, 1.024),
+    (0.11, 0.17, 0.10, 0.15, 1.022, 1.070),
+    (0.17, 0.13, 0.15, 0.10, 1.068, 1.028),
+    (0.09, 0.12, 0.16, 0.12, 1.018, 1.048),
+    (0.15, 0.15, 0.11, 0.14, 1.050, 1.018),
+    (0.12, 0.09, 0.17, 0.15, 1.026, 1.072),
+    (0.14, 0.17, 0.10, 0.09, 1.070, 1.030),
+    (0.11, 0.14, 0.11, 0.17, 1.020, 1.050),
+    (0.17, 0.10, 0.14, 0.14, 1.054, 1.022),
 ]
-KEN_BURNS_ZOOM_MIN: Final[float] = 1.03
-KEN_BURNS_ZOOM_MAX: Final[float] = 1.13
+KEN_BURNS_ZOOM_MIN: Final[float] = 1.018
+KEN_BURNS_ZOOM_MAX: Final[float] = 1.072
 
 SHOT_TYPE_PROFILE_INDICES: Final[dict[ShotType, tuple[int, ...]]] = {
     "establishing": (0, 2, 9),
@@ -122,11 +129,11 @@ _PULLBACK_KEYWORDS: Final[tuple[str, ...]] = (
     "ending",
 )
 
-KEN_BURNS_SETTLE_MIN_SECONDS: Final[float] = 0.10
-KEN_BURNS_SETTLE_MAX_SECONDS: Final[float] = 0.24
-KEN_BURNS_TRAVEL_MIN_SECONDS: Final[float] = 1.1
-KEN_BURNS_TRAVEL_MAX_SECONDS: Final[float] = 3.8
-KEN_BURNS_DURATION_FOR_FULL_TRAVEL_SECONDS: Final[float] = 4.8
+KEN_BURNS_SETTLE_MIN_SECONDS: Final[float] = 0.18
+KEN_BURNS_SETTLE_MAX_SECONDS: Final[float] = 0.38
+KEN_BURNS_TRAVEL_MIN_SECONDS: Final[float] = 1.6
+KEN_BURNS_TRAVEL_MAX_SECONDS: Final[float] = 4.6
+KEN_BURNS_DURATION_FOR_FULL_TRAVEL_SECONDS: Final[float] = 6.2
 
 THEATER_MIN_HEIGHT_DESKTOP_PX: Final[int] = 420
 THEATER_MIN_HEIGHT_TABLET_PX: Final[int] = 300
@@ -305,10 +312,201 @@ def narration_max_words_for_age(value: int | str | None, *, cover: bool = False)
     if cover:
         return 12 if age <= 5 else 14 if age <= 7 else 16
     if age <= 5:
-        return 9
+        return 12
     if age <= 7:
         return 11
     return 14
+
+
+def normalize_storybook_movie_pacing(raw: str | None) -> StorybookMoviePacingMode:
+    normalized = str(raw or "").strip().lower()
+    if normalized in {"read_to_me", "read-to-me", "readtome", "voice_first", "voice-first"}:
+        return "read_to_me"
+    if normalized in {"fast_movie", "fast-movie", "fast", "replay"}:
+        return "fast_movie"
+    return STORYBOOK_MOVIE_PACING_DEFAULT
+
+
+def storybook_movie_pacing_default() -> StorybookMoviePacingMode:
+    return STORYBOOK_MOVIE_PACING_DEFAULT
+
+
+def readalong_max_words_for_age(
+    value: int | str | None,
+    movie_pacing: str | None = None,
+) -> int:
+    age = clamp_child_age(value)
+    mode = normalize_storybook_movie_pacing(movie_pacing)
+    if mode == "read_to_me":
+        if age <= 5:
+            return 6
+        if age <= 7:
+            return 8
+        return 10
+    if mode == "fast_movie":
+        if age <= 5:
+            return 7
+        if age <= 7:
+            return 9
+        return 12
+    if age <= 5:
+        return 12
+    if age <= 7:
+        return 12
+    return 16
+
+
+def _storybook_word_count(text: str | None) -> int:
+    normalized = normalize_storybeat_text(text, max_chars=400)
+    return len([token for token in normalized.split() if token])
+
+
+def _truncate_words(text: str, max_words: int) -> str:
+    if max_words <= 0:
+        return ""
+    return truncate_story_sentence(text, max_words=max_words)
+
+
+def choose_readalong_text(
+    primary_text: str | None,
+    fallback_text: str | None,
+    child_age: int | str | None,
+    movie_pacing: str | None = None,
+) -> str:
+    primary = normalize_storybeat_text(primary_text, max_chars=320)
+    fallback = normalize_storybeat_text(fallback_text, max_chars=320)
+    max_words = readalong_max_words_for_age(child_age, movie_pacing)
+    primary_score = story_sentence_quality_score(primary)
+    fallback_score = story_sentence_quality_score(fallback)
+
+    if fallback and (fallback_score >= primary_score + 3 or primary_score < 2):
+        if _storybook_word_count(fallback) <= max_words:
+            return fallback
+        return _truncate_words(fallback, max_words)
+
+    if primary and _storybook_word_count(primary) <= max_words:
+        return primary
+    if fallback and _storybook_word_count(fallback) <= max_words:
+        return fallback
+    if fallback:
+        return _truncate_words(fallback, max_words)
+    if primary:
+        return _truncate_words(primary, max_words)
+    return ""
+
+
+def readalong_seconds_for_age(
+    text: str | None,
+    child_age: int | str | None,
+    movie_pacing: str | None = None,
+) -> float:
+    words = _storybook_word_count(text)
+    if words <= 0:
+        return 0.0
+
+    age = clamp_child_age(child_age)
+    mode = normalize_storybook_movie_pacing(movie_pacing)
+    if mode == "read_to_me":
+        if age <= 5:
+            min_seconds = 4.4
+            max_seconds = 5.8
+            words_per_second = 2.4
+            settle_seconds = 1.2
+        elif age <= 7:
+            min_seconds = 4.1
+            max_seconds = 5.3
+            words_per_second = 2.8
+            settle_seconds = 0.95
+        else:
+            min_seconds = 3.8
+            max_seconds = 4.8
+            words_per_second = 3.3
+            settle_seconds = 0.75
+    elif mode == "fast_movie":
+        if age <= 5:
+            min_seconds = 4.0
+            max_seconds = 5.0
+            words_per_second = 2.8
+            settle_seconds = 0.9
+        elif age <= 7:
+            min_seconds = 3.7
+            max_seconds = 4.8
+            words_per_second = 3.2
+            settle_seconds = 0.8
+        else:
+            min_seconds = 3.4
+            max_seconds = 4.5
+            words_per_second = 3.8
+            settle_seconds = 0.6
+    else:
+        if age <= 5:
+            min_seconds = 5.2
+            max_seconds = 7.2
+            words_per_second = 2.0
+            settle_seconds = 1.6
+        elif age <= 7:
+            min_seconds = 4.6
+            max_seconds = 6.2
+            words_per_second = 2.5
+            settle_seconds = 1.3
+        else:
+            min_seconds = 4.0
+            max_seconds = 5.6
+            words_per_second = 3.0
+            settle_seconds = 1.0
+
+    estimated = settle_seconds + (words / words_per_second)
+    return max(min_seconds, min(max_seconds, estimated))
+
+
+def storybook_page_duration_seconds(
+    *,
+    child_age: int | str | None,
+    base_page_seconds: float,
+    narration_seconds: float = 0.0,
+    readalong_text: str | None = None,
+    movie_pacing: str | None = None,
+) -> float:
+    duration = max(
+        clamp_page_seconds(base_page_seconds),
+        readalong_seconds_for_age(readalong_text, child_age, movie_pacing),
+    )
+    if narration_seconds and narration_seconds > 0:
+        duration = max(duration, float(narration_seconds) + PAGE_SECONDS_NARRATION_BUFFER)
+    return duration
+
+
+def storybook_tts_speaking_rate(
+    base_rate: float,
+    child_age: int | str | None,
+    movie_pacing: str | None = None,
+) -> float:
+    rate = float(base_rate or 0.9)
+    age = clamp_child_age(child_age)
+    mode = normalize_storybook_movie_pacing(movie_pacing)
+    if age <= 5:
+        if mode == "read_to_me":
+            rate -= 0.04
+        elif mode == "fast_movie":
+            rate -= 0.01
+        else:
+            rate -= 0.06
+    return max(0.7, min(rate, 1.2))
+
+
+def storybook_tts_tempo_factor(
+    child_age: int | str | None,
+    movie_pacing: str | None = None,
+) -> float:
+    age = clamp_child_age(child_age)
+    if age <= 5:
+        mode = normalize_storybook_movie_pacing(movie_pacing)
+        if mode == "read_to_me":
+            return 0.97
+        if mode == "fast_movie":
+            return 1.0
+        return 0.94
+    return 1.0
 
 
 def storybook_release_gate(
@@ -327,9 +525,11 @@ def storybook_release_gate(
     safe_duration = max(0.0, float(final_video_duration_sec or 0.0))
     safe_expected_narration = max(0, int(expected_narration_count or 0))
     safe_rendered_narration = max(0, int(rendered_narration_count or 0))
+    if expected_audio and safe_scene_count > 0:
+        safe_expected_narration = max(safe_expected_narration, safe_scene_count)
     cleaned_shot_types = [str(item or "").strip() for item in shot_types or [] if str(item or "").strip()]
 
-    if safe_scene_count and safe_scene_count < STORYBOOK_RELEASE_MIN_SCENES:
+    if safe_scene_count < STORYBOOK_RELEASE_MIN_SCENES:
         issues.append(f"scene_count={safe_scene_count} is below the minimum of {STORYBOOK_RELEASE_MIN_SCENES}")
     if safe_duration > 0.0 and safe_duration < 1.0:
         issues.append(f"video_duration={safe_duration:.2f}s is too short")

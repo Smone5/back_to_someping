@@ -1,7 +1,7 @@
 {
-    "name": "Magical Storyteller",
-    "short_name": "Storyteller",
-    "description": "Make your own magical AI story!",
+    "name": "StorySpark",
+    "short_name": "StorySpark",
+    "description": "Turn imagination into magical AI picture stories with StorySpark.",
     "start_url": "/",
     "display": "fullscreen",
     "orientation": "portrait",

@@ -1,4 +1,4 @@
-"""WebSocket router for the Interactive Storyteller live session."""
+"""WebSocket router for the StorySpark live session."""
 
 from __future__ import annotations
 
@@ -35,8 +35,12 @@ from shared.story_continuity import (
     record_continuity_scene,
     update_continuity_from_child_utterance,
 )
-from shared.storybook_movie_quality import clamp_child_age, child_age_band
-from shared.storybook_pages import story_pages_from_state_data
+from shared.storybook_movie_quality import (
+    child_age_band,
+    clamp_child_age,
+    normalize_storybook_movie_pacing,
+)
+from shared.storybook_pages import count_rendered_story_pages, story_pages_from_state_data
 from agent.tools import (
     assemble_story_video,
     cache_storybook_state,
@@ -162,6 +166,12 @@ _MOVIE_FEEDBACK_REASON_MAP: dict[str, str] = {
 }
 
 _INITIAL_SCENE_PLACEHOLDER = "No image yet — the story is just beginning!"
+_DEFAULT_STORYBOOK_ELEVENLABS_VOICE_ID = (
+    str(os.environ.get("PAGE_READ_ALOUD_ELEVENLABS_VOICE_ID") or "").strip()
+    or str(os.environ.get("ELEVENLABS_VOICE_ID") or "").strip()
+    or "21m00Tcm4TlvDq8ikWAM"
+)
+_SHARED_TOY_COMPANION_NAME = "shared toy companion"
 
 _SESSION_STATE_DEFAULTS: dict[str, Any] = {
     "child_name": "friend",
@@ -190,10 +200,15 @@ _SESSION_STATE_DEFAULTS: dict[str, Any] = {
     "pending_scene_branch_label": "",
     "awaiting_story_choice": False,
     "pending_story_hint": "",
+    "assembly_wait_last_child_utterance": "",
     "story_tone": "cozy",
+    "storybook_movie_pacing": "read_with_me",
+    "storybook_elevenlabs_voice_id": _DEFAULT_STORYBOOK_ELEVENLABS_VOICE_ID,
     "assembly_kind": "initial",
     "assembly_status": "",
     "scene_render_pending": False,
+    "queued_scene_child_utterance": "",
+    "queued_scene_child_utterance_at_epoch_ms": 0,
     "theater_release_ready": False,
     "story_summary": "",
     "sidekick_description": "a magical companion",
@@ -204,6 +219,8 @@ _SESSION_STATE_DEFAULTS: dict[str, Any] = {
     "scene_asset_gcs_uris": [],
     "scene_descriptions": [],
     "scene_storybeat_texts": [],
+    "scene_lighting_cues": [],
+    "theater_lighting_cues": [],
     "canonical_scene_description": "",
     "canonical_scene_storybeat_text": "",
     "canonical_scene_thumbnail_b64": "",
@@ -211,6 +228,25 @@ _SESSION_STATE_DEFAULTS: dict[str, Any] = {
     "current_scene_visual_summary": "",
     "previous_scene_visual_summary": "",
     "canonical_scene_visual_summary": "",
+    "character_bible": {},
+    "current_visual_continuity_plan": {
+        "previous_location": "",
+        "target_location": "",
+        "transition_type": "",
+        "active_character_keys": [],
+        "active_character_labels": [],
+        "required_prop_keys": [],
+        "required_prop_labels": [],
+        "forbidden_drift": [],
+        "continuity_notes": [],
+    },
+    "last_scene_visual_audit": {
+        "status": "pass",
+        "should_retry": False,
+        "repair_prompt_suffix": "",
+        "notes": [],
+        "issues": [],
+    },
     "child_delight_anchors": [],
     "child_delight_anchors_text": "None saved yet.",
     "continuity_entity_registry": {
@@ -236,6 +272,7 @@ _SESSION_STATE_DEFAULTS: dict[str, Any] = {
         "pending_prop_keys": [],
     },
     "continuity_scene_history": [],
+    "recent_scene_references": [],
     "continuity_registry_text": "No recurring entities tracked yet.",
     "continuity_world_state_text": "No scene-to-scene world state established yet.",
     "turn_number": 1,
@@ -243,6 +280,9 @@ _SESSION_STATE_DEFAULTS: dict[str, Any] = {
     "max_story_turns": _MAX_STORY_TURNS,
     "max_story_turns_minus_one": max(3, _MAX_STORY_TURNS - 1),
     "story_turn_limit_reached": False,
+    "story_page_count": 0,
+    "story_pages_remaining": _MAX_STORY_TURNS,
+    "story_page_limit_reached": False,
     "state_snapshots": [],
     "current_scene_description": _INITIAL_SCENE_PLACEHOLDER,
     "current_scene_storybeat_text": "",
@@ -254,6 +294,20 @@ _SESSION_STATE_DEFAULTS: dict[str, Any] = {
     "partial_child_utterance_finished": False,
     "scene_tool_turn_open": False,
 }
+
+
+def _sync_story_page_progress_fields(state: dict[str, Any] | None) -> None:
+    if not isinstance(state, dict):
+        return
+    try:
+        max_turns = int(state.get("max_story_turns", _MAX_STORY_TURNS) or _MAX_STORY_TURNS)
+    except Exception:
+        max_turns = _MAX_STORY_TURNS
+    max_turns = max(_MIN_STORY_TURNS, min(max_turns, _MAX_STORY_TURNS_HARD))
+    rendered_page_count = count_rendered_story_pages(state)
+    state["story_page_count"] = rendered_page_count
+    state["story_pages_remaining"] = max(max_turns - rendered_page_count, 0)
+    state["story_page_limit_reached"] = rendered_page_count >= max_turns
 
 
 def _bump_live_telemetry(metric: str, amount: int = 1) -> None:
@@ -270,7 +324,69 @@ def _ensure_session_state_defaults(state: dict[str, Any] | None) -> dict[str, An
         if key not in state:
             state[key] = copy.deepcopy(value)
     ensure_story_continuity_state(state)
+    _sync_story_page_progress_fields(state)
     return state
+
+
+def _state_has_prior_story_context(state: dict[str, Any] | None) -> bool:
+    if not isinstance(state, dict) or not state:
+        return False
+    if bool(state.get("story_started", False)) or bool(state.get("name_confirmed", False)):
+        return True
+    child_name = str(state.get("child_name", "") or "").strip().lower()
+    if child_name and child_name != "friend":
+        return True
+    if str(state.get("pending_child_name", "") or "").strip():
+        return True
+    if str(state.get("pending_story_hint", "") or "").strip():
+        return True
+    if str(state.get("last_child_utterance", "") or "").strip():
+        return True
+    if str(state.get("assembly_status", "") or "").strip():
+        return True
+    if str(state.get("story_summary", "") or "").strip():
+        return True
+    try:
+        if int(state.get("turn_number", 1) or 1) > 1:
+            return True
+    except Exception:
+        pass
+    try:
+        if int(state.get("response_turn_number", 1) or 1) > 1:
+            return True
+    except Exception:
+        pass
+    current_scene_description = str(state.get("current_scene_description", "") or "").strip()
+    if current_scene_description and current_scene_description != _INITIAL_SCENE_PLACEHOLDER:
+        return True
+    scene_urls = state.get("scene_asset_urls")
+    if isinstance(scene_urls, list) and any(str(item or "").strip() for item in scene_urls):
+        return True
+    branch_points = state.get("scene_branch_points")
+    if isinstance(branch_points, list) and len(branch_points) > 0:
+        return True
+    return False
+
+
+def _opening_phase_needs_first_greeting(state: dict[str, Any] | None) -> bool:
+    """Returns True only before the first real greeting has landed."""
+    if not isinstance(state, dict):
+        return True
+    if bool(state.get("story_started", False)) or bool(state.get("name_confirmed", False)):
+        return False
+    if str(state.get("story_summary", "") or "").strip():
+        return False
+    if str(state.get("last_child_utterance", "") or "").strip():
+        return False
+    if str(state.get("pending_story_hint", "") or "").strip():
+        return False
+    if str(state.get("pending_child_name", "") or "").strip():
+        return False
+    try:
+        response_turn_number = int(state.get("response_turn_number", state.get("turn_number", 1)) or 1)
+    except Exception:
+        response_turn_number = 1
+    return response_turn_number <= 1
 
 
 def _current_rss_mb() -> float | None:
@@ -606,9 +722,11 @@ def _resolve_image_prefs_from_state(state: dict[str, Any]) -> tuple[str, str, st
 
 
 def _fallback_scene_prompt(assistant_text: str, child_text: str, state: dict[str, Any]) -> str:
-    text = (assistant_text or "").strip()
+    cleaned_child = _CTRL_TOKEN_RE.sub("", child_text or "").strip()
+    cleaned_assistant = _CTRL_TOKEN_RE.sub("", assistant_text or "").strip()
+    text = cleaned_child if cleaned_child and _child_requested_scene_refresh(cleaned_child) else cleaned_assistant
     if not text:
-        text = (child_text or "").strip()
+        text = cleaned_child
     if not text:
         text = str(state.get("story_summary", "")).strip()
     if not text:
@@ -636,11 +754,29 @@ _LAUGH_CHAT_RE = re.compile(
     flags=re.IGNORECASE,
 )
 _SCENE_ACTION_RE = re.compile(
-    r"\b(go|going|walk|run|fly|swim|sail|climb|crawl|hop|jump|open|enter|step|follow|ride|explore|peek|look inside|look behind|through|into|across|under|over|behind|find|search|discover|reach|arrive|visit|choose|pick|take|turn into|become|transform)\b",
+    r"\b(go|going|walk|run|fly|swim|sail|climb|crawl|hop|jump|open|enter|step|follow|ride|explore|peek|look inside|look behind|through|into|across|under|over|behind|find|search|discover|reach|arrive|visit|choose|pick|take|move|head|turn into|become|transform)\b"
+    r"|\b(?:get|move|come|walk|go|step|head)\s+(?:closer|near|next to|over to|toward|towards|up to)\b"
+    r"|\bcloser\s+to\b",
     flags=re.IGNORECASE,
 )
 _SCENE_EDIT_RE = re.compile(
     r"\b(add|change|make|turn|give|put)\b",
+    flags=re.IGNORECASE,
+)
+_EXPLICIT_VISUAL_REQUEST_RE = re.compile(
+    r"\bshow (?:me|us)\b"
+    r"|\b(?:draw|picture|image|illustration)\b"
+    r"|\b(?:with|in) an image\b"
+    r"|\b(?:can|could) (?:i|we) see (?:it|that|the picture|the image|a picture|an image|the [a-z][a-z'\- ]{0,40})\b"
+    r"|\bwhat does .* look like\b"
+    r"|\btake me there\b",
+    flags=re.IGNORECASE,
+)
+_READ_PAGE_REQUEST_RE = re.compile(
+    r"\b(?:read|say|tell)\s+(?:the|this)?\s*page\b"
+    r"|\bwhat(?:'s| does)\s+(?:this|the)\s+page\s+(?:say|says)\b"
+    r"|\bwhat's\s+that\s+say\b"
+    r"|\bread\s+(?:it|that)\s+to\s+me\b",
     flags=re.IGNORECASE,
 )
 _ASSISTANT_NEW_SCENE_RE = re.compile(
@@ -659,7 +795,11 @@ def _child_requested_scene_refresh(text: str) -> bool:
     cleaned = _CTRL_TOKEN_RE.sub("", text or "").strip().lower()
     if not cleaned:
         return False
-    has_action = bool(_SCENE_ACTION_RE.search(cleaned) or _SCENE_EDIT_RE.search(cleaned))
+    has_action = bool(
+        _SCENE_ACTION_RE.search(cleaned)
+        or _SCENE_EDIT_RE.search(cleaned)
+        or _EXPLICIT_VISUAL_REQUEST_RE.search(cleaned)
+    )
     if _IMAGE_CHAT_RE.search(cleaned) and not has_action:
         return False
     return has_action
@@ -669,9 +809,52 @@ def _child_requested_scene_chat(text: str) -> bool:
     cleaned = _CTRL_TOKEN_RE.sub("", text or "").strip().lower()
     if not cleaned:
         return False
-    if _SCENE_ACTION_RE.search(cleaned) or _SCENE_EDIT_RE.search(cleaned):
+    if _READ_PAGE_REQUEST_RE.search(cleaned):
+        return True
+    if (
+        _SCENE_ACTION_RE.search(cleaned)
+        or _SCENE_EDIT_RE.search(cleaned)
+        or _EXPLICIT_VISUAL_REQUEST_RE.search(cleaned)
+    ):
         return False
     return bool(_IMAGE_CHAT_RE.search(cleaned) or _LAUGH_CHAT_RE.search(cleaned))
+
+
+def _scene_render_in_progress(session_id: str, state: dict[str, Any] | None) -> bool:
+    if not isinstance(state, dict):
+        return session_id in _pending_image_events
+    return bool(state.get("scene_render_pending", False)) or session_id in _pending_image_events
+
+
+def _queue_latest_scene_follow_up_request(state: dict[str, Any], child_utterance: str) -> None:
+    queued_text = str(child_utterance or "").strip()
+    if not queued_text:
+        return
+    state["queued_scene_child_utterance"] = queued_text
+    state["queued_scene_child_utterance_at_epoch_ms"] = int(time.time() * 1000)
+    state["partial_child_utterance"] = queued_text
+    state["partial_child_utterance_finished"] = True
+    update_continuity_from_child_utterance(state, queued_text)
+
+
+def _arm_queued_scene_follow_up_after_render(state: dict[str, Any]) -> str:
+    queued_text = str(state.get("queued_scene_child_utterance", "") or "").strip()
+    if not queued_text:
+        return ""
+    if bool(state.get("pending_response", False)) or bool(state.get("scene_tool_turn_open", False)):
+        return ""
+    if _storybook_assembly_in_progress(state):
+        return ""
+    state["queued_scene_child_utterance"] = ""
+    state["queued_scene_child_utterance_at_epoch_ms"] = 0
+    state["pending_response"] = True
+    state["pending_response_interrupted"] = False
+    state["scene_tool_turn_open"] = True
+    state["pending_response_token"] = uuid.uuid4().hex
+    state["last_child_utterance"] = queued_text
+    state["partial_child_utterance"] = queued_text
+    state["partial_child_utterance_finished"] = True
+    return queued_text
 
 
 def _should_trigger_fallback_scene(
@@ -681,6 +864,8 @@ def _should_trigger_fallback_scene(
 ) -> bool:
     if not _has_rendered_scene(state):
         return bool(_CTRL_TOKEN_RE.sub("", assistant_text or "").strip())
+    if _READ_PAGE_REQUEST_RE.search(_CTRL_TOKEN_RE.sub("", child_text or "").strip().lower()):
+        return False
     if _child_requested_scene_refresh(child_text):
         return True
     cleaned_child = _CTRL_TOKEN_RE.sub("", child_text or "").strip()
@@ -1132,7 +1317,15 @@ _RESTART_STORY_RE = re.compile(
     flags=re.IGNORECASE,
 )
 _END_STORY_RE = re.compile(
-    r"^\s*(?:the end|end (?:the|this)? story|finish (?:the )?story|make (?:the )?movie|we(?:'re| are) done|story is over)\b",
+    r"^\s*(?:"
+    r"the end"
+    r"|end (?:the|this)? story(?: now)?"
+    r"|finish (?:the )?story(?: now)?"
+    r"|(?:let'?s|lets|please|can we|could we|i want to|we want to)\s+(?:make|start)\s+(?:the|this|our|my)\s+movie(?: now)?"
+    r"|(?:make|start)\s+(?:the|this|our|my)\s+movie(?: now)?"
+    r"|we(?:'re| are) done(?: with (?:the )?story)?"
+    r"|story is over"
+    r")\s*[.!?]*\s*$",
     flags=re.IGNORECASE,
 )
 _MIC_OFF_RE = re.compile(
@@ -1428,6 +1621,56 @@ def _normalize_child_age(raw: Any) -> int:
     return clamp_child_age(raw)
 
 
+def _normalize_storybook_movie_pacing(raw: Any) -> str:
+    return normalize_storybook_movie_pacing(raw)
+
+
+def _normalize_storybook_elevenlabs_voice_id(raw: Any) -> str:
+    cleaned = re.sub(r"[^A-Za-z0-9]", "", str(raw or "").strip())
+    if 20 <= len(cleaned) <= 64:
+        return cleaned
+    return _DEFAULT_STORYBOOK_ELEVENLABS_VOICE_ID
+
+
+def _payload_storybook_elevenlabs_voice_id(payload: Any) -> str | None:
+    if not isinstance(payload, dict):
+        return None
+    raw = payload.get("storybook_elevenlabs_voice_id")
+    if raw is None:
+        raw = payload.get("storybookElevenlabsVoiceId")
+    cleaned = re.sub(r"[^A-Za-z0-9]", "", str(raw or "").strip())
+    if 20 <= len(cleaned) <= 64:
+        return cleaned
+    return None
+
+
+async def _persist_storybook_elevenlabs_voice_id(
+    *,
+    runner: Runner,
+    user_id: str,
+    session_id: str,
+    voice_id: str | None,
+) -> None:
+    normalized = _payload_storybook_elevenlabs_voice_id(
+        {"storybook_elevenlabs_voice_id": voice_id}
+    ) if voice_id else None
+    if not normalized:
+        return
+
+    await _mutate_state(
+        runner=runner,
+        user_id=user_id,
+        session_id=session_id,
+        mutator=lambda state: state.__setitem__("storybook_elevenlabs_voice_id", normalized),
+    )
+    _update_storybook_firestore(
+        session_id,
+        {
+            "storybook_elevenlabs_voice_id": normalized,
+        },
+    )
+
+
 def _is_meta_only_transcription(text: str | None) -> bool:
     if not text:
         return False
@@ -1560,6 +1803,23 @@ def _story_pages_payload(state: dict[str, Any]) -> list[dict[str, Any]]:
             "story_pages": state.get("story_pages", []),
         }
     )
+
+
+def _storybook_scene_state_payload(state: dict[str, Any]) -> dict[str, Any]:
+    public_points = _scene_branch_public_payload(state)
+    return {
+        "story_pages": _story_pages_payload(state),
+        "scene_branch_points": public_points,
+        "scene_branch_points_public": public_points,
+        "scene_asset_urls": list(state.get("scene_asset_urls", []) or []),
+        "scene_asset_gcs_uris": list(state.get("scene_asset_gcs_uris", []) or []),
+        "scene_descriptions": list(state.get("scene_descriptions", []) or []),
+        "scene_storybeat_texts": list(state.get("scene_storybeat_texts", []) or []),
+        "current_scene_description": str(state.get("current_scene_description", "") or "").strip(),
+        "current_scene_storybeat_text": str(state.get("current_scene_storybeat_text", "") or "").strip(),
+        "story_summary": str(state.get("story_summary", "") or "").strip(),
+        "story_phase": str(state.get("story_phase", "") or "").strip(),
+    }
 
 
 def _apply_scene_asset_to_story_state(
@@ -1702,6 +1962,7 @@ def _apply_scene_asset_to_story_state(
         state["current_scene_storybeat_text"] = storybeat_text
         if not str(state.get("canonical_scene_storybeat_text", "") or "").strip():
             state["canonical_scene_storybeat_text"] = storybeat_text
+    _sync_story_page_progress_fields(state)
     record_continuity_scene(
         state,
         description=description,
@@ -1924,7 +2185,7 @@ def _should_attempt_clean_live_resume(
     """Returns True when a clean Live close should transparently restart the stream."""
     if session_id in _awaiting_greeting_sessions:
         return True
-    if session_id in _opening_phase_sessions:
+    if session_id in _opening_phase_sessions and _opening_phase_needs_first_greeting(state):
         return True
     if session_id in _ending_story_sessions:
         return True
@@ -2372,6 +2633,7 @@ def _prepare_branch_state(
     restored["scene_render_pending"] = False
     restored["assembly_kind"] = "initial"
     restored["theater_release_ready"] = False
+    restored["active_scene_request_id"] = str(target_point.get("request_id", "") or "").strip()
     restored["scene_branch_points"] = copy.deepcopy(kept_points)
     restored["story_pages"] = story_pages_from_state_data({"scene_branch_points": kept_points})
     restored["state_snapshots"] = []
@@ -2384,11 +2646,23 @@ def _reset_storybook_progress_after_branch(session_id: str, state: dict[str, Any
     state.pop("assembly_status", None)
     state.pop("assembly_kind", None)
     state.pop("final_video_url", None)
+    state.pop("final_video_gcs_uri", None)
     state.pop("trading_card_url", None)
     state.pop("narration_lines", None)
+    state.pop("theater_lighting_cues", None)
     state.pop("audio_available", None)
     state.pop("final_has_audio_stream", None)
     state.pop("final_video_duration_sec", None)
+    state.pop("audio_expected", None)
+    state.pop("expected_narration_count", None)
+    state.pop("rendered_narration_count", None)
+    state.pop("final_scene_count", None)
+    state.pop("final_shot_types", None)
+    state.pop("storyboard_review", None)
+    state.pop("storybook_studio", None)
+    state.pop("assembly_started_at_epoch_ms", None)
+    state["assembly_recent_activities"] = []
+    state["assembly_wait_prompt_count"] = 0
     state["scene_render_pending"] = False
     state["theater_release_ready"] = False
     _sync_story_phase(session_id, state)
@@ -2404,15 +2678,27 @@ def _reset_storybook_progress_after_branch(session_id: str, state: dict[str, Any
             "assembly_status": "",
             "assembly_kind": "",
             "final_video_url": "",
+            "final_video_gcs_uri": "",
             "trading_card_url": "",
             "narration_lines": [],
+            "theater_lighting_cues": [],
+            "audio_expected": None,
             "audio_available": None,
+            "expected_narration_count": None,
+            "rendered_narration_count": None,
             "final_has_audio_stream": None,
             "final_video_duration_sec": None,
+            "final_scene_count": None,
+            "final_shot_types": [],
+            "storyboard_review": None,
+            "storybook_studio": None,
+            "assembly_started_at_epoch_ms": None,
+            "assembly_recent_activities": [],
+            "assembly_wait_prompt_count": 0,
             "theater_release_ready": False,
-            "story_pages": _story_pages_payload(state),
             "movie_feedback_latest": None,
             "post_movie_meta_review": None,
+            **_storybook_scene_state_payload(state),
         },
     )
 
@@ -2461,7 +2747,23 @@ async def _branch_story_to_scene(
 
     _reset_storybook_progress_after_branch(session_id, storage_session.state)
 
+    target_storybeat_text = (
+        str(target_point.get("storybeat_text", "") or "").strip()
+        or str(storage_session.state.get("current_scene_storybeat_text", "") or "").strip()
+    )
+    target_scene_description = (
+        str(target_point.get("scene_description", "") or "").strip()
+        or str(storage_session.state.get("current_scene_description", "") or "").strip()
+    )
     target_image_url = str(target_point.get("image_url", "") or "").strip()
+    if not target_image_url:
+        story_pages = _story_pages_payload(storage_session.state)
+        if story_pages:
+            target_image_url = str(story_pages[-1].get("image_url", "") or "").strip()
+    if not target_image_url:
+        scene_asset_urls = list(storage_session.state.get("scene_asset_urls", []) or [])
+        if scene_asset_urls:
+            target_image_url = str(scene_asset_urls[-1] or "").strip()
     if target_image_url:
         await websocket.send_text(
             json.dumps(
@@ -2470,7 +2772,7 @@ async def _branch_story_to_scene(
                     "payload": {
                         "url": target_image_url,
                         "media_type": "image",
-                        "storybeat_text": str(target_point.get("storybeat_text", "") or "").strip(),
+                        "storybeat_text": target_storybeat_text,
                         "scene_history": _scene_branch_public_payload(storage_session.state, selected_scene_number=scene_number),
                     },
                 }
@@ -2484,8 +2786,8 @@ async def _branch_story_to_scene(
                 "scene_number": scene_number,
                 "scene_history": _scene_branch_public_payload(storage_session.state, selected_scene_number=scene_number),
                 "current_scene_image_url": target_image_url or None,
-                "current_scene_storybeat_text": str(target_point.get("storybeat_text", "") or "").strip(),
-                "current_scene_description": str(target_point.get("scene_description", "") or "").strip(),
+                "current_scene_storybeat_text": target_storybeat_text,
+                "current_scene_description": target_scene_description,
                 "source": source,
             },
         ).model_dump_json()
@@ -2530,6 +2832,60 @@ def _clear_toy_share_resume_state(state: dict[str, Any]) -> None:
     state["toy_share_resume_story_summary"] = ""
     state["toy_share_resume_scene_description"] = ""
     state["toy_share_resume_storybeat_text"] = ""
+
+
+def _upsert_character_fact(state: dict[str, Any], *, character_name: str, fact: str) -> None:
+    name = str(character_name or "").strip()
+    cleaned_fact = str(fact or "").strip()
+    if not name or not cleaned_fact:
+        return
+    facts = list(state.get("character_facts_list", []) or [])
+    normalized_name = name.lower()
+    updated = False
+    for entry in facts:
+        if not isinstance(entry, dict):
+            continue
+        existing_name = str(entry.get("character_name", "") or "").strip().lower()
+        if existing_name != normalized_name:
+            continue
+        entry["character_name"] = name
+        entry["fact"] = cleaned_fact
+        updated = True
+        break
+    if not updated:
+        facts.append({"character_name": name, "fact": cleaned_fact})
+    facts = facts[-40:]
+    state["character_facts_list"] = facts
+    state["character_facts"] = "\n".join(
+        f"- {str(entry.get('character_name', '')).strip()}: {str(entry.get('fact', '')).strip()}"
+        for entry in facts
+        if isinstance(entry, dict)
+        and str(entry.get("character_name", "")).strip()
+        and str(entry.get("fact", "")).strip()
+    )
+
+
+def _apply_shared_toy_story_state(
+    state: dict[str, Any],
+    *,
+    summary_text: str,
+    toy_thumb: tuple[str, str] | None = None,
+) -> None:
+    normalized_summary = str(summary_text or "").strip() or (
+        "The photo looks a little fuzzy, but it seems like a very special toy."
+    )
+    state["camera_stage"] = "done"
+    state["camera_received"] = True
+    if toy_thumb:
+        state["toy_reference_thumbnail_b64"] = str(toy_thumb[0] or "").strip()
+        state["toy_reference_thumbnail_mime"] = str(toy_thumb[1] or "").strip()
+    state["toy_reference_visual_summary"] = normalized_summary
+    state["sidekick_description"] = normalized_summary
+    _upsert_character_fact(
+        state,
+        character_name=_SHARED_TOY_COMPANION_NAME,
+        fact=normalized_summary,
+    )
 
 
 def _begin_toy_share_state(state: dict[str, Any], turns: int = 3) -> None:
@@ -2619,6 +2975,19 @@ async def _trigger_story_end(
         storybook_progress["story_title"] = story_title
     if child_name:
         storybook_progress["child_name"] = child_name
+    if live_state:
+        storybook_progress.update(
+            {
+                "story_pages": _story_pages_payload(live_state),
+                "scene_asset_urls": list(live_state.get("scene_asset_urls", []) or []),
+                "scene_asset_gcs_uris": list(live_state.get("scene_asset_gcs_uris", []) or []),
+                "scene_descriptions": list(live_state.get("scene_descriptions", []) or []),
+                "scene_storybeat_texts": list(live_state.get("scene_storybeat_texts", []) or []),
+                "current_scene_description": str(live_state.get("current_scene_description", "") or "").strip(),
+                "current_scene_storybeat_text": str(live_state.get("current_scene_storybeat_text", "") or "").strip(),
+                "story_summary": str(live_state.get("story_summary", "") or "").strip(),
+            }
+        )
     progress_snapshot = {**live_state, **storybook_progress}
     storybook_progress["story_phase"] = _sync_story_phase(session_id, progress_snapshot)
     _update_storybook_firestore(session_id, storybook_progress)
@@ -2885,6 +3254,7 @@ async def handle_storyteller_ws(websocket: WebSocket, runner: Runner) -> None:
         user_id=user_id,
         session_id=session_id,
     )
+    session_was_created = False
     if session is None:
         session = await runner.session_service.create_session(
             app_name="storyteller",
@@ -2892,6 +3262,7 @@ async def handle_storyteller_ws(websocket: WebSocket, runner: Runner) -> None:
             session_id=session_id,
             state=copy.deepcopy(_SESSION_STATE_DEFAULTS),
         )
+        session_was_created = True
         _opening_phase_sessions.add(session_id)
     else:
         _ensure_session_state_defaults(session.state)
@@ -2915,6 +3286,13 @@ async def handle_storyteller_ws(websocket: WebSocket, runner: Runner) -> None:
         session.state["response_turn_number"] = max(int(session.state.get("response_turn_number", session.state.get("turn_number", 1))), 1)
     except Exception:
         session.state["response_turn_number"] = session.state.get("turn_number", 1)
+    _sync_story_page_progress_fields(session.state)
+    storybook_resume_state = load_storybook_resume_state(session_id)
+    if session_was_created and _state_has_prior_story_context(storybook_resume_state):
+        session.state.update(copy.deepcopy(storybook_resume_state))
+        _ensure_session_state_defaults(session.state)
+        _sync_story_page_progress_fields(session.state)
+        logger.info("Rehydrated live session state from cached storybook state for session %s", session_id)
     try:
         current_name = str(session.state.get("child_name", "friend")).strip().lower()
         if current_name and current_name != "friend":
@@ -2927,7 +3305,7 @@ async def handle_storyteller_ws(websocket: WebSocket, runner: Runner) -> None:
         _opening_phase_sessions.discard(session_id)
     else:
         _opening_phase_sessions.add(session_id)
-    if bool(session.state.get("story_turn_limit_reached", False)):
+    if bool(session.state.get("story_turn_limit_reached", False) or session.state.get("story_page_limit_reached", False)):
         _story_turn_limit_sessions.add(session_id)
     else:
         _story_turn_limit_sessions.discard(session_id)
@@ -2945,7 +3323,9 @@ async def handle_storyteller_ws(websocket: WebSocket, runner: Runner) -> None:
     except Exception:
         pass
 
-    storybook_resume_state = load_storybook_resume_state(session_id)
+    if _state_has_prior_story_context(session.state) or _state_has_prior_story_context(storybook_resume_state):
+        _greeting_sent_sessions.add(session_id)
+        _awaiting_greeting_sessions.discard(session_id)
     assembly_resuming = (
         _storybook_assembly_in_progress(session.state)
         or _storybook_assembly_in_progress(storybook_resume_state)
@@ -3003,6 +3383,8 @@ async def handle_storyteller_ws(websocket: WebSocket, runner: Runner) -> None:
                 "pending_response": bool(session.state.get("pending_response", False)),
                 "assistant_speaking": session_id in _assistant_speaking_sessions,
                 "ending_story": session_id in _ending_story_sessions or assembly_resuming,
+                "assembly_status": str(rehydrated_state_snapshot.get("assembly_status", "") or "").strip(),
+                "assembly_error": str(rehydrated_state_snapshot.get("assembly_error", "") or "").strip(),
                 "assembly_started_at_epoch_ms": (
                     _assembly_started_at_epoch_ms_from_state(storybook_resume_state)
                     or _assembly_started_at_epoch_ms_from_state(session.state)
@@ -3052,6 +3434,7 @@ async def handle_storyteller_ws(websocket: WebSocket, runner: Runner) -> None:
                     user_id,
                     session_id,
                     connection_id,
+                    live_queue,
                 )
             )
         early_audio_drop_logged = False
@@ -3333,11 +3716,306 @@ async def _run_agent(
     assistant_audio_closed_after_finish = False
     scene_narration_guard_active = False
     turn_output_sealed_until_child_input = False
+    deferred_opening_turn_complete = False
+    deferred_opening_finalize_task: asyncio.Task | None = None
+    turn_output_seal_task: asyncio.Task | None = None
 
     try:
         max_reconnect_attempts = int(os.environ.get("MAX_LIVE_RECONNECTS", "6"))
     except Exception:
         max_reconnect_attempts = 6
+
+    def _cancel_deferred_opening_finalize() -> None:
+        nonlocal deferred_opening_finalize_task
+        task = deferred_opening_finalize_task
+        deferred_opening_finalize_task = None
+        if task and not task.done():
+            task.cancel()
+
+    def _cancel_turn_output_seal() -> None:
+        nonlocal turn_output_seal_task
+        task = turn_output_seal_task
+        turn_output_seal_task = None
+        if task and not task.done():
+            task.cancel()
+
+    def _schedule_turn_output_seal(delay_seconds: float = 0.0) -> None:
+        nonlocal turn_output_sealed_until_child_input
+        nonlocal turn_output_seal_task
+        _cancel_turn_output_seal()
+        if delay_seconds <= 0:
+            turn_output_sealed_until_child_input = True
+            return
+
+        async def _seal_later() -> None:
+            nonlocal turn_output_sealed_until_child_input
+            nonlocal turn_output_seal_task
+            try:
+                await asyncio.sleep(delay_seconds)
+                turn_output_sealed_until_child_input = True
+            except asyncio.CancelledError:
+                return
+            finally:
+                turn_output_seal_task = None
+
+        turn_output_seal_task = asyncio.create_task(_seal_later())
+
+    async def _finalize_deferred_opening_turn() -> bool:
+        nonlocal assistant_parts
+        nonlocal last_output_transcription
+        nonlocal child_utterance_this_turn
+        nonlocal last_persisted_partial_child_utterance
+        nonlocal last_persisted_partial_child_utterance_finished
+        nonlocal child_turn_attempted_this_turn
+        nonlocal child_turn_answered_this_turn
+        nonlocal model_emitted_meaningful_output
+        nonlocal assistant_output_soft_closed
+        nonlocal assistant_output_hard_closed
+        nonlocal assistant_audio_closed_after_finish
+        nonlocal assistant_finished_utterances_this_turn
+        nonlocal heard_humanish_speech_this_turn
+        nonlocal heard_noise_only_this_turn
+        nonlocal turn_output_sealed_until_child_input
+        nonlocal deferred_opening_turn_complete
+        nonlocal silent_recovery_attempts
+        nonlocal _turn_start_t
+
+        if not deferred_opening_turn_complete:
+            return False
+
+        assistant_text = " ".join(assistant_parts).strip()
+        if not assistant_text and _is_meaningful_text(last_output_transcription):
+            assistant_text = last_output_transcription
+        if not _is_meaningful_text(assistant_text):
+            return False
+
+        completed_state_snapshot: dict[str, Any] = {}
+
+        def _on_late_opening_turn_complete(state: dict[str, Any]) -> None:
+            nonlocal completed_state_snapshot
+            _take_snapshot(state)
+            state["pending_response"] = False
+            state["pending_response_interrupted"] = False
+            state["scene_tool_turn_open"] = False
+            state["assembly_wait_last_child_utterance"] = ""
+            state["partial_child_utterance"] = ""
+            state["partial_child_utterance_finished"] = False
+            if state.get("name_confirmed") or int(state.get("response_turn_number", state.get("turn_number", 1))) >= 3:
+                _opening_phase_sessions.discard(session_id)
+            else:
+                _opening_phase_sessions.add(session_id)
+            _append_story_summary(state, assistant_text)
+
+            pending_name = str(state.get("pending_child_name", "")).strip()
+            if (
+                assistant_text
+                and pending_name
+                and not bool(state.get("name_confirmed", False))
+            ):
+                prompt_match = re.search(
+                    r"(did i hear (your name is|you say)|is your name|your name is|did i get your name|your magical name|is it)",
+                    assistant_text,
+                    flags=re.IGNORECASE,
+                )
+                name_in_question = (
+                    "?" in assistant_text
+                    and re.search(rf"\\b{re.escape(pending_name)}\\b", assistant_text, flags=re.IGNORECASE)
+                )
+                if prompt_match or name_in_question:
+                    state["name_confirmation_prompted"] = True
+
+            if (
+                assistant_text
+                and bool(state.get("name_confirmed", False))
+                and not bool(state.get("story_started", False))
+                and _STORY_PROMPT_RE.search(assistant_text)
+            ):
+                state["awaiting_story_choice"] = True
+            elif bool(state.get("story_started", False)):
+                state["awaiting_story_choice"] = False
+
+            if (
+                str(state.get("camera_stage", "none")) == "pending"
+                and _CAMERA_PROMPT_RE.search(assistant_text or "")
+            ):
+                state["camera_stage"] = "prompted"
+            if _CAMERA_PROMPT_RE.search(assistant_text or ""):
+                try:
+                    state["camera_prompt_count"] = int(state.get("camera_prompt_count", 0)) + 1
+                except Exception:
+                    state["camera_prompt_count"] = 1
+
+            try:
+                current_response_turn = int(state.get("response_turn_number", state.get("turn_number", 1)) or 1)
+            except Exception:
+                current_response_turn = 1
+            current_response_turn = max(current_response_turn, 1)
+            state["response_turn_number"] = current_response_turn + 1
+
+            if (
+                state.get("response_turn_number", state.get("turn_number", 1)) >= 3
+                and str(state.get("child_name", "friend")).strip().lower() == "friend"
+                and not bool(state.get("name_confirmed", False))
+            ):
+                state["name_confirmed"] = True
+                state["pending_child_name"] = ""
+                state["name_confirmation_prompted"] = False
+
+            _sync_story_phase(session_id, state)
+            completed_state_snapshot = dict(state)
+
+        await _mutate_state(
+            runner=runner,
+            user_id=user_id,
+            session_id=session_id,
+            mutator=_on_late_opening_turn_complete,
+        )
+        cache_storybook_state(session_id, completed_state_snapshot)
+
+        try:
+            await websocket.send_text(json.dumps({"type": "TURN_COMPLETE"}))
+        except Exception:
+            return False
+
+        logger.info(
+            "Finalized deferred opening turn after late narration for session %s",
+            session_id,
+        )
+        _cancel_deferred_opening_finalize()
+        deferred_opening_turn_complete = False
+        silent_recovery_attempts = 0
+        turn_output_sealed_until_child_input = True
+        assistant_parts = []
+        last_output_transcription = ""
+        child_utterance_this_turn = ""
+        last_persisted_partial_child_utterance = ""
+        last_persisted_partial_child_utterance_finished = False
+        child_turn_attempted_this_turn = False
+        child_turn_answered_this_turn = False
+        model_emitted_meaningful_output = False
+        assistant_output_soft_closed = False
+        assistant_output_hard_closed = False
+        assistant_audio_closed_after_finish = False
+        assistant_finished_utterances_this_turn = 0
+        heard_humanish_speech_this_turn = False
+        heard_noise_only_this_turn = False
+        _audio_seen_this_turn.discard(session_id)
+        _assistant_speaking_sessions.discard(session_id)
+        _assistant_speaking_since.pop(session_id, None)
+        _turn_start_t = time.monotonic()
+        return True
+
+    async def _retry_deferred_opening_turn() -> bool:
+        nonlocal assistant_parts
+        nonlocal last_output_transcription
+        nonlocal child_utterance_this_turn
+        nonlocal last_persisted_partial_child_utterance
+        nonlocal last_persisted_partial_child_utterance_finished
+        nonlocal child_turn_attempted_this_turn
+        nonlocal child_turn_answered_this_turn
+        nonlocal scene_visuals_called_this_turn
+        nonlocal model_emitted_meaningful_output
+        nonlocal assistant_output_soft_closed
+        nonlocal assistant_output_hard_closed
+        nonlocal assistant_audio_closed_after_finish
+        nonlocal assistant_finished_utterances_this_turn
+        nonlocal heard_humanish_speech_this_turn
+        nonlocal heard_noise_only_this_turn
+        nonlocal turn_output_sealed_until_child_input
+        nonlocal deferred_opening_turn_complete
+        nonlocal silent_recovery_attempts
+        nonlocal _turn_start_t
+
+        if not deferred_opening_turn_complete:
+            return False
+
+        deferred_opening_turn_complete = False
+        recovery_reason = ""
+        storage_session = _get_storage_session(runner, user_id, session_id)
+        opening_state = (
+            dict(storage_session.state)
+            if storage_session is not None and isinstance(storage_session.state, dict)
+            else {}
+        )
+
+        if session_id in _awaiting_greeting_sessions:
+            if silent_recovery_attempts < 2:
+                silent_recovery_attempts += 1
+                greeting_prompt = (
+                    "A child just joined. Greet them with very short, simple sentences for a 4-year-old. "
+                    "Ask their name, and say they can also tell you what story they want."
+                )
+                recovery_reason = "silent_greeting_retry"
+                live_queue.reset(session_id, recovery_reason)
+                _send_live_content(session_id, live_queue, greeting_prompt)
+            else:
+                _awaiting_greeting_sessions.discard(session_id)
+        elif session_id in _opening_phase_sessions and _opening_phase_needs_first_greeting(opening_state):
+            if silent_recovery_attempts < 2:
+                silent_recovery_attempts += 1
+                greeting_prompt = (
+                    "You're still in the opening. Repeat the greeting in very short, simple sentences. "
+                    "Ask their name, and say they can also tell you what story they want."
+                )
+                recovery_reason = "opening_greeting_retry"
+                live_queue.reset(session_id, recovery_reason)
+                _send_live_content(session_id, live_queue, greeting_prompt)
+        else:
+            return False
+
+        logger.warning(
+            "Opening-phase turn still had no finalized narration after grace period for session %s; %s.",
+            session_id,
+            "retrying greeting" if recovery_reason else "ending defer without retry",
+        )
+
+        try:
+            await websocket.send_text(json.dumps({"type": "TURN_COMPLETE"}))
+        except Exception:
+            return False
+
+        turn_output_sealed_until_child_input = True
+        assistant_parts = []
+        last_output_transcription = ""
+        child_utterance_this_turn = ""
+        last_persisted_partial_child_utterance = ""
+        last_persisted_partial_child_utterance_finished = False
+        child_turn_attempted_this_turn = False
+        child_turn_answered_this_turn = False
+        scene_visuals_called_this_turn = False
+        model_emitted_meaningful_output = False
+        assistant_output_soft_closed = False
+        assistant_output_hard_closed = False
+        assistant_audio_closed_after_finish = False
+        assistant_finished_utterances_this_turn = 0
+        heard_humanish_speech_this_turn = False
+        heard_noise_only_this_turn = False
+        _audio_seen_this_turn.discard(session_id)
+        _assistant_speaking_sessions.discard(session_id)
+        _assistant_speaking_since.pop(session_id, None)
+        _turn_start_t = time.monotonic()
+        return True
+
+    def _schedule_deferred_opening_finalize() -> None:
+        nonlocal deferred_opening_finalize_task
+        _cancel_deferred_opening_finalize()
+
+        async def _runner() -> None:
+            try:
+                await asyncio.sleep(0.35)
+                finalized = await _finalize_deferred_opening_turn()
+                if not finalized:
+                    await _retry_deferred_opening_turn()
+            except asyncio.CancelledError:
+                pass
+            except Exception as exc:
+                logger.debug(
+                    "Deferred opening finalize failed for session %s: %s",
+                    session_id,
+                    exc,
+                )
+
+        deferred_opening_finalize_task = asyncio.create_task(_runner())
 
     async def _perform_hard_live_reset(*, reason: str, user_message: str) -> None:
         nonlocal hard_reset_attempts
@@ -3348,6 +4026,7 @@ async def _run_agent(
         nonlocal assistant_finished_utterances_this_turn
         nonlocal scene_narration_guard_active
         nonlocal turn_output_sealed_until_child_input
+        nonlocal deferred_opening_turn_complete
         hard_reset_attempts += 1
         reconnect_attempt = 0
         assistant_output_soft_closed = False
@@ -3356,6 +4035,8 @@ async def _run_agent(
         assistant_finished_utterances_this_turn = 0
         scene_narration_guard_active = False
         turn_output_sealed_until_child_input = False
+        deferred_opening_turn_complete = False
+        _cancel_deferred_opening_finalize()
         _emit_live_telemetry(
             "live_hard_reset",
             session_id=session_id,
@@ -3470,6 +4151,12 @@ async def _run_agent(
 
                             # ── Instant placeholder: intercept function_call BEFORE execution ──
                             if getattr(part, "function_call", None):
+                                if session_id in _ending_story_sessions:
+                                    logger.info(
+                                        "Dropping tool call during movie assembly for session %s",
+                                        session_id,
+                                    )
+                                    continue
                                 if turn_output_sealed_until_child_input and session_id not in _ending_story_sessions:
                                     logger.info(
                                         "Dropping stale function call after turn completion for session %s",
@@ -3496,6 +4183,12 @@ async def _run_agent(
                                         logger.info("⏱️ SYNC [ws] image sync event created at function_call time | session=%s", session_id)
 
                             if part.function_response:
+                                if session_id in _ending_story_sessions:
+                                    logger.info(
+                                        "Dropping tool response during movie assembly for session %s",
+                                        session_id,
+                                    )
+                                    continue
                                 if turn_output_sealed_until_child_input and session_id not in _ending_story_sessions:
                                     logger.info(
                                         "Dropping stale function response after turn completion for session %s",
@@ -3580,6 +4273,7 @@ async def _run_agent(
                                 elif not heard_humanish_speech_this_turn:
                                     heard_noise_only_this_turn = True
                             if actionable_child_text:
+                                _cancel_turn_output_seal()
                                 scene_narration_guard_active = False
                                 assistant_output_soft_closed = False
                                 assistant_output_hard_closed = False
@@ -3661,17 +4355,14 @@ async def _run_agent(
                                     wait_activity: dict[str, str] = {"key": ""}
 
                                     def _mark_pending_assembly(s: dict[str, Any]) -> None:
-                                        s["pending_response"] = True
-                                        s["pending_response_interrupted"] = False
-                                        s["scene_tool_turn_open"] = True
-                                        s["pending_response_token"] = uuid.uuid4().hex
-                                        s["last_child_utterance"] = cleaned_text or raw_text
-                                        s["partial_child_utterance"] = cleaned_text or raw_text
-                                        s["partial_child_utterance_finished"] = True
-                                        update_continuity_from_child_utterance(s, cleaned_text or raw_text)
-                                        wait_activity["key"] = _select_and_record_assembly_wait_activity(
+                                        wait_activity["key"] = _choose_assembly_wait_activity(
                                             s,
                                             child_utterance=cleaned_text or raw_text,
+                                        )
+                                        _mark_pending_assembly_wait_response(
+                                            s,
+                                            child_utterance=cleaned_text or raw_text,
+                                            activity_key=wait_activity["key"],
                                         )
 
                                     await _mutate_state(
@@ -3785,8 +4476,29 @@ async def _run_agent(
                                                 input_finished=input_finished,
                                             )
 
+                                queued_scene_follow_up = False
+                                if (
+                                    actionable_child_text
+                                    and input_finished
+                                    and not voice_ui_consumed
+                                    and bool(state.get("story_started", False))
+                                    and _scene_render_in_progress(session_id, state)
+                                    and _child_requested_scene_refresh(cleaned_text or raw_text)
+                                ):
+                                    queued_scene_follow_up = True
+
+                                    def _queue_scene_follow_up(s: dict[str, Any]) -> None:
+                                        _queue_latest_scene_follow_up_request(s, cleaned_text or raw_text)
+
+                                    await _mutate_state(runner, user_id, session_id, _queue_scene_follow_up)
+                                    logger.info(
+                                        "Queued latest child scene request while render pending for session %s: %s",
+                                        session_id,
+                                        (cleaned_text or raw_text)[:160],
+                                    )
+
                                 # Mark turn as pending so we can resume if disconnected
-                                if actionable_child_text and (voice_ui_marks_pending or not voice_ui_consumed):
+                                if actionable_child_text and not queued_scene_follow_up and (voice_ui_marks_pending or not voice_ui_consumed):
                                     def _mark_pending(s: dict[str, Any]) -> None:
                                         s["pending_response"] = True
                                         s["pending_response_interrupted"] = False
@@ -3922,6 +4634,8 @@ async def _run_agent(
                                         # Scene turns should resolve to one Amelia answer.
                                         # Any later continuation in the same Live turn is stale.
                                         scene_narration_guard_active = True
+                                    if deferred_opening_turn_complete:
+                                        _schedule_deferred_opening_finalize()
 
                     if getattr(event, "turn_complete", False):
                         if session_id in _ending_story_flush_sessions:
@@ -3929,6 +4643,7 @@ async def _run_agent(
                                 s["pending_response"] = False
                                 s["pending_response_interrupted"] = False
                                 s["scene_tool_turn_open"] = False
+                                s["assembly_wait_last_child_utterance"] = ""
                                 s["partial_child_utterance"] = ""
                                 s["partial_child_utterance_finished"] = False
                             await _mutate_state(runner, user_id, session_id, _clear_pending_after_end)
@@ -4011,6 +4726,7 @@ async def _run_agent(
                             s["pending_response"] = False
                             s["pending_response_interrupted"] = False
                             s["scene_tool_turn_open"] = False
+                            s["assembly_wait_last_child_utterance"] = ""
                             s["partial_child_utterance"] = ""
                             s["partial_child_utterance_finished"] = False
                         await _mutate_state(runner, user_id, session_id, _clear_pending)
@@ -4020,6 +4736,22 @@ async def _run_agent(
                             assistant_text = last_output_transcription
                         last_output_transcription = ""
 
+                        had_child_input_this_turn = _is_meaningful_text(child_utterance_this_turn)
+                        if (
+                            not had_child_input_this_turn
+                            and not _is_meaningful_text(assistant_text)
+                            and not scene_visuals_called_this_turn
+                            and (session_id in _awaiting_greeting_sessions or session_id in _opening_phase_sessions)
+                        ):
+                            if not deferred_opening_turn_complete:
+                                logger.info(
+                                    "Deferring opening-phase turn completion briefly for session %s to allow late greeting narration.",
+                                    session_id,
+                                )
+                            deferred_opening_turn_complete = True
+                            _schedule_deferred_opening_finalize()
+                            continue
+
                         if session_id in _ending_story_sessions:
                             assembly_state_snapshot: dict[str, Any] = {}
 
@@ -4028,6 +4760,7 @@ async def _run_agent(
                                 state["pending_response"] = False
                                 state["pending_response_interrupted"] = False
                                 state["scene_tool_turn_open"] = False
+                                state["assembly_wait_last_child_utterance"] = ""
                                 state["partial_child_utterance"] = ""
                                 state["partial_child_utterance_finished"] = False
                                 assembly_state_snapshot = dict(state)
@@ -4084,6 +4817,8 @@ async def _run_agent(
                             continue
 
                         if model_emitted_meaningful_output or scene_visuals_called_this_turn:
+                            deferred_opening_turn_complete = False
+                            _cancel_deferred_opening_finalize()
                             silent_recovery_attempts = 0
                             if child_turn_attempted_this_turn and not child_turn_answered_this_turn:
                                 child_turn_answered_this_turn = True
@@ -4108,6 +4843,7 @@ async def _run_agent(
                                 _take_snapshot(state)
                                 state["pending_response"] = False
                                 state["pending_response_interrupted"] = False
+                                state["assembly_wait_last_child_utterance"] = ""
                                 state["partial_child_utterance"] = ""
                                 state["partial_child_utterance_finished"] = False
                                 if state.get("name_confirmed") or int(state.get("response_turn_number", state.get("turn_number", 1))) >= 3:
@@ -4191,6 +4927,7 @@ async def _run_agent(
                                 max_turns = max(_MIN_STORY_TURNS, min(max_turns, _MAX_STORY_TURNS_HARD))
                                 state["max_story_turns"] = max_turns
                                 state["max_story_turns_minus_one"] = max(3, max_turns - 1)
+                                _sync_story_page_progress_fields(state)
                                 try:
                                     current_response_turn = int(state.get("response_turn_number", state.get("turn_number", 1)) or 1)
                                 except Exception:
@@ -4222,7 +4959,11 @@ async def _run_agent(
                                 )
                                 story_page_turn = bool(scene_visuals_called_this_turn or fallback_scene_turn)
                                 current_turn = int(state.get("turn_number", 1))
-                                turn_limit_reached = False if (toy_share_active_before or not story_page_turn) else current_turn >= max_turns
+                                try:
+                                    current_story_page_count = int(state.get("story_page_count", 0) or 0)
+                                except Exception:
+                                    current_story_page_count = 0
+                                turn_limit_reached = False if (toy_share_active_before or not story_page_turn) else current_story_page_count >= max_turns
                                 state["response_turn_number"] = current_response_turn + 1
                                 if toy_share_active_before:
                                     state["toy_share_turns_remaining"] = max(toy_share_turns_remaining - 1, 0)
@@ -4242,11 +4983,15 @@ async def _run_agent(
                                     state["story_turn_limit_reached"] = turn_limit_reached
                                     state["scene_render_pending"] = bool(scene_visuals_called_this_turn or fallback_scene_turn)
                                     _clear_toy_share_resume_state(state)
+                                _sync_story_page_progress_fields(state)
                                 completed_turn_number = current_turn
                                 completed_response_turn_number = current_response_turn
                                 completed_name_confirmed = bool(state.get("name_confirmed", False))
                                 completed_camera_stage = str(state.get("camera_stage", "none"))
-                                completed_story_turn_limit = bool(state.get("story_turn_limit_reached", False))
+                                completed_story_turn_limit = bool(
+                                    state.get("story_turn_limit_reached", False)
+                                    or state.get("story_page_limit_reached", False)
+                                )
                                 completed_story_started = bool(state.get("story_started", False))
                                 completed_toy_share_active = toy_share_active_before
                                 completed_scene_chat_turn = scene_chat_turn
@@ -4363,7 +5108,7 @@ async def _run_agent(
                                     scene_visuals_called_this_turn = True
                                     _early_fallback_started.add(session_id)
 
-                            if turn_limit_reached:
+                            if completed_story_turn_limit:
                                 _story_turn_limit_sessions.add(session_id)
                                 # Safety fallback: if the model fails to call assemble_story_video,
                                 # trigger it once we hit the final turn (cloud mode only).
@@ -4405,7 +5150,6 @@ async def _run_agent(
                             heard_noise_only_this_turn = False
                             _turn_start_t = time.monotonic()  # reset turn timer
                         else:
-                            had_child_input_this_turn = _is_meaningful_text(child_utterance_this_turn)
                             logger.warning(
                                 "Silent model turn detected for session %s (child_input=%s)",
                                 session_id,
@@ -4435,7 +5179,16 @@ async def _run_agent(
                             elif session_id in _opening_phase_sessions:
                                 # During the opening, ignore noise and re-offer the greeting instead of
                                 # triggering a generic "repeat yourself" message.
-                                if silent_recovery_attempts < 2:
+                                storage_session = _get_storage_session(runner, user_id, session_id)
+                                opening_state = (
+                                    dict(storage_session.state)
+                                    if storage_session is not None and isinstance(storage_session.state, dict)
+                                    else {}
+                                )
+                                if (
+                                    _opening_phase_needs_first_greeting(opening_state)
+                                    and silent_recovery_attempts < 2
+                                ):
                                     silent_recovery_attempts += 1
                                     greeting_prompt = (
                                         "You're still in the opening. Repeat the greeting in very short, simple sentences. "
@@ -4495,7 +5248,14 @@ async def _run_agent(
                                     )
 
                         await websocket.send_text(json.dumps({"type": "TURN_COMPLETE"}))
-                        turn_output_sealed_until_child_input = True
+                        seal_delay_seconds = (
+                            0.45
+                            if had_child_input_this_turn
+                            and assistant_finished_utterances_this_turn <= 0
+                            and session_id not in _ending_story_sessions
+                            else 0.0
+                        )
+                        _schedule_turn_output_seal(seal_delay_seconds)
                         model_emitted_meaningful_output = False
                         child_utterance_this_turn = ""
                         last_persisted_partial_child_utterance = ""
@@ -4551,6 +5311,8 @@ async def _run_agent(
                         assistant_audio_closed_after_finish = False
                         assistant_finished_utterances_this_turn = 0
                         turn_output_sealed_until_child_input = False
+                        deferred_opening_turn_complete = False
+                        _cancel_deferred_opening_finalize()
                         _emit_live_telemetry(
                             "live_clean_close_recovered",
                             session_id=session_id,
@@ -4579,6 +5341,8 @@ async def _run_agent(
                 assistant_audio_closed_after_finish = False
                 assistant_finished_utterances_this_turn = 0
                 turn_output_sealed_until_child_input = False
+                deferred_opening_turn_complete = False
+                _cancel_deferred_opening_finalize()
                 forced_turn_recovery = isinstance(stream_exc, _LiveTurnRecoveryRequested)
                 invalid_argument_error = _is_invalid_argument_live_error(stream_exc)
                 internal_error_after_child_turn = (
@@ -4727,6 +5491,8 @@ async def _run_agent(
             await websocket.send_text(err_event.model_dump_json())
         except Exception:
             pass
+    finally:
+        _cancel_deferred_opening_finalize()
 
 
 async def _download_gcs_to_bytes(gcs_url: str) -> bytes | None:
@@ -4905,6 +5671,20 @@ _ASSEMBLY_WAIT_ACTIVITY_ORDER = [
     "counting_game",
 ]
 
+_ASSEMBLY_WAIT_NO_FALSE_COMPLETION_TEXT = (
+    "Do NOT say the movie is ready, done, finished, starting now, opening now, or ready to watch. "
+    "Do NOT say phrases like 'enjoy the movie', 'enjoy the show', 'the movie is done', "
+    "'it is time to watch', 'here comes the movie', or 'the curtain is opening'. "
+    "Until the real release happens, talk as if the movie is still being made right now."
+)
+
+_ASSEMBLY_WAIT_NO_FUTURE_STORY_TEXT = (
+    "Do NOT ask what happens next in the story or adventure. "
+    "Do NOT ask where to go next, what to do next, what happens next, what the next page is, "
+    "or what the child wants next on the adventure. "
+    "Do NOT invite another choice that could continue, reopen, or extend the finished story."
+)
+
 
 def _assembly_activity_instruction(activity: str) -> str:
     normalized = str(activity or "").strip().lower()
@@ -4976,6 +5756,26 @@ def _select_and_record_assembly_wait_activity(
     return activity
 
 
+def _mark_pending_assembly_wait_response(
+    state: dict[str, Any],
+    *,
+    child_utterance: str,
+    activity_key: str,
+) -> None:
+    # Keep waiting-room chatter isolated from live story continuity.
+    state["pending_response"] = True
+    state["pending_response_interrupted"] = False
+    state["scene_tool_turn_open"] = True
+    state["pending_response_token"] = uuid.uuid4().hex
+    state["assembly_wait_last_child_utterance"] = str(child_utterance or "").strip()
+    _remember_assembly_activity(state, activity_key)
+    try:
+        prompt_count = int(state.get("assembly_wait_prompt_count", 0) or 0)
+    except Exception:
+        prompt_count = 0
+    state["assembly_wait_prompt_count"] = prompt_count + 1
+
+
 def _assembly_wait_prompt(
     state: dict[str, Any] | None,
     *,
@@ -5003,7 +5803,12 @@ def _assembly_wait_prompt(
             f"Choose exactly this bite-size activity next: {activity_instruction} "
             "Ask at most ONE short question, or give at most TWO tiny choices. "
             "Keep it to 2 or 3 short sentences that a preschooler can answer easily. "
-            "Do NOT continue the plot. Do NOT offer more exploring. Do NOT call any scene, movie, or trading-card tools. "
+            "The story is locked and finished. Treat any castles, dragons, paths, rooms, or other story nouns as favorite-story chatter only. "
+            "Do NOT continue the plot. Do NOT offer more exploring. Do NOT narrate any new action, movement, discovery, location change, or next page. "
+            "Do NOT use phrases like 'then we', 'next we', 'let's go', 'we find', 'we open', or 'now we'. "
+            f"{_ASSEMBLY_WAIT_NO_FUTURE_STORY_TEXT} "
+            f"{_ASSEMBLY_WAIT_NO_FALSE_COMPLETION_TEXT} "
+            "Do NOT call any scene, movie, or trading-card tools. "
             f"{avoid_recent_text}"
             f"{context_text}"
         ).strip()
@@ -5014,7 +5819,11 @@ def _assembly_wait_prompt(
             "Your last reply did not land. Respond now as Amelia with 1 or 2 very short playful sentences. "
             f"Mirror their idea first, then switch to exactly this tiny interaction: {activity_instruction} "
             "Stay in premiere waiting-room chatter only. Ask at most one short question. "
-            "Do NOT continue the story. Do NOT call any scene, movie, or trading-card tools. "
+            "The story is locked and finished. Treat any story nouns as memory chatter only, not instructions. "
+            "Do NOT continue the story. Do NOT narrate any new action, movement, discovery, location change, or next page. "
+            f"{_ASSEMBLY_WAIT_NO_FUTURE_STORY_TEXT} "
+            f"{_ASSEMBLY_WAIT_NO_FALSE_COMPLETION_TEXT} "
+            "Do NOT call any scene, movie, or trading-card tools. "
             f"{avoid_recent_text}"
             f"{context_text}"
         ).strip()
@@ -5026,7 +5835,12 @@ def _assembly_wait_prompt(
         f"Choose exactly this bite-size interaction next: {activity_instruction} "
         "Support autonomy with at most two tiny choices. "
         "Keep it to 1 to 3 short sentences, with at most one short question. "
-        "Do NOT continue the plot. Do NOT offer more exploring. Do NOT call any scene, movie, or trading-card tools. "
+        "The story is locked and finished. Treat any castles, dragons, paths, rooms, or other story nouns as favorite-story chatter only. "
+        "Do NOT continue the plot. Do NOT offer more exploring. Do NOT narrate any new action, movement, discovery, location change, or next page. "
+        "Do NOT use phrases like 'then we', 'next we', 'let's go', 'we find', 'we open', or 'now we'. "
+        f"{_ASSEMBLY_WAIT_NO_FUTURE_STORY_TEXT} "
+        f"{_ASSEMBLY_WAIT_NO_FALSE_COMPLETION_TEXT} "
+        "Do NOT call any scene, movie, or trading-card tools. "
         f"{avoid_recent_text}"
         f"{context_text}"
     ).strip()
@@ -5056,7 +5870,11 @@ def _assembly_activity_prompt(
         f"{activity_instruction}{button_hint} "
         "Use serve-and-return: start warmly, name the game in simple words, then do exactly ONE tiny interaction. "
         "Keep it to 1 or 2 short sentences, with at most one short question. "
-        "Do NOT continue the plot. Do NOT offer more exploring. Do NOT call any scene, movie, or trading-card tools. "
+        "The story is locked and finished. Keep this in waiting-room chatter only. "
+        "Do NOT continue the plot. Do NOT offer more exploring. Do NOT narrate any new action, movement, discovery, location change, or next page. "
+        f"{_ASSEMBLY_WAIT_NO_FUTURE_STORY_TEXT} "
+        f"{_ASSEMBLY_WAIT_NO_FALSE_COMPLETION_TEXT} "
+        "Do NOT call any scene, movie, or trading-card tools. "
         f"{avoid_recent_text}"
         f"{context_text}"
     ).strip()
@@ -5159,11 +5977,40 @@ async def _restore_storybook_ui_after_reconnect(
         if isinstance(narration_raw, list)
         else None
     )
+    lighting_cues_raw = state.get("theater_lighting_cues")
+    lighting_cues = (
+        [dict(item) for item in lighting_cues_raw if isinstance(item, dict)]
+        if isinstance(lighting_cues_raw, list)
+        else None
+    )
     audio_available = state.get("audio_available")
     if not isinstance(audio_available, bool):
         audio_available = None
+    final_has_audio_stream = state.get("final_has_audio_stream")
+    if not isinstance(final_has_audio_stream, bool):
+        final_has_audio_stream = None
+    try:
+        final_video_duration_sec = float(state.get("final_video_duration_sec") or 0.0)
+    except Exception:
+        final_video_duration_sec = 0.0
+    explicit_theater_release_ready = state.get("theater_release_ready")
+    if not isinstance(explicit_theater_release_ready, bool):
+        explicit_theater_release_ready = None
 
     assembly_status = str(state.get("assembly_status", "") or "").strip().lower()
+
+    if assembly_status == "failed":
+        error_message = str(state.get("assembly_error", "") or "").strip()
+        await websocket.send_text(
+            ServerEvent(
+                type=ServerEventType.ERROR,
+                payload={
+                    "message": error_message or "Movie assembly failed before the final video was created.",
+                    "assembly_failed": True,
+                },
+            ).model_dump_json()
+        )
+        return
 
     if _storybook_release_ready(state):
         await websocket.send_text(
@@ -5171,7 +6018,11 @@ async def _restore_storybook_ui_after_reconnect(
                 mp4_url=final_video_url,
                 trading_card_url=trading_card_url,
                 narration_lines=narration_lines,
+                lighting_cues=lighting_cues,
                 audio_available=audio_available,
+                final_has_audio_stream=final_has_audio_stream,
+                final_video_duration_sec=final_video_duration_sec if final_video_duration_sec > 0 else None,
+                theater_release_ready=explicit_theater_release_ready if explicit_theater_release_ready is not None else True,
                 story_title=story_title,
                 child_name=child_name,
                 story_phase="theater",
@@ -5442,14 +6293,39 @@ async def _watch_for_final_video(session_id: str) -> None:
 
     object_path = f"{session_id}/story_final.mp4"
     deadline = asyncio.get_running_loop().time() + 600
+    try:
+        poll_seconds = float(os.environ.get("STORYBOOK_FINAL_VIDEO_POLL_SECONDS", "1.0"))
+    except Exception:
+        poll_seconds = 1.0
+    poll_seconds = max(0.5, min(poll_seconds, 4.0))
+    firestore_client = None
+    project = os.environ.get("GOOGLE_CLOUD_PROJECT", "")
+    db_name = os.environ.get("FIRESTORE_DATABASE", "(default)")
+    if project:
+        try:
+            from google.cloud import firestore as _fs
+
+            firestore_client = _fs.AsyncClient(project=project, database=db_name)
+        except Exception as exc:
+            logger.debug("Could not initialize Firestore client for final video watch: %s", exc)
 
     try:
         while asyncio.get_running_loop().time() < deadline:
             try:
                 resume_state = load_storybook_resume_state(session_id)
-                assembly_status = str((resume_state or {}).get("assembly_status", "") or "").strip().lower()
+                merged_state = dict(resume_state or {})
+                if firestore_client is not None:
+                    try:
+                        doc = await firestore_client.collection("storyteller_sessions").document(session_id).get()
+                        if doc.exists:
+                            merged_state.update(doc.to_dict() or {})
+                            if merged_state:
+                                cache_storybook_state(session_id, merged_state)
+                    except Exception as exc:
+                        logger.debug("Could not read final movie metadata from Firestore: %s", exc)
+                assembly_status = str((merged_state or {}).get("assembly_status", "") or "").strip().lower()
                 if assembly_status == "failed":
-                    error_message = str((resume_state or {}).get("assembly_error", "") or "").strip()
+                    error_message = str((merged_state or {}).get("assembly_error", "") or "").strip()
                     publish_session_event(
                         session_id,
                         {
@@ -5476,47 +6352,35 @@ async def _watch_for_final_video(session_id: str) -> None:
                         if updated_epoch <= 0.0 or updated_epoch + 0.25 < not_before_epoch:
                             await asyncio.sleep(1)
                             continue
-                    # Read final movie metadata from Firestore session doc.
-                    story_title, child_name = _storybook_identity_from_state(resume_state or {})
-                    narration_raw = (resume_state or {}).get("narration_lines")
+                    story_title, child_name = _storybook_identity_from_state(merged_state)
+                    narration_raw = merged_state.get("narration_lines")
                     narration_lines = (
                         [str(line).strip() for line in narration_raw if isinstance(line, str) and str(line).strip()]
                         if isinstance(narration_raw, list)
                         else None
                     )
-                    audio_available = (resume_state or {}).get("audio_available")
+                    lighting_cues_raw = merged_state.get("theater_lighting_cues")
+                    lighting_cues = (
+                        [dict(item) for item in lighting_cues_raw if isinstance(item, dict)]
+                        if isinstance(lighting_cues_raw, list)
+                        else None
+                    )
+                    audio_available = merged_state.get("audio_available")
                     if not isinstance(audio_available, bool):
                         audio_available = None
-                    final_url: str | None = None
-                    trading_card_url: str | None = str((resume_state or {}).get("trading_card_url", "") or "").strip() or None
-                    publish_ready = _storybook_release_ready(resume_state)
+                    final_has_audio_stream = merged_state.get("final_has_audio_stream")
+                    if not isinstance(final_has_audio_stream, bool):
+                        final_has_audio_stream = None
                     try:
-                        project = os.environ.get("GOOGLE_CLOUD_PROJECT", "")
-                        db_name = os.environ.get("FIRESTORE_DATABASE", "(default)")
-                        if project:
-                            from google.cloud import firestore as _fs
-                            _db = _fs.AsyncClient(project=project, database=db_name)
-                            _doc = await _db.collection("storyteller_sessions").document(session_id).get()
-                            if _doc.exists:
-                                doc_data = _doc.to_dict() or {}
-                                merged_state = dict(resume_state or {})
-                                merged_state.update(doc_data)
-                                assembly_status = str((merged_state or {}).get("assembly_status", "") or "").strip().lower()
-                                publish_ready = _storybook_release_ready(merged_state)
-                                final_url = str(merged_state.get("final_video_url", "") or "").strip() or None
-                                trading_card_url = str(merged_state.get("trading_card_url", "") or "").strip() or None
-                                story_title, child_name = _storybook_identity_from_state(merged_state)
-                                narration_raw = doc_data.get("narration_lines")
-                                if isinstance(narration_raw, list):
-                                    narration_lines = [
-                                        str(line).strip()
-                                        for line in narration_raw
-                                        if isinstance(line, str) and str(line).strip()
-                                    ]
-                                if isinstance(doc_data.get("audio_available"), bool):
-                                    audio_available = bool(doc_data.get("audio_available"))
-                    except Exception as exc:
-                        logger.debug("Could not read final movie metadata from Firestore: %s", exc)
+                        final_video_duration_sec = float(merged_state.get("final_video_duration_sec") or 0.0)
+                    except Exception:
+                        final_video_duration_sec = 0.0
+                    explicit_theater_release_ready = merged_state.get("theater_release_ready")
+                    if not isinstance(explicit_theater_release_ready, bool):
+                        explicit_theater_release_ready = None
+                    final_url: str | None = str(merged_state.get("final_video_url", "") or "").strip() or None
+                    trading_card_url: str | None = str((merged_state or {}).get("trading_card_url", "") or "").strip() or None
+                    publish_ready = _storybook_release_ready(merged_state)
                     if not publish_ready:
                         await asyncio.sleep(1)
                         continue
@@ -5533,7 +6397,11 @@ async def _watch_for_final_video(session_id: str) -> None:
                             mp4_url=url,
                             trading_card_url=trading_card_url,
                             narration_lines=narration_lines,
+                            lighting_cues=lighting_cues,
                             audio_available=audio_available,
+                            final_has_audio_stream=final_has_audio_stream,
+                            final_video_duration_sec=final_video_duration_sec if final_video_duration_sec > 0 else None,
+                            theater_release_ready=explicit_theater_release_ready if explicit_theater_release_ready is not None else publish_ready,
                             story_title=story_title,
                             child_name=child_name,
                             story_phase="theater",
@@ -5543,7 +6411,7 @@ async def _watch_for_final_video(session_id: str) -> None:
             except Exception as exc:
                 logger.debug("Final video poll error for %s: %s", session_id, exc)
 
-            await asyncio.sleep(1 if _env_enabled("ENABLE_FAST_STORYBOOK_ASSEMBLY", default=False) else 4)
+            await asyncio.sleep(poll_seconds)
     finally:
         _watching_final_video_sessions.discard(session_id)
         _final_video_watch_not_before_epoch.pop(session_id, None)
@@ -5571,6 +6439,18 @@ async def _handle_command(
             (
                 cmd.payload.get("child_age")
                 or cmd.payload.get("childAge")
+            ) if isinstance(cmd.payload, dict) else None
+        )
+        storybook_movie_pacing = _normalize_storybook_movie_pacing(
+            (
+                cmd.payload.get("storybook_movie_pacing")
+                or cmd.payload.get("storybookMoviePacing")
+            ) if isinstance(cmd.payload, dict) else None
+        )
+        storybook_elevenlabs_voice_id = _normalize_storybook_elevenlabs_voice_id(
+            (
+                cmd.payload.get("storybook_elevenlabs_voice_id")
+                or cmd.payload.get("storybookElevenlabsVoiceId")
             ) if isinstance(cmd.payload, dict) else None
         )
         try:
@@ -5613,6 +6493,8 @@ async def _handle_command(
                 state["story_tone"] = story_tone
                 state["child_age"] = child_age
                 state["child_age_band"] = child_age_band(child_age)
+                state["storybook_movie_pacing"] = storybook_movie_pacing
+                state["storybook_elevenlabs_voice_id"] = storybook_elevenlabs_voice_id
 
             await _mutate_state(
                 runner=runner,
@@ -5629,8 +6511,21 @@ async def _handle_command(
                     state.__setitem__("story_tone", story_tone),
                     state.__setitem__("child_age", child_age),
                     state.__setitem__("child_age_band", child_age_band(child_age)),
+                    state.__setitem__("storybook_movie_pacing", storybook_movie_pacing),
+                    state.__setitem__("storybook_elevenlabs_voice_id", storybook_elevenlabs_voice_id),
                 ),
             )
+
+        _update_storybook_firestore(
+            session_id,
+            {
+                "story_tone": story_tone,
+                "child_age": child_age,
+                "child_age_band": child_age_band(child_age),
+                "storybook_movie_pacing": storybook_movie_pacing,
+                "storybook_elevenlabs_voice_id": storybook_elevenlabs_voice_id,
+            },
+        )
 
         if session_id not in _greeting_sent_sessions:
             _greeting_sent_sessions.add(session_id)
@@ -5736,6 +6631,12 @@ async def _handle_command(
             )
 
     elif cmd.type == ClientCommandType.END_STORY:
+        await _persist_storybook_elevenlabs_voice_id(
+            runner=runner,
+            user_id=user_id,
+            session_id=cmd.session_id,
+            voice_id=_payload_storybook_elevenlabs_voice_id(cmd.payload),
+        )
         await _trigger_story_end(
             runner=runner,
             session_id=cmd.session_id,
@@ -5840,13 +6741,11 @@ async def _handle_command(
                     ),
                 )
                 def _save_spyglass(state: dict[str, Any]) -> None:
-                    state["camera_stage"] = "done"
-                    state["camera_received"] = True
-                    if toy_thumb:
-                        state["toy_reference_thumbnail_b64"] = toy_thumb[0]
-                        state["toy_reference_thumbnail_mime"] = toy_thumb[1]
-                    state["toy_reference_visual_summary"] = summary_text
-                    state["sidekick_description"] = "their special toy companion"
+                    _apply_shared_toy_story_state(
+                        state,
+                        summary_text=summary_text,
+                        toy_thumb=toy_thumb,
+                    )
 
                 await _mutate_state(
                     runner=runner,
@@ -5886,6 +6785,13 @@ async def _handle_command(
         rating = _normalize_movie_feedback_rating(cmd.payload.get("rating"))
         reasons = _normalize_movie_feedback_reasons(cmd.payload.get("reasons"))
         note = str(cmd.payload.get("note", "") or "").strip()[:500]
+        storybook_elevenlabs_voice_id = _payload_storybook_elevenlabs_voice_id(cmd.payload)
+        await _persist_storybook_elevenlabs_voice_id(
+            runner=runner,
+            user_id=user_id,
+            session_id=cmd.session_id,
+            voice_id=storybook_elevenlabs_voice_id,
+        )
         firestore_state = _load_storybook_firestore_state(cmd.session_id)
         session = await runner.session_service.get_session(
             app_name="storyteller",
@@ -5898,6 +6804,8 @@ async def _handle_command(
                 merged_state.update(dict(session.state))
             except Exception:
                 pass
+        if storybook_elevenlabs_voice_id:
+            merged_state["storybook_elevenlabs_voice_id"] = storybook_elevenlabs_voice_id
         if rating or reasons or note:
             schedule_background_task(
                 asyncio.to_thread(
@@ -6069,6 +6977,7 @@ async def _forward_session_events(
     user_id: str,
     session_id: str,
     connection_id: str,
+    live_queue: LiveRequestQueue,
 ) -> None:
     """Forwards custom async events (tool completions) to the websocket."""
     queue = get_session_queue(session_id)
@@ -6090,6 +6999,7 @@ async def _forward_session_events(
                 if url:
                     is_placeholder = bool(payload.get("is_placeholder"))
                     persist_asset = payload.get("persist_asset", True) is not False
+                    queued_follow_up_text = ""
                     # Mark that this session has received at least one real image.
                     if not is_placeholder:
                         _session_has_any_image.add(session_id)
@@ -6102,6 +7012,7 @@ async def _forward_session_events(
                     asset_key = "scene_asset_urls" if looks_like_image else "generated_asset_urls"
 
                     def _append_asset(state: dict[str, Any]) -> None:
+                        nonlocal queued_follow_up_text
                         urls = state.get(asset_key, [])
                         if not isinstance(urls, list):
                             urls = []
@@ -6119,6 +7030,7 @@ async def _forward_session_events(
                                 gcs_uri=gcs_uri,
                             )
                             state["scene_render_pending"] = False
+                            queued_follow_up_text = _arm_queued_scene_follow_up_after_render(state)
                         else:
                             if not urls or urls[-1] != url:
                                 urls.append(url)
@@ -6214,6 +7126,23 @@ async def _forward_session_events(
                             _req_at = _scene_gen_requested_at.pop(session_id, None)
                             _e2e_ms = int((time.monotonic() - _req_at) * 1000) if _req_at else -1
                             logger.info("⏱️ TIMING [ws] video_ready sent (no sync wait) | e2e_ms=%d | session=%s", _e2e_ms, session_id)
+                        if queued_follow_up_text:
+                            logger.info(
+                                "Replaying queued child scene request after render complete for session %s: %s",
+                                session_id,
+                                queued_follow_up_text[:160],
+                            )
+                            _send_live_content(
+                                session_id,
+                                live_queue,
+                                (
+                                    "The child already asked for the next page while the last picture was still drawing: "
+                                    f"\"{queued_follow_up_text}\". "
+                                    "Continue immediately from that newest request. "
+                                    "Give at most one short acknowledgment if needed, then make the next page. "
+                                    "Do not ask the child to repeat it."
+                                ),
+                            )
                 else:
                     logger.debug("video_ready event for session %s had an empty URL?!", session_id)
                 continue
@@ -6226,6 +7155,12 @@ async def _forward_session_events(
                     narration_lines = (
                         [str(line).strip() for line in narration_raw if isinstance(line, str) and str(line).strip()]
                         if isinstance(narration_raw, list)
+                        else None
+                    )
+                    lighting_cues_raw = payload.get("lighting_cues")
+                    lighting_cues = (
+                        [dict(item) for item in lighting_cues_raw if isinstance(item, dict)]
+                        if isinstance(lighting_cues_raw, list)
                         else None
                     )
                     audio_available = payload.get("audio_available")
@@ -6242,6 +7177,8 @@ async def _forward_session_events(
                             state["trading_card_url"] = trading_card_url
                         if narration_lines is not None:
                             state["narration_lines"] = narration_lines
+                        if lighting_cues is not None:
+                            state["theater_lighting_cues"] = lighting_cues
                         if isinstance(audio_available, bool):
                             state["audio_available"] = audio_available
                         if isinstance(final_has_audio_stream, bool):
@@ -6273,6 +7210,7 @@ async def _forward_session_events(
                                 "final_video_url": str(persisted_state.get("final_video_url", "") or "").strip(),
                                 "trading_card_url": str(persisted_state.get("trading_card_url", "") or "").strip(),
                                 "narration_lines": list(persisted_state.get("narration_lines", []) or []),
+                                "theater_lighting_cues": list(persisted_state.get("theater_lighting_cues", []) or []),
                                 "audio_available": persisted_state.get("audio_available"),
                                 "final_has_audio_stream": persisted_state.get("final_has_audio_stream"),
                                 "final_video_duration_sec": persisted_state.get("final_video_duration_sec"),

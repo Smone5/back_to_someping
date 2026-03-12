@@ -4,7 +4,7 @@ import json
 import logging
 import os
 import uuid
-from typing import Any, Awaitable, Callable
+from typing import Any, Awaitable, Callable, Literal
 
 from google.adk.agents import BaseAgent, LlmAgent
 from google.adk.agents.callback_context import CallbackContext
@@ -15,12 +15,41 @@ from google.adk.runners import Runner
 from google.adk.sessions import InMemorySessionService
 from google.adk.utils import instructions_utils
 from google.genai import types as genai_types
-from pydantic import ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 
 logger = logging.getLogger(__name__)
 
 ReviewCallback = Callable[[dict[str, Any], int], Awaitable[dict[str, Any]]]
 RepairCallback = Callable[[dict[str, Any], dict[str, Any], int], Awaitable[dict[str, Any]]]
+
+
+class AssemblyDirectorPlan(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    quality_bar: str
+    pacing_focus: list[str] = Field(default_factory=list)
+    audio_focus: list[str] = Field(default_factory=list)
+    motion_focus: list[str] = Field(default_factory=list)
+    repair_strategy: str
+
+
+class AssemblyDirectorDecision(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    done: bool
+    reason: str
+    selected_scene_indices: list[int] = Field(default_factory=list)
+    selected_repair_limit: int = 0
+
+
+class AssemblyDirectorSummary(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    status: Literal["passed", "passed_with_warnings", "passed_with_repairs", "needs_manual_review"]
+    ready_to_render: bool
+    iterations_completed: int
+    repairs_applied: int
+    reason: str
 
 
 def _director_model() -> str:
@@ -117,6 +146,8 @@ def _workflow_status_from_state(state: dict[str, Any]) -> str:
 
 
 def parse_workflow_json(raw: Any) -> dict[str, Any] | None:
+    if isinstance(raw, BaseModel):
+        return raw.model_dump(exclude_none=True)
     if isinstance(raw, dict):
         return dict(raw)
     if not isinstance(raw, str):
@@ -434,18 +465,21 @@ def _build_workflow_agent(
         model=model,
         instruction=_planner_instruction,
         output_key="assembly_director_plan",
+        output_schema=AssemblyDirectorPlan,
     )
     critic_agent = LlmAgent(
         name="assembly_critic",
         model=model,
         instruction=_critic_instruction,
         output_key="assembly_director_decision",
+        output_schema=AssemblyDirectorDecision,
     )
     finalizer_agent = LlmAgent(
         name="assembly_finalizer",
         model=model,
         instruction=_finalizer_instruction,
         output_key="assembly_director_summary",
+        output_schema=AssemblyDirectorSummary,
     )
     return StorybookAssemblyWorkflowAgent(
         planner_agent=planner_agent,

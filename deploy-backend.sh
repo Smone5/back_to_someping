@@ -2,8 +2,8 @@
 # deploy-backend.sh — Build, push, and deploy the backend to Cloud Run
 set -euo pipefail
 
-PROJECT="interactive-story-gemini"
-REGION="us-central1"
+PROJECT="${GOOGLE_CLOUD_PROJECT:-interactive-story-gemini}"
+REGION="${GOOGLE_CLOUD_LOCATION:-us-central1}"
 TAG="${1:-$(date +%Y%m%d-%H%M%S)}"
 BACKEND_IMAGE="gcr.io/$PROJECT/storyteller-backend:$TAG"
 

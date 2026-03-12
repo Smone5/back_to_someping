@@ -9,21 +9,36 @@
  * but hard for a 4-year-old to pass.
  *
  * Additional accessibility features:
- * - "Calm Mode" toggle (grayscale + audio off) for sensory-overloaded children (Iter 5 #3)
  * - Large, high-contrast buttons (WCAG AA/AAA, Iter 4 #5)
  * - aria-labels for screen reader support
  * - Cannot be "accidentally" passed by a child mashing the screen
  */
 
 import { useState, useCallback, useEffect } from 'react';
+import { useStoryVoicePreview } from '@/hooks/useStoryVoicePreview';
 import { useUiSounds } from '@/hooks/useUiSounds';
 import { normalizeHomeAssistantConfig } from './homeAssistant';
 import IoTSettingsModal, { IoTConfig } from './IoTSettingsModal';
+import HowItWorksModal from './HowItWorksModal';
+import {
+    DEFAULT_STORY_READER_VOICE_ID,
+    STORY_READER_VOICE_OPTIONS,
+    getStoryReaderVoiceOption,
+    normalizeStoryReaderVoiceId,
+} from './storyVoiceOptions';
 
 export type StoryTone = 'cozy' | 'gentle_spooky' | 'adventure_spooky';
+export type StorybookMoviePacing = 'read_to_me' | 'read_with_me' | 'fast_movie';
 
 interface ParentGateProps {
-    onApproved: (calmMode: boolean, iotConfig: IoTConfig | null, storyTone: StoryTone, childAge: number) => void;
+    onApproved: (
+        calmMode: boolean,
+        iotConfig: IoTConfig | null,
+        storyTone: StoryTone,
+        childAge: number,
+        storybookMoviePacing: StorybookMoviePacing,
+        storyReaderVoiceId: string,
+    ) => void;
 }
 
 const REQUIRE_MATH_GATE = ['1', 'true', 'yes', 'on'].includes(
@@ -41,15 +56,28 @@ export default function ParentGate({ onApproved }: ParentGateProps) {
     const [challenge, setChallenge] = useState(generateMathChallenge);
     const [input, setInput] = useState('');
     const [error, setError] = useState('');
-    const [calmMode, setCalmMode] = useState(false);
+    const calmMode = false;
     const [storyTone, setStoryTone] = useState<StoryTone>('cozy');
     const [childAge, setChildAge] = useState(4);
+    const [storybookMoviePacing, setStorybookMoviePacing] = useState<StorybookMoviePacing>('read_with_me');
+    const [storyReaderVoiceId, setStoryReaderVoiceId] = useState(DEFAULT_STORY_READER_VOICE_ID);
     const [attempts, setAttempts] = useState(0);
     const [showIoT, setShowIoT] = useState(false);
     const [iotConfig, setIoTConfig] = useState<IoTConfig | null>(null);
     const [showHowTo, setShowHowTo] = useState(false);
     const [isMounted, setIsMounted] = useState(false);
     const { playUiSound } = useUiSounds({ enabled: !calmMode, volume: 0.9 });
+    const {
+        previewError,
+        previewLoading,
+        previewPlaying,
+        previewVoiceId,
+        previewVoice,
+        stopPreview,
+    } = useStoryVoicePreview({
+        childAge,
+        storybookMoviePacing,
+    });
 
     // Initial mount hydration fix
     useEffect(() => {
@@ -90,27 +118,56 @@ export default function ParentGate({ onApproved }: ParentGateProps) {
         }
     }, []);
 
+    useEffect(() => {
+        try {
+            const saved = localStorage.getItem('storyteller_storybook_movie_pacing');
+            if (saved === 'read_to_me' || saved === 'read_with_me' || saved === 'fast_movie') {
+                setStorybookMoviePacing(saved);
+            }
+        } catch {
+            // Ignore
+        }
+    }, []);
+
+    useEffect(() => {
+        try {
+            const saved = localStorage.getItem('storyteller_story_reader_voice_id');
+            if (saved) {
+                setStoryReaderVoiceId(normalizeStoryReaderVoiceId(saved));
+            }
+        } catch {
+            // Ignore
+        }
+    }, []);
+
+    useEffect(() => {
+        if (previewVoiceId && previewVoiceId !== storyReaderVoiceId) {
+            stopPreview();
+        }
+    }, [previewVoiceId, stopPreview, storyReaderVoiceId]);
+
     const handleSubmit = useCallback(() => {
-        if (!REQUIRE_MATH_GATE) {
+        const persistParentPrefs = () => {
             try {
                 localStorage.setItem('storyteller_story_tone', storyTone);
                 localStorage.setItem('storyteller_child_age', String(childAge));
+                localStorage.setItem('storyteller_storybook_movie_pacing', storybookMoviePacing);
+                localStorage.setItem('storyteller_story_reader_voice_id', storyReaderVoiceId);
             } catch {
                 // Ignore
             }
-            onApproved(calmMode, iotConfig, storyTone, childAge);
+        };
+
+        if (!REQUIRE_MATH_GATE) {
+            persistParentPrefs();
+            onApproved(calmMode, iotConfig, storyTone, childAge, storybookMoviePacing, storyReaderVoiceId);
             return;
         }
 
         const userAnswer = parseInt(input, 10);
         if (userAnswer === challenge.answer) {
-            try {
-                localStorage.setItem('storyteller_story_tone', storyTone);
-                localStorage.setItem('storyteller_child_age', String(childAge));
-            } catch {
-                // Ignore
-            }
-            onApproved(calmMode, iotConfig, storyTone, childAge);
+            persistParentPrefs();
+            onApproved(calmMode, iotConfig, storyTone, childAge, storybookMoviePacing, storyReaderVoiceId);
         } else {
             setAttempts((a) => a + 1);
             setError('Hmm, that\'s not quite right! Try again.');
@@ -122,7 +179,7 @@ export default function ParentGate({ onApproved }: ParentGateProps) {
                 setError('New challenge generated. Please try again.');
             }
         }
-    }, [input, challenge.answer, calmMode, attempts, childAge, iotConfig, onApproved, storyTone]);
+    }, [input, challenge.answer, calmMode, attempts, childAge, iotConfig, onApproved, storyTone, storyReaderVoiceId, storybookMoviePacing]);
 
     useEffect(() => {
         const handleKey = (e: KeyboardEvent) => {
@@ -164,28 +221,15 @@ export default function ParentGate({ onApproved }: ParentGateProps) {
                     type="button"
                     className="parent-gate-how-to-btn"
                     onClick={() => {
-                        playUiSound(showHowTo ? 'close' : 'tap');
-                        setShowHowTo((v) => !v);
+                        playUiSound('tap');
+                        setShowHowTo(true);
                     }}
-                    aria-expanded={showHowTo}
+                    aria-haspopup="dialog"
                 >
-                    {showHowTo ? '▼ Hide' : '▶ How it works'}
+                    ▶ How it works
                 </button>
 
-                {showHowTo && (
-                    <div className="parent-gate-how-to" role="region" aria-label="How to use the app">
-                        <p><strong>How it works:</strong></p>
-                        <ul>
-                            <li><strong>Imagine:</strong> Your child says an idea like &ldquo;a pink dragon flying over a castle.&rdquo;</li>
-                            <li><strong>Create:</strong> Amelia draws the first storybook page.</li>
-                            <li><strong>Build:</strong> Amelia asks one simple question, like &ldquo;Who is in the story?&rdquo; or &ldquo;What happens next?&rdquo;</li>
-                            <li><strong>Continue:</strong> Each answer grows the story through a clear beginning, middle, and end.</li>
-                            <li><strong>Finish:</strong> Amelia turns the adventure into a personalized storybook movie.</li>
-                        </ul>
-                        <p><strong>Learning benefits:</strong> Early literacy, sequencing, creativity, and communication.</p>
-                        <p><strong>Microphone:</strong> We use the microphone for the live chat. No audio is ever stored or saved.</p>
-                    </div>
-                )}
+                {/* How It Works Content moved to responsive modal */}
 
                 {!showHowTo && (
                     <div className="parent-gate-tone-picker" role="radiogroup" aria-label="Story mood">
@@ -193,7 +237,7 @@ export default function ParentGate({ onApproved }: ParentGateProps) {
                             <strong>Story Mood</strong>
                             <span>Pick how spooky Amelia may get.</span>
                         </div>
-                        <div className="parent-gate-tone-options">
+                        <div className="parent-gate-scroll-row">
                             <button
                                 type="button"
                                 className={`parent-gate-tone-option ${storyTone === 'cozy' ? 'is-selected' : ''}`}
@@ -226,25 +270,106 @@ export default function ParentGate({ onApproved }: ParentGateProps) {
                 )}
 
                 {!showHowTo && (
-                    <div className="parent-gate-age-picker">
+                    <div className="parent-gate-tone-picker" role="radiogroup" aria-label="Final storybook movie pace">
                         <div className="parent-gate-tone-heading">
-                            <strong>Child Age</strong>
-                            <span>Amelia will match the pacing, words, and story intensity to this age.</span>
+                            <strong>Final Movie Pace</strong>
+                            <span>Choose how long pages stay on screen.</span>
                         </div>
-                        <label className="parent-gate-age-field">
-                            <span>Age</span>
-                            <select
-                                value={childAge}
-                                onChange={(e) => setChildAge(Math.max(4, Math.min(10, Number(e.target.value) || 4)))}
-                                aria-label="Child age"
+                        <div className="parent-gate-scroll-row">
+                            <button
+                                type="button"
+                                className={`parent-gate-tone-option ${storybookMoviePacing === 'read_to_me' ? 'is-selected' : ''}`}
+                                onClick={() => setStorybookMoviePacing('read_to_me')}
+                                aria-pressed={storybookMoviePacing === 'read_to_me'}
                             >
-                                {[4, 5, 6, 7, 8, 9, 10].map((age) => (
-                                    <option key={age} value={age}>
-                                        {age} years old
-                                    </option>
-                                ))}
-                            </select>
-                        </label>
+                                <span className="parent-gate-tone-label">Read to Me</span>
+                                <span className="parent-gate-tone-copy">Voice leads. Shorter page text. Best for pre-readers.</span>
+                            </button>
+                            <button
+                                type="button"
+                                className={`parent-gate-tone-option ${storybookMoviePacing === 'read_with_me' ? 'is-selected' : ''}`}
+                                onClick={() => setStorybookMoviePacing('read_with_me')}
+                                aria-pressed={storybookMoviePacing === 'read_with_me'}
+                            >
+                                <span className="parent-gate-tone-label">Read with Me</span>
+                                <span className="parent-gate-tone-copy">Balanced read-along timing with more time to look and read.</span>
+                            </button>
+                            <button
+                                type="button"
+                                className={`parent-gate-tone-option ${storybookMoviePacing === 'fast_movie' ? 'is-selected' : ''}`}
+                                onClick={() => setStorybookMoviePacing('fast_movie')}
+                                aria-pressed={storybookMoviePacing === 'fast_movie'}
+                            >
+                                <span className="parent-gate-tone-label">Fast Movie</span>
+                                <span className="parent-gate-tone-copy">Brisker page turns for replays or quick sharing.</span>
+                            </button>
+                        </div>
+                    </div>
+                )}
+
+                {!showHowTo && (
+                    <div className="parent-gate-dropdowns-row">
+                        <div className="parent-gate-age-picker">
+                            <div className="parent-gate-tone-heading">
+                                <strong>Child Age</strong>
+                            </div>
+                            <label className="parent-gate-age-field">
+                                <select
+                                    value={childAge}
+                                    onChange={(e) => setChildAge(Math.max(4, Math.min(10, Number(e.target.value) || 4)))}
+                                    aria-label="Child age"
+                                >
+                                    {[4, 5, 6, 7, 8, 9, 10].map((age) => (
+                                        <option key={age} value={age}>
+                                            {age} years old
+                                        </option>
+                                    ))}
+                                </select>
+                            </label>
+                        </div>
+
+                        <div className="parent-gate-age-picker">
+                            <div className="parent-gate-tone-heading">
+                                <strong>Narrator Voice</strong>
+                            </div>
+                            <label className="parent-gate-age-field">
+                                <div className="story-reader-voice-row">
+                                    <select
+                                        value={storyReaderVoiceId}
+                                        onChange={(e) => setStoryReaderVoiceId(normalizeStoryReaderVoiceId(e.target.value))}
+                                        aria-label="Story reader voice"
+                                    >
+                                        {STORY_READER_VOICE_OPTIONS.map((voice) => (
+                                            <option key={voice.id} value={voice.id}>
+                                                {voice.name}
+                                            </option>
+                                        ))}
+                                    </select>
+                                    <button
+                                        type="button"
+                                        className={`story-reader-voice-preview-btn ${(previewLoading || previewPlaying) && previewVoiceId === storyReaderVoiceId ? 'is-active' : ''}`}
+                                        onClick={() => {
+                                            playUiSound((previewLoading || previewPlaying) && previewVoiceId === storyReaderVoiceId ? 'close' : 'tap');
+                                            void previewVoice(storyReaderVoiceId);
+                                        }}
+                                        aria-label={previewLoading || previewPlaying ? 'Stop voice preview' : `Preview ${getStoryReaderVoiceOption(storyReaderVoiceId).name} voice`}
+                                        aria-pressed={(previewLoading || previewPlaying) && previewVoiceId === storyReaderVoiceId}
+                                        title={getStoryReaderVoiceOption(storyReaderVoiceId).blurb}
+                                    >
+                                        {previewLoading && previewVoiceId === storyReaderVoiceId
+                                            ? '...'
+                                            : previewPlaying && previewVoiceId === storyReaderVoiceId
+                                                ? 'Stop'
+                                                : '▶'}
+                                    </button>
+                                </div>
+                            </label>
+                            {previewError ? (
+                                <p className="story-reader-voice-preview-error" role="status">
+                                    {previewError}
+                                </p>
+                            ) : null}
+                        </div>
                     </div>
                 )}
 
@@ -271,16 +396,6 @@ export default function ParentGate({ onApproved }: ParentGateProps) {
                 )}
 
                 <div className="parent-gate-footer-controls">
-                    {/* Calm Mode toggle */}
-                    <label className="calm-mode-toggle" aria-label="Enable calm mode for sensory-sensitive children">
-                        <input
-                            type="checkbox"
-                            checked={calmMode}
-                            onChange={(e) => setCalmMode(e.target.checked)}
-                        />
-                        <span className="calm-toggle-label">🌙 Calm Mode (Softer Play)</span>
-                    </label>
-
                     <button
                         className="parent-gate-btn"
                         onClick={() => {
@@ -306,6 +421,9 @@ export default function ParentGate({ onApproved }: ParentGateProps) {
                         setIoTConfig(config);
                     }}
                 />
+            )}
+            {showHowTo && (
+                <HowItWorksModal onClose={() => setShowHowTo(false)} />
             )}
         </div>
     );

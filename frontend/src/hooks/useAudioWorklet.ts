@@ -41,6 +41,17 @@ function ensureAudioWorkletModules(ctx: AudioContext): Promise<void> {
 }
 
 export type AudioState = 'idle' | 'listening' | 'speaking' | 'buffering';
+export interface BufferedClipProgress {
+    progress: number;
+    elapsedSpeechMs: number;
+    speechStartMs: number;
+    speechEndMs: number;
+    speechDurationMs: number;
+}
+
+interface StartListeningOptions {
+    deviceId?: string | null;
+}
 
 interface UseAudioWorkletOptions {
     onPcmChunk: (pcm: ArrayBuffer) => void;
@@ -99,6 +110,9 @@ export function useAudioWorklet({
     const wakeLockRef = useRef<WakeLockSentinel | null>(null);
     const isSpeakingRef = useRef(false);
     const audioInitializedRef = useRef(false);
+    const bufferedClipSourceRef = useRef<AudioBufferSourceNode | null>(null);
+    const bufferedClipProgressRafRef = useRef<number | null>(null);
+    const preferredInputDeviceIdRef = useRef<string | null>(null);
     const voiceActiveRef = useRef(false);
     const voiceRiseStartedAtRef = useRef<number | null>(null);
     const silenceStartedAtRef = useRef<number | null>(null);
@@ -124,6 +138,23 @@ export function useAudioWorklet({
 
     const getNarrationCeiling = useCallback(() => (outputMutedRef.current ? 0 : 0.8), []);
     const getNarrationDucked = useCallback(() => (outputMutedRef.current ? 0 : 0.25), []);
+
+    const teardownCapture = useCallback(() => {
+        if (voiceActiveRef.current) {
+            voiceActiveRef.current = false;
+            onVoiceActivityEndRef.current?.();
+        }
+        voiceRiseStartedAtRef.current = null;
+        silenceStartedAtRef.current = null;
+        voiceActiveStartedAtRef.current = null;
+        preRollRef.current = [];
+        downsamplerNodeRef.current?.disconnect();
+        downsamplerNodeRef.current = null;
+        micSourceRef.current?.disconnect();
+        micSourceRef.current = null;
+        micStreamRef.current?.getTracks().forEach((t) => t.stop());
+        micStreamRef.current = null;
+    }, []);
 
     const initAudio = useCallback(async () => {
         if (audioInitializedRef.current) {
@@ -191,23 +222,45 @@ export function useAudioWorklet({
         }
     }, [initAudio, audioState]);
 
-    const startListening = useCallback(async () => {
+    const startListening = useCallback(async (options?: StartListeningOptions) => {
+        const activeDeviceId = preferredInputDeviceIdRef.current;
+        const requestedDeviceId = options?.deviceId ?? activeDeviceId ?? null;
         if (micStreamRef.current) {
-            setAudioState('listening');
-            return;
+            if (requestedDeviceId === null || requestedDeviceId === activeDeviceId) {
+                setAudioState('listening');
+                return;
+            }
+            teardownCapture();
+        }
+        if (options?.deviceId !== undefined) {
+            preferredInputDeviceIdRef.current = options.deviceId ?? null;
         }
         const ctx = await initAudio();
 
-        // Mic capture with echo cancellation (Iter 1 #2 — Audio Feedback Loop fix)
-        const stream = await navigator.mediaDevices.getUserMedia({
-            audio: {
-                echoCancellation: true,
-                noiseSuppression: true,
-                autoGainControl: true,
-                sampleRate: { ideal: 48000 },
-                channelCount: 1,
-            },
+        const buildAudioConstraints = (deviceId: string | null): MediaTrackConstraints => ({
+            echoCancellation: true,
+            noiseSuppression: true,
+            autoGainControl: true,
+            sampleRate: { ideal: 48000 },
+            channelCount: 1,
+            ...(deviceId ? { deviceId: { exact: deviceId } } : {}),
         });
+
+        // Mic capture with echo cancellation (Iter 1 #2 — Audio Feedback Loop fix)
+        let stream: MediaStream;
+        try {
+            stream = await navigator.mediaDevices.getUserMedia({
+                audio: buildAudioConstraints(requestedDeviceId),
+            });
+        } catch (error) {
+            if (!requestedDeviceId) {
+                throw error;
+            }
+            stream = await navigator.mediaDevices.getUserMedia({
+                audio: buildAudioConstraints(null),
+            });
+            preferredInputDeviceIdRef.current = null;
+        }
 
         micStreamRef.current = stream;
         const source = ctx.createMediaStreamSource(stream);
@@ -336,29 +389,16 @@ export function useAudioWorklet({
         downsamplerNodeRef.current = downsamplerNode;
 
         setAudioState('listening');
-    }, [getNarrationCeiling, getNarrationDucked, initAudio]);
+    }, [getNarrationCeiling, getNarrationDucked, initAudio, teardownCapture]);
 
     const stopListening = useCallback(() => {
-        if (voiceActiveRef.current) {
-            voiceActiveRef.current = false;
-            onVoiceActivityEndRef.current?.();
-        }
-        voiceRiseStartedAtRef.current = null;
-        silenceStartedAtRef.current = null;
-        voiceActiveStartedAtRef.current = null;
-        preRollRef.current = [];
-        downsamplerNodeRef.current?.disconnect();
-        downsamplerNodeRef.current = null;
-        micSourceRef.current?.disconnect();
-        micSourceRef.current = null;
-        micStreamRef.current?.getTracks().forEach((t) => t.stop());
-        micStreamRef.current = null;
+        teardownCapture();
         if (gainNodeRef.current) {
             gainNodeRef.current.gain.value = getNarrationCeiling();
         }
         duckedForUserRef.current = false;
         setAudioState('idle');
-    }, [getNarrationCeiling]);
+    }, [getNarrationCeiling, teardownCapture]);
 
     /** Feed raw 24kHz int16 PCM bytes from the backend into the playback worklet. */
     const playPcmChunk = useCallback((pcmBytes: ArrayBuffer) => {
@@ -397,6 +437,166 @@ export function useAudioWorklet({
         gainNode.gain.linearRampToValueAtTime(target, gainNode.context.currentTime + 0.08);
     }, []);
 
+    const stopBufferedClip = useCallback(() => {
+        if (bufferedClipProgressRafRef.current !== null) {
+            cancelAnimationFrame(bufferedClipProgressRafRef.current);
+            bufferedClipProgressRafRef.current = null;
+        }
+        const source = bufferedClipSourceRef.current;
+        bufferedClipSourceRef.current = null;
+        if (!source) {
+            return;
+        }
+        source.onended = null;
+        try {
+            source.stop();
+        } catch {
+            // Ignore redundant stop calls.
+        }
+        setAudioState((current) => (current === 'speaking' ? 'idle' : current));
+    }, []);
+
+    const estimateBufferedClipSpeechWindow = useCallback((buffer: AudioBuffer) => {
+        const totalDuration = Math.max(buffer.duration, 0.01);
+        if (!buffer.length || buffer.numberOfChannels <= 0) {
+            return { startSeconds: 0, endSeconds: totalDuration };
+        }
+
+        const blockSize = Math.max(64, Math.floor(buffer.sampleRate / 220));
+        const totalBlocks = Math.ceil(buffer.length / blockSize);
+        const minActiveBlocks = 3;
+        const threshold = 0.008;
+        const channels = Array.from({ length: buffer.numberOfChannels }, (_, idx) => buffer.getChannelData(idx));
+
+        let speechStartBlock = -1;
+        let speechEndBlock = -1;
+        let activeRun = 0;
+
+        for (let blockIndex = 0; blockIndex < totalBlocks; blockIndex += 1) {
+            const blockStart = blockIndex * blockSize;
+            const blockEnd = Math.min(buffer.length, blockStart + blockSize);
+            let blockPeak = 0;
+
+            for (const channel of channels) {
+                for (let sampleIndex = blockStart; sampleIndex < blockEnd; sampleIndex += 1) {
+                    const amplitude = Math.abs(channel[sampleIndex] ?? 0);
+                    if (amplitude > blockPeak) {
+                        blockPeak = amplitude;
+                    }
+                    if (blockPeak >= threshold) {
+                        break;
+                    }
+                }
+                if (blockPeak >= threshold) {
+                    break;
+                }
+            }
+
+            if (blockPeak >= threshold) {
+                activeRun += 1;
+                if (speechStartBlock < 0 && activeRun >= minActiveBlocks) {
+                    speechStartBlock = Math.max(0, blockIndex - minActiveBlocks + 1);
+                }
+                speechEndBlock = blockIndex;
+            } else {
+                activeRun = 0;
+            }
+        }
+
+        if (speechStartBlock < 0 || speechEndBlock < speechStartBlock) {
+            return { startSeconds: 0, endSeconds: totalDuration };
+        }
+
+        const safetyBlocks = 1;
+        const startSeconds = Math.max(0, ((speechStartBlock - safetyBlocks) * blockSize) / buffer.sampleRate);
+        const endSeconds = Math.min(
+            totalDuration,
+            ((speechEndBlock + safetyBlocks + 1) * blockSize) / buffer.sampleRate,
+        );
+
+        if (endSeconds - startSeconds < 0.12) {
+            return { startSeconds: 0, endSeconds: totalDuration };
+        }
+
+        return { startSeconds, endSeconds };
+    }, []);
+
+    const playBufferedClip = useCallback(async (
+        audioBytes: ArrayBuffer,
+        options?: { onEnded?: () => void; onProgress?: (progress: BufferedClipProgress) => void },
+    ): Promise<boolean> => {
+        if (!audioBytes.byteLength) {
+            return false;
+        }
+        const ctx = await initAudio();
+        if (ctx.state === 'suspended') {
+            await ctx.resume();
+        }
+        stopBufferedClip();
+        try {
+            const decoded = await ctx.decodeAudioData(audioBytes.slice(0));
+            const source = ctx.createBufferSource();
+            source.buffer = decoded;
+            source.connect(gainNodeRef.current ?? ctx.destination);
+            bufferedClipSourceRef.current = source;
+            setAudioState('speaking');
+            const startedAt = ctx.currentTime;
+            const speechWindow = estimateBufferedClipSpeechWindow(decoded);
+            const duration = Math.max(speechWindow.endSeconds - speechWindow.startSeconds, 0.01);
+            const emitProgress = (elapsedSeconds: number) => {
+                const progress = Math.max(
+                    0,
+                    Math.min(1, (elapsedSeconds - speechWindow.startSeconds) / duration),
+                );
+                options?.onProgress?.({
+                    progress,
+                    elapsedSpeechMs: Math.max(0, (elapsedSeconds - speechWindow.startSeconds) * 1000),
+                    speechStartMs: speechWindow.startSeconds * 1000,
+                    speechEndMs: speechWindow.endSeconds * 1000,
+                    speechDurationMs: duration * 1000,
+                });
+                return progress;
+            };
+            emitProgress(0);
+            const tickProgress = () => {
+                if (bufferedClipSourceRef.current !== source) {
+                    return;
+                }
+                const elapsed = ctx.currentTime - startedAt;
+                const progress = emitProgress(elapsed);
+                if (progress < 1) {
+                    bufferedClipProgressRafRef.current = requestAnimationFrame(tickProgress);
+                } else {
+                    bufferedClipProgressRafRef.current = null;
+                }
+            };
+            bufferedClipProgressRafRef.current = requestAnimationFrame(tickProgress);
+            source.onended = () => {
+                if (bufferedClipProgressRafRef.current !== null) {
+                    cancelAnimationFrame(bufferedClipProgressRafRef.current);
+                    bufferedClipProgressRafRef.current = null;
+                }
+                if (bufferedClipSourceRef.current === source) {
+                    bufferedClipSourceRef.current = null;
+                    setAudioState((current) => (current === 'speaking' ? 'idle' : current));
+                }
+                emitProgress(speechWindow.endSeconds);
+                options?.onEnded?.();
+            };
+            source.start();
+            return true;
+        } catch (error) {
+            if (bufferedClipProgressRafRef.current !== null) {
+                cancelAnimationFrame(bufferedClipProgressRafRef.current);
+                bufferedClipProgressRafRef.current = null;
+            }
+            console.warn('Buffered audio playback failed:', error);
+            bufferedClipSourceRef.current = null;
+            setAudioState((current) => (current === 'speaking' ? 'idle' : current));
+            return false;
+        }
+    }, [estimateBufferedClipSpeechWindow, initAudio, stopBufferedClip]);
+
     // iOS Background Audio Suppression fix (Iter 5 #2)
     useEffect(() => {
         const handleVisibilityChange = async () => {
@@ -412,10 +612,11 @@ export function useAudioWorklet({
     // Cleanup on unmount
     useEffect(() => {
         return () => {
+            stopBufferedClip();
             stopListening();
             wakeLockRef.current?.release?.();
         };
-    }, [stopListening]);
+    }, [stopBufferedClip, stopListening]);
 
     return {
         audioState,
@@ -425,6 +626,8 @@ export function useAudioWorklet({
         startListening,
         stopListening,
         playPcmChunk,
+        playBufferedClip,
+        stopBufferedClip,
         flushPlaybackBuffer,
         setNarrationMuted,
     };

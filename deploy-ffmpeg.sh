@@ -2,8 +2,8 @@
 # deploy-ffmpeg.sh — Build, push, and deploy the FFmpeg worker Cloud Run Job
 set -euo pipefail
 
-PROJECT="interactive-story-gemini"
-REGION="us-central1"
+PROJECT="${GOOGLE_CLOUD_PROJECT:-interactive-story-gemini}"
+REGION="${GOOGLE_CLOUD_LOCATION:-us-central1}"
 TAG="${1:-$(date +%Y%m%d-%H%M%S)}"
 FFMPEG_IMAGE="gcr.io/$PROJECT/storyteller-ffmpeg:$TAG"
 

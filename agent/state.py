@@ -7,7 +7,7 @@ Firestore sessions after future schema updates (Iteration 10, Data Integrity Aud
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Literal
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 
@@ -36,6 +36,76 @@ class CharacterFact(BaseModel):
         return data
 
 
+class CharacterVisualReference(BaseModel):
+    """A compact visual reference for a recurring character."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    request_id: str = Field(default="")
+    scene_number: int = Field(default=0)
+    thumbnail_b64: str = Field(default="")
+    thumbnail_mime: str = Field(default="image/jpeg")
+    description: str = Field(default="")
+    storybeat_text: str = Field(default="")
+    visual_summary: str = Field(default="")
+    reference_kind: str = Field(default="scene_thumbnail")
+    focus_label: str = Field(default="")
+    crop_box: dict[str, int] = Field(default_factory=dict)
+
+
+class CharacterBibleEntry(BaseModel):
+    """Canonical visual memory for one recurring story character."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    character_key: str = Field(default="")
+    label: str = Field(default="")
+    species: str = Field(default="")
+    role: str = Field(default="story_character")
+    canonical_visual_traits: list[str] = Field(default_factory=list)
+    outfit_accessories: list[str] = Field(default_factory=list)
+    latest_visual_summary: str = Field(default="")
+    reference_images: list[CharacterVisualReference] = Field(default_factory=list)
+
+
+class VisualContinuityPlan(BaseModel):
+    """Structured continuity contract for the next scene render."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    previous_location: str = Field(default="")
+    target_location: str = Field(default="")
+    transition_type: str = Field(default="")
+    active_character_keys: list[str] = Field(default_factory=list)
+    active_character_labels: list[str] = Field(default_factory=list)
+    required_prop_keys: list[str] = Field(default_factory=list)
+    required_prop_labels: list[str] = Field(default_factory=list)
+    forbidden_drift: list[str] = Field(default_factory=list)
+    continuity_notes: list[str] = Field(default_factory=list)
+
+
+class SceneVisualAuditIssue(BaseModel):
+    """One continuity issue found during image QA."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    severity: Literal["minor", "major", "critical"] = Field(default="minor")
+    kind: str = Field(default="")
+    issue: str = Field(default="")
+
+
+class SceneVisualAuditRecord(BaseModel):
+    """Most recent visual continuity QA result for a scene."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    status: Literal["pass", "repair", "fail"] = Field(default="pass")
+    should_retry: bool = Field(default=False)
+    repair_prompt_suffix: str = Field(default="")
+    notes: list[str] = Field(default_factory=list)
+    issues: list[SceneVisualAuditIssue] = Field(default_factory=list)
+
+
 class StorySession(BaseModel):
     """The complete, versioned state of a single storytelling session.
 
@@ -55,6 +125,8 @@ class StorySession(BaseModel):
     toy_reference_visual_summary: str = Field(default="")
     story_summary: str = Field(default="The adventure is just beginning...")
     story_tone: str = Field(default="cozy")
+    storybook_movie_pacing: str = Field(default="read_with_me")
+    storybook_elevenlabs_voice_id: str = Field(default="")
     story_phase: str = Field(default="opening")
     assembly_kind: str = Field(default="initial")
     scene_render_pending: bool = Field(default=False)
@@ -84,6 +156,10 @@ class StorySession(BaseModel):
         }
     )
     continuity_scene_history: list[dict[str, Any]] = Field(default_factory=list)
+    recent_scene_references: list[dict[str, Any]] = Field(default_factory=list)
+    character_bible: dict[str, CharacterBibleEntry] = Field(default_factory=dict)
+    current_visual_continuity_plan: VisualContinuityPlan = Field(default_factory=VisualContinuityPlan)
+    last_scene_visual_audit: SceneVisualAuditRecord = Field(default_factory=SceneVisualAuditRecord)
     continuity_registry_text: str = Field(default="No recurring entities tracked yet.")
     continuity_world_state_text: str = Field(default="No scene-to-scene world state established yet.")
     current_scene_visual_summary: str = Field(default="")
@@ -96,6 +172,8 @@ class StorySession(BaseModel):
         default_factory=list,
         description="GCS URLs of all Veo 3.1 / Nano Banana 2 generated assets this session.",
     )
+    scene_lighting_cues: list[dict[str, Any]] = Field(default_factory=list)
+    theater_lighting_cues: list[dict[str, Any]] = Field(default_factory=list)
     elevenlabs_audio_chunks: list[str] = Field(
         default_factory=list,
         description="GCS URLs of per-turn ElevenLabs audio tracks for final FFmpeg assembly.",
@@ -123,8 +201,16 @@ class StorySession(BaseModel):
             # v1 didn't have elevenlabs_audio_chunks
             if "elevenlabs_audio_chunks" not in data:
                 data["elevenlabs_audio_chunks"] = []
+            if "scene_lighting_cues" not in data:
+                data["scene_lighting_cues"] = []
+            if "theater_lighting_cues" not in data:
+                data["theater_lighting_cues"] = []
             if "story_tone" not in data:
                 data["story_tone"] = "cozy"
+            if "storybook_movie_pacing" not in data:
+                data["storybook_movie_pacing"] = "read_with_me"
+            if "storybook_elevenlabs_voice_id" not in data:
+                data["storybook_elevenlabs_voice_id"] = ""
             if "child_age" not in data:
                 data["child_age"] = 4
             if "child_age_band" not in data:
@@ -163,6 +249,14 @@ class StorySession(BaseModel):
                 }
             if "continuity_scene_history" not in data:
                 data["continuity_scene_history"] = []
+            if "recent_scene_references" not in data:
+                data["recent_scene_references"] = []
+            if "character_bible" not in data:
+                data["character_bible"] = {}
+            if "current_visual_continuity_plan" not in data:
+                data["current_visual_continuity_plan"] = {}
+            if "last_scene_visual_audit" not in data:
+                data["last_scene_visual_audit"] = {}
             if "continuity_registry_text" not in data:
                 data["continuity_registry_text"] = "No recurring entities tracked yet."
             if "continuity_world_state_text" not in data:

@@ -223,6 +223,154 @@ class StoryContinuityTests(unittest.TestCase):
         self.assertFalse(decision.should_render)
         self.assertEqual(decision.reason, "same_location_minor_beat_young_child")
 
+    def test_path_exploration_is_treated_as_new_page_for_young_child(self) -> None:
+        state: dict[str, object] = {"child_age_band": "4-5"}
+        ensure_story_continuity_state(state)
+        record_continuity_scene(
+            state,
+            description=(
+                "A swirling rainbow path glows under a big moon, leading toward a playful purple castle "
+                "with friendly ghosts in the trees."
+            ),
+            storybeat_text="The rainbow path leads toward the castle.",
+            scene_number=1,
+        )
+
+        update_continuity_from_child_utterance(state, "Let's explore the rainbow path.")
+        result = validate_live_scene_request(
+            state,
+            "A swirling rainbow path glowing under a big moon, curving deeper through the spooky forest toward the castle.",
+        )
+        decision = should_render_new_scene_page(
+            state,
+            result.resolved_description,
+            target_location_label=result.location_label,
+        )
+
+        self.assertEqual(state["continuity_world_state"]["pending_location_label"], "rainbow path")
+        self.assertTrue(decision.should_render)
+        self.assertEqual(decision.reason, "pending_location_change")
+        self.assertNotIn("Treat this as the same place from a new angle", result.prompt_suffix)
+
+    def test_opposite_direction_request_forces_new_page_even_if_castle_is_still_mentioned(self) -> None:
+        state: dict[str, object] = {"child_age_band": "4-5"}
+        ensure_story_continuity_state(state)
+        record_continuity_scene(
+            state,
+            description=(
+                "A swirling rainbow path glows under a big moon, leading toward a playful purple castle "
+                "with friendly ghosts in the trees."
+            ),
+            storybeat_text="The rainbow path leads toward the castle.",
+            scene_number=1,
+        )
+
+        update_continuity_from_child_utterance(
+            state,
+            "Let's go the opposite direction of the castle. Where does the path go if we go the opposite direction of the castle?",
+        )
+        result = validate_live_scene_request(
+            state,
+            "A swirling rainbow path glowing under a big moon, curving away from the purple castle toward shadowy trees and magical flowers.",
+        )
+        decision = should_render_new_scene_page(
+            state,
+            result.resolved_description,
+            target_location_label=result.location_label,
+        )
+
+        self.assertEqual(state["continuity_world_state"]["pending_location_label"], "path")
+        self.assertTrue(decision.should_render)
+        self.assertEqual(decision.reason, "pending_location_change")
+        self.assertIn("moving onward to the next stretch of the journey", result.prompt_suffix)
+
+    def test_hidden_door_request_keeps_next_scene_adjacent_to_current_world(self) -> None:
+        state: dict[str, object] = {}
+        ensure_story_continuity_state(state)
+        record_continuity_scene(
+            state,
+            description="Inside the purple castle, a cozy hall glows with lanterns beside a secret little door.",
+            storybeat_text="A secret little door waits in the castle hall.",
+            visual_summary="Inside the purple castle hall, warm lanterns glow beside a secret little door in the stone wall.",
+            scene_number=1,
+        )
+
+        update_continuity_from_child_utterance(state, "Can we go through the secret door?")
+        result = validate_live_scene_request(
+            state,
+            "A moonlit forest clearing with tall trees and soft grass.",
+        )
+
+        self.assertIn("purple castle", result.resolved_description.lower())
+        self.assertIn("directly connected space in the same world", result.prompt_suffix)
+        self.assertIn("Do not jump to an unrelated forest", result.prompt_suffix)
+
+    def test_open_treasure_chest_keeps_reveal_inside_current_cave(self) -> None:
+        state: dict[str, object] = {
+            "current_scene_visual_summary": (
+                "Inside a crystal cave behind the waterfall, a treasure chest glows beside blue crystals "
+                "and a friendly green blob."
+            )
+        }
+        ensure_story_continuity_state(state)
+        record_continuity_scene(
+            state,
+            description=(
+                "Inside a crystal cave behind the waterfall, a treasure chest glows beside blue crystals "
+                "and a friendly green blob."
+            ),
+            storybeat_text="Behind the waterfall, the blob finds a glowing treasure chest in the cave.",
+            visual_summary=str(state["current_scene_visual_summary"]),
+            scene_number=1,
+        )
+
+        update_continuity_from_child_utterance(state, "Can we open the treasure chest?")
+        world = state["continuity_world_state"]
+        self.assertEqual(world["pending_transition"], "same_room")
+        self.assertEqual(world["pending_location_label"], "crystal cave")
+
+        result = validate_live_scene_request(
+            state,
+            "A sunny forest clearing with the treasure chest open beside moss and red mushrooms.",
+        )
+        decision = should_render_new_scene_page(
+            state,
+            result.resolved_description,
+            target_location_label=result.location_label,
+        )
+
+        self.assertIn("crystal cave", result.resolved_description.lower())
+        self.assertIn("requested_location_mismatch", result.issues)
+        self.assertIn("same-place reveal", result.prompt_suffix.lower())
+        self.assertIn("keep the reveal inside the existing cave", result.prompt_suffix.lower())
+        self.assertTrue(decision.should_render)
+        self.assertEqual(decision.reason, "structural_transition")
+
+    def test_open_it_after_chest_scene_inherits_current_cave_location(self) -> None:
+        state: dict[str, object] = {
+            "current_scene_visual_summary": (
+                "Inside a crystal cave behind the waterfall, a treasure chest rests beside blue crystals."
+            )
+        }
+        ensure_story_continuity_state(state)
+        record_continuity_scene(
+            state,
+            description=(
+                "Inside a crystal cave behind the waterfall, a treasure chest rests beside blue crystals "
+                "and the happy blob."
+            ),
+            storybeat_text="The treasure chest waits inside the cave behind the waterfall.",
+            visual_summary=str(state["current_scene_visual_summary"]),
+            scene_number=1,
+        )
+
+        update_continuity_from_child_utterance(state, "Open it!")
+        world = state["continuity_world_state"]
+
+        self.assertEqual(world["pending_transition"], "same_room")
+        self.assertEqual(world["pending_location_label"], "crystal cave")
+        self.assertTrue(world["pending_prop_keys"])
+
 
 if __name__ == "__main__":
     unittest.main()

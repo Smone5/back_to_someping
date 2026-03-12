@@ -1,116 +1,115 @@
-# Back to Somping, Back to Dody Land
+# StorySpark
 
-Interactive voice-first storytelling for young children, built with Google ADK, Gemini native audio, FastAPI, Next.js, and Google Cloud.
+StorySpark is a voice-first storytelling app for young children. A child talks to Amelia in the browser, the backend runs a Google ADK + Gemini live agent, scene illustrations are generated during the session, and the session ends as a storybook-style video with narration, music, and optional smart-home effects.
 
-Recommended Gemini Live Agent Challenge category: `Creative Storyteller`
+This repo contains the app code, Docker build definitions, and Google Cloud Terraform needed to reproduce the project.
 
-## What This Project Actually Does
+## What It Does
 
-- A parent or guardian unlocks the app through a simple parent gate before microphone access.
-- The child talks to Amelia through a live browser session.
-- The frontend streams microphone audio over `/ws/story` and plays back live audio responses.
-- The backend runs a Google ADK storyteller agent backed by a Gemini native-audio model.
-- Scene storybeats are generated during the story with Gemini mixed `TEXT + IMAGE` output and pushed back to the browser as live events.
-- The app can accept an optional uploaded toy/photo reference to help guide visuals.
-- Ending the session triggers storybook assembly and theater mode, using deterministic cinematic camera moves from the trusted story images.
-- The system also generates a personalized trading card for the child.
-
-## Preschool Positioning
-
-- The strongest use case is preschool and early-elementary storytelling, especially ages 4–5.
-- Amelia helps children turn spoken imagination into illustrated picture stories before they can comfortably read, write, or draw everything they want to express.
-- The product loop is: `Imagine -> Create -> Build -> Continue -> Finish`.
-
-### Why This Matters
-
-- Many young children have vivid ideas before they have the writing, drawing, or fine-motor skills to express those ideas independently.
-- A voice-first picture-story flow removes that production barrier and keeps the child focused on imagination, sequencing, and spoken language.
-
-### Educational Benefits
-
-- Early literacy: beginning-middle-end structure, listening, vocabulary growth
-- Cognitive development: sequencing, cause and effect, simple problem solving
-- Communication: describing ideas, answering prompts, building confidence
-- Creativity: imagination, visual storytelling, idea generation
-
-## Important Accuracy Notes
-
-- The current deployment config enables barge-in by default. The browser keeps the mic live, ducks narration on user speech, and the backend discards interrupted assistant turns instead of treating them as clean completions.
-- The codebase contains Veo hooks, but the checked-in deployment defaults keep live/final Veo generation off. The default submission path is still-image storytelling plus assembled storybook video.
-- The final storybook movie does not depend on a second generative video model. The assembler creates production-style camera motion from the approved scene stills to preserve character continuity.
-- Live conversation audio comes from Gemini native audio. Storybook narration prefers ElevenLabs when configured and falls back to Google Cloud Text-to-Speech.
-- Each scene beat asks Gemini for mixed `TEXT + IMAGE` output, producing a short storybook caption and matching illustration from one model response.
-- ADK live session state is held in memory. Firestore is used for storybook/session persistence and final-output metadata during assembly.
+- Streams microphone audio from the browser to a live backend over `/ws/story`
+- Runs a Gemini native-audio storyteller agent with Google ADK
+- Generates live story scene images during the conversation
+- Persists story state and artifacts in Firestore and Cloud Storage
+- Assembles a final storybook video locally or through a Cloud Run Job
+- Supports optional ElevenLabs narration and Home Assistant room-light cues
 
 ## Stack
 
 | Layer | Implementation |
 | --- | --- |
-| Live agent | Google ADK + Gemini native-audio model |
 | Frontend | Next.js 15 + React 19 |
 | Backend | FastAPI + Uvicorn |
-| Scene storybeats | Google GenAI mixed `TEXT + IMAGE` generation path from `agent/tools.py` |
-| Storybook assembly | Fast assembly path or FFmpeg Cloud Run Job |
+| Live agent | Google ADK + Gemini native-audio |
+| Scene generation | Gemini mixed `TEXT + IMAGE` flow |
+| Final assembly | In-process assembly or FFmpeg Cloud Run Job |
 | Storage | Cloud Storage |
 | Persistence | Firestore |
 | Secrets | Secret Manager |
-| Optional integrations | ElevenLabs, Home Assistant MCP |
+| Infra | Terraform + Cloud Run + HTTPS Load Balancer |
 
 ## Architecture
 
 ```mermaid
 flowchart LR
-    B["Browser<br/>Next.js + audio worklets"] -->|PCM + JSON over WebSocket| API["Cloud Run backend<br/>FastAPI + ADK Runner"]
+    B["Browser<br/>Next.js + audio worklets"] -->|PCM + JSON over WebSocket| API["FastAPI backend<br/>Cloud Run or local"]
     API --> GEM["Gemini native-audio storyteller"]
     API --> TOOLS["ADK tools"]
-    TOOLS --> IMG["Google image generation path"]
+    TOOLS --> IMG["Gemini image generation"]
     TOOLS --> GCS["Cloud Storage"]
     TOOLS --> FS["Firestore"]
-    TOOLS --> JOB["Cloud Run Job<br/>FFmpeg assembler"]
+    TOOLS --> JOB["FFmpeg Cloud Run Job"]
     JOB --> GCS
-    API -->|video_ready / theater_mode| B
+    API -->|storybook events| B
 ```
 
 ## Repository Layout
 
-- `agent/`: Storyteller agent definition, prompts, and tools
-- `backend/`: FastAPI server, WebSocket router, and FFmpeg worker
-- `frontend/`: Next.js UI and browser-side audio/WebSocket logic
-- `google_terraform/`: Google Cloud infrastructure as code
-- `shared/`: Shared meta-learning helpers
-- `deploy*.sh`: Build and deploy scripts
+- `agent/` - storyteller agent definition, prompts, and tools
+- `backend/` - FastAPI app, WebSocket router, and FFmpeg worker
+- `frontend/` - Next.js app and browser audio/WebSocket logic
+- `google_terraform/` - Google Cloud infrastructure as code
+- `shared/` - shared storybook and meta-learning helpers
+- `deploy*.sh` - image build and deploy helpers
 
-## Local Development
+## Reproducing The Project
 
-### Prerequisites
+There are three practical ways to run this repo:
+
+1. Local app runtime: run FastAPI and Next.js directly on your machine
+2. Local Docker runtime: run the same backend/frontend images used for Cloud Run
+3. Full Google Cloud deployment: provision infra with Terraform and deploy with Docker + Cloud Run
+
+> Local development is still cloud-backed. The backend uses Google Cloud Storage and Firestore directly, so you need Google application credentials locally even if the frontend and backend are running on your laptop.
+
+## Prerequisites
 
 - Node.js 20+
 - npm
 - Python 3.11+
 - `ffmpeg`
+- Docker
+- `gcloud`
+- Terraform 1.5+
+- A Google Cloud project with billing enabled
+- A real domain or subdomain if you want to apply the current load-balancer Terraform unchanged
 
-### 1. Configure environment
+## 1. Configure Environment
+
+Copy the example env file:
 
 ```bash
 cp .env.example .env
 ```
 
-At minimum for backend startup, fill in these required settings:
+At minimum, set these values in `.env`:
 
 - `GOOGLE_API_KEY`
 - `GOOGLE_CLOUD_PROJECT`
 - `ELEVENLABS_API_KEY`
+- `GCS_ASSETS_BUCKET`
+- `GCS_FINAL_VIDEOS_BUCKET`
 
-Notes:
+Recommended local defaults:
 
-- The current backend settings require `ELEVENLABS_API_KEY` at startup even though the core live voice path comes from Gemini native audio.
-- `GOOGLE_CLOUD_LOCATION` defaults to `us-central1`.
-- `GOOGLE_GENAI_USE_VERTEXAI` should stay `true` for the deployed backend if you want ADK live session resumption and Vertex-backed Gemini Live behavior.
-- `STORYTELLER_LIVE_MODEL` defaults to `gemini-live-2.5-flash-native-audio` for Vertex-backed live storytelling.
-- `GCS_ASSETS_BUCKET` and `GCS_FINAL_VIDEOS_BUCKET` have defaults in code, but you should set real bucket names for any cloud-backed flow.
-- `FRONTEND_ORIGIN` should stay `http://localhost:3000` for local development unless you change the frontend port.
+- Keep `FRONTEND_ORIGIN=http://localhost:3000`
+- Keep `GOOGLE_CLOUD_LOCATION=us-central1` unless you are changing regions everywhere
+- Keep `LOCAL_STORYBOOK_MODE=1` for local-only runs so the backend assembles storybooks in-process instead of expecting the Cloud Run Job
 
-### 2. Start the backend
+You also need Google application credentials for local and Docker runs. Use one of these:
+
+```bash
+gcloud auth application-default login
+```
+
+or
+
+```bash
+export GOOGLE_APPLICATION_CREDENTIALS=/absolute/path/to/service-account.json
+```
+
+## 2. Run Locally Without Docker
+
+Start the backend in one terminal:
 
 ```bash
 python3 -m venv .venv
@@ -131,104 +130,206 @@ Expected response:
 {"status":"ok","active_sessions":0}
 ```
 
-### 3. Start the frontend
+Start the frontend in a second terminal:
 
 ```bash
-cd frontend
-npm install
-npm run dev
+npm --prefix frontend install
+npm --prefix frontend run dev
 ```
+
+Then open `http://localhost:3000`.
 
 Notes:
 
-- In local development, `frontend/next.config.js` proxies `/api/*` and `/ws/*` to `http://localhost:8000` by default.
-- If you want to bypass the math gate locally, run the frontend with `NEXT_PUBLIC_REQUIRE_MATH=false`.
+- In local development, [`frontend/next.config.js`](frontend/next.config.js) proxies `/api/*` and `/ws/*` to `http://localhost:8000`
+- To disable the parent math gate locally, run the frontend with `NEXT_PUBLIC_REQUIRE_MATH=false`
 
-### 4. Open the app
+## 3. Run Locally With Docker
 
-Visit `http://localhost:3000`.
+This repo ships Dockerfiles, not a committed `docker-compose.yml`. The supported Docker path is to run the backend and frontend containers separately.
 
-## Testing Room Lights Without Hardware
-
-See [docs/testing_room_lights.md](docs/testing_room_lights.md) for the full test guide.
-
-Quick start:
+Create a Docker network once:
 
 ```bash
-python3 scripts/mock_home_assistant.py --token test-token --allow-origin http://localhost:3000
+docker network create storyspark
 ```
 
-Then set:
+If you authenticated with `gcloud auth application-default login`, your ADC file is usually:
 
-- Home Assistant URL: `http://127.0.0.1:8123`
-- Long-Lived Access Token: `test-token`
-- Light Entity ID: `light.story_room`
+```bash
+export GCP_CREDS_JSON="$HOME/.config/gcloud/application_default_credentials.json"
+```
 
-## Google Cloud Deployment
+Build and run the backend:
 
-### Prerequisites
+```bash
+docker build --platform linux/amd64 -t storyspark-backend -f backend/Dockerfile .
+docker run --rm \
+  --name storyspark-backend \
+  --network storyspark \
+  --env-file .env \
+  -e GOOGLE_APPLICATION_CREDENTIALS=/var/secrets/google/application_default_credentials.json \
+  -v "$GCP_CREDS_JSON:/var/secrets/google/application_default_credentials.json:ro" \
+  -p 8000:8080 \
+  storyspark-backend
+```
 
-- `gcloud` authenticated to your project
-- Docker
-- Terraform 1.5+
+Build and run the frontend:
 
-### 1. Seed Secret Manager
+```bash
+docker build \
+  --platform linux/amd64 \
+  --build-arg NEXT_PUBLIC_REQUIRE_MATH=false \
+  -t storyspark-frontend \
+  -f frontend/Dockerfile \
+  frontend/
 
-Terraform creates the secret resources, but you must add secret values yourself:
+docker run --rm \
+  --name storyspark-frontend \
+  --network storyspark \
+  -e BACKEND_URL=http://storyspark-backend:8080 \
+  -e NEXT_PUBLIC_WS_URL=/ws/story \
+  -e NEXT_PUBLIC_UPLOAD_URL=/api/upload \
+  -p 3000:8080 \
+  storyspark-frontend
+```
+
+Then open `http://localhost:3000`.
+
+Notes:
+
+- The backend container still needs Google Cloud credentials because it talks to GCS and Firestore
+- For local Docker reproduction, keep `LOCAL_STORYBOOK_MODE=1` in `.env`; otherwise the backend expects the FFmpeg Cloud Run Job to exist
+
+## 4. Deploy To Google Cloud With Terraform
+
+The checked-in Terraform provisions:
+
+- `storyteller-backend` Cloud Run service
+- `storyteller-frontend` Cloud Run service
+- `storyteller-ffmpeg-assembler` Cloud Run Job
+- Cloud Storage buckets for session assets and final videos
+- Firestore database `storyteller-lore`
+- Secret Manager secrets for API keys
+- Service accounts and IAM bindings
+- A global HTTPS load balancer and managed certificate
+
+Important constraint:
+
+- The current Terraform requires `domain_name` and creates a managed SSL certificate and HTTPS load balancer
+- If you do not have a real domain/subdomain yet, use direct Cloud Run URLs or change the Terraform before applying it
+
+### First-Time Cloud Bootstrap
+
+Set your project and region in the shell:
+
+```bash
+export GOOGLE_CLOUD_PROJECT=your-project-id
+export GOOGLE_CLOUD_LOCATION=us-central1
+```
+
+Authenticate and enable Container Registry for the initial image push:
+
+```bash
+gcloud auth login
+gcloud auth application-default login
+gcloud config set project "$GOOGLE_CLOUD_PROJECT"
+gcloud auth configure-docker
+gcloud services enable containerregistry.googleapis.com
+```
+
+Create your Terraform vars file from the committed example:
+
+```bash
+cp google_terraform/terraform.tfvars.example google_terraform/terraform.tfvars
+```
+
+Edit `google_terraform/terraform.tfvars` and replace:
+
+- `project_id`
+- `domain_name`
+- the bootstrap image URIs if your tags or project name differ
+
+Build and push the first set of images. These tags should match the bootstrap values in `terraform.tfvars`:
+
+```bash
+docker build --platform linux/amd64 -t "gcr.io/$GOOGLE_CLOUD_PROJECT/storyteller-backend:bootstrap" -f backend/Dockerfile .
+docker push "gcr.io/$GOOGLE_CLOUD_PROJECT/storyteller-backend:bootstrap"
+
+docker build --platform linux/amd64 --build-arg NEXT_PUBLIC_REQUIRE_MATH=false -t "gcr.io/$GOOGLE_CLOUD_PROJECT/storyteller-frontend:bootstrap" -f frontend/Dockerfile frontend/
+docker push "gcr.io/$GOOGLE_CLOUD_PROJECT/storyteller-frontend:bootstrap"
+
+docker build --platform linux/amd64 -t "gcr.io/$GOOGLE_CLOUD_PROJECT/storyteller-ffmpeg:bootstrap" -f backend/ffmpeg_worker/Dockerfile .
+docker push "gcr.io/$GOOGLE_CLOUD_PROJECT/storyteller-ffmpeg:bootstrap"
+```
+
+Apply Terraform:
+
+```bash
+cd google_terraform
+terraform init
+terraform apply -auto-approve
+```
+
+Seed the secret values after Terraform creates the Secret Manager resources:
 
 ```bash
 echo -n "YOUR_GOOGLE_API_KEY" | gcloud secrets versions add storyteller-google-api-key --data-file=-
 echo -n "YOUR_ELEVENLABS_API_KEY" | gcloud secrets versions add storyteller-elevenlabs-api-key --data-file=-
 ```
 
-### 2. Configure Terraform
-
-Edit `google_terraform/terraform.tfvars` with your project settings, domain, and image URIs if needed.
-
-### 3. Apply infrastructure
+Deploy fresh revisions once so Cloud Run picks up the real images and the now-seeded secrets:
 
 ```bash
-cd google_terraform
-terraform init
-terraform apply -auto-approve
 cd ..
-```
-
-### 4. Deploy the app
-
-```bash
 ./deploy.sh all
 ```
 
-You can also deploy individual components:
+Point your DNS `A` record at the load balancer IP:
 
 ```bash
+cd google_terraform
+terraform output load_balancer_ip
+```
+
+### Subsequent Deploys
+
+After the initial bootstrap, use the deploy helpers from the repo root:
+
+```bash
+./deploy.sh all
 ./deploy.sh backend
 ./deploy.sh frontend
 ./deploy.sh ffmpeg
 ./deploy.sh terraform
 ```
 
-## Google Cloud Services Used
+`deploy.sh` builds new timestamped images, pushes them to `gcr.io`, updates the image tags inside `google_terraform/terraform.tfvars`, and runs `terraform apply` when requested.
 
-- Cloud Run for the backend and frontend
-- Cloud Run Jobs for storybook movie assembly
-- Cloud Storage for session assets and final videos
-- Firestore for storybook/session persistence
-- Secret Manager for API keys
-- Google Cloud Text-to-Speech as a narration fallback
-- Global HTTPS Load Balancer in Terraform
+## Verification
 
-## Contest-Oriented Positioning
+Local:
 
-This project is now a defensible `Creative Storyteller` submission. The live ADK session remains voice-first, and each scene beat also uses Gemini mixed `TEXT + IMAGE` output to create an illustrated page caption plus matching artwork inside the same storytelling flow. It can still fit `Live Agents`, but the checked-in build now satisfies the Storyteller-specific mixed-output requirement.
+```bash
+curl http://localhost:8000/health
+```
 
-## Submission Assets
+Cloud:
 
-- Root submission overview: `../README.md`
-- Devpost copy: `../docs/submission/DEVPOST_SUBMISSION.md`
-- Architecture diagram: `../docs/submission/ARCHITECTURE.md`
-- Google Cloud proof: `../docs/submission/GOOGLE_CLOUD_PROOF.md`
-- Criteria mapping: `../docs/submission/JUDGING_CRITERIA.md`
-- Demo script: `../docs/submission/DEMO_VIDEO_SCRIPT.md`
-- Checklist: `../docs/submission/SUBMISSION_CHECKLIST.md`
+```bash
+gcloud run services describe storyteller-backend --region="$GOOGLE_CLOUD_LOCATION" --project="$GOOGLE_CLOUD_PROJECT" --format='value(status.url)'
+gcloud run services describe storyteller-frontend --region="$GOOGLE_CLOUD_LOCATION" --project="$GOOGLE_CLOUD_PROJECT" --format='value(status.url)'
+```
+
+Backend health:
+
+```bash
+BACKEND_URL="$(gcloud run services describe storyteller-backend --region="$GOOGLE_CLOUD_LOCATION" --project="$GOOGLE_CLOUD_PROJECT" --format='value(status.url)')"
+curl "$BACKEND_URL/health"
+```
+
+## Extra Docs
+
+- [Deployment guide](docs/deployment_guide.md)
+- [Room light testing guide](docs/testing_room_lights.md)
+- [Docs index](docs/README.md)

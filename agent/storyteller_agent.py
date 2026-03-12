@@ -1,4 +1,4 @@
-"""Root ADK Agent definition for the Interactive Storyteller.
+"""Root ADK agent definition for StorySpark.
 
 Architecture decisions:
 - Uses App wrapper (per Iteration 2 #3: ADK App Containerization) for

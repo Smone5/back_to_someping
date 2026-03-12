@@ -25,6 +25,8 @@ resource "google_cloud_run_v2_service" "backend" {
       max_instance_count = var.max_backend_instances # Hard billing ceiling (Iter 4 #10)
     }
 
+    timeout = "3600s" # WebSockets on Cloud Run are still request-bound; avoid 5-minute disconnects.
+
     service_account = google_service_account.backend_sa.email
 
     containers {
@@ -100,11 +102,11 @@ resource "google_cloud_run_v2_service" "backend" {
       }
       env {
         name  = "PROD_FRONTEND_ORIGIN"
-        value = "https://storyteller-frontend-119014819686.us-central1.run.app"
+        value = "https://${var.domain_name}"
       }
       env {
         name  = "BACKEND_PUBLIC_URL"
-        value = "https://storyteller-backend-119014819686.us-central1.run.app"
+        value = "https://${var.domain_name}"
       }
       env {
         name  = "MAX_LIVE_SESSIONS"
@@ -159,6 +161,18 @@ resource "google_cloud_run_v2_service" "backend" {
         value = tostring(var.client_direct_live_new_session_minutes)
       }
       env {
+        name  = "PAGE_READ_ALOUD_MODEL"
+        value = var.page_read_aloud_model
+      }
+      env {
+        name  = "PAGE_READ_ALOUD_VOICE"
+        value = var.page_read_aloud_voice
+      }
+      env {
+        name  = "PAGE_READ_ALOUD_LANGUAGE_CODE"
+        value = var.page_read_aloud_language_code
+      }
+      env {
         name  = "ENABLE_STORYBOOK_MUSIC"
         value = "1"
       }
@@ -180,7 +194,7 @@ resource "google_cloud_run_v2_service" "backend" {
       }
       env {
         name  = "STORYBOOK_SFX_VOLUME"
-        value = "0.22"
+        value = "0.18"
       }
       env {
         name  = "STORYBOOK_SFX_MAX"
@@ -196,7 +210,23 @@ resource "google_cloud_run_v2_service" "backend" {
       }
       env {
         name  = "STORYBOOK_NARRATION_VOLUME"
-        value = "1.8"
+        value = "2.0"
+      }
+      env {
+        name  = "ENABLE_STORYBOOK_END_CARD"
+        value = "1"
+      }
+      env {
+        name  = "STORYBOOK_END_CARD_SECONDS"
+        value = "2.8"
+      }
+      env {
+        name  = "STORYBOOK_END_CARD_TITLE"
+        value = "The End"
+      }
+      env {
+        name  = "STORYBOOK_END_CARD_NARRATION"
+        value = "The end."
       }
       env {
         name  = "ENABLE_STORYBOOK_DUCKING"
@@ -406,6 +436,10 @@ resource "google_cloud_run_v2_job" "ffmpeg_worker" {
           value = "4"
         }
         env {
+          name  = "ENABLE_FAST_STORYBOOK_ASSEMBLY"
+          value = tostring(var.enable_fast_storybook_assembly)
+        }
+        env {
           name  = "ENABLE_STORYBOOK_TTS"
           value = "1"
         }
@@ -447,7 +481,7 @@ resource "google_cloud_run_v2_job" "ffmpeg_worker" {
         }
         env {
           name  = "ENABLE_STORYBOOK_CAPTIONS"
-          value = "0"
+          value = "1"
         }
         env {
           name  = "ENABLE_STORYBOOK_COVER"
@@ -507,7 +541,7 @@ resource "google_cloud_run_v2_job" "ffmpeg_worker" {
         }
         env {
           name  = "STORYBOOK_MUSIC_VOLUME"
-          value = "0.10"
+          value = "0.08"
         }
         env {
           name  = "STORYBOOK_MUSIC_CUE_SECONDS"
@@ -527,7 +561,7 @@ resource "google_cloud_run_v2_job" "ffmpeg_worker" {
         }
         env {
           name  = "STORYBOOK_SFX_VOLUME"
-          value = "0.22"
+          value = "0.12"
         }
         env {
           name  = "STORYBOOK_SFX_CUE_SECONDS"
@@ -547,7 +581,23 @@ resource "google_cloud_run_v2_job" "ffmpeg_worker" {
         }
         env {
           name  = "STORYBOOK_NARRATION_VOLUME"
-          value = "1.8"
+          value = "2.2"
+        }
+        env {
+          name  = "ENABLE_STORYBOOK_END_CARD"
+          value = "1"
+        }
+        env {
+          name  = "STORYBOOK_END_CARD_SECONDS"
+          value = "2.8"
+        }
+        env {
+          name  = "STORYBOOK_END_CARD_TITLE"
+          value = "The End"
+        }
+        env {
+          name  = "STORYBOOK_END_CARD_NARRATION"
+          value = "And that is the happy end of our story."
         }
         env {
           name  = "ENABLE_STORYBOOK_DUCKING"

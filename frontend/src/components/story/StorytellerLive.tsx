@@ -21,8 +21,9 @@
 import dynamic from 'next/dynamic';
 import { useCallback, useEffect, useRef, useState } from 'react';
 
-import { useAudioWorklet } from '@/hooks/useAudioWorklet';
+import { useAudioWorklet, type BufferedClipProgress } from '@/hooks/useAudioWorklet';
 import { useBackgroundMusic } from '@/hooks/useBackgroundMusic';
+import { useStoryVoicePreview } from '@/hooks/useStoryVoicePreview';
 import { useUiSounds } from '@/hooks/useUiSounds';
 import { useWebSocket } from '@/hooks/useWebSocket';
 import { useSfxDucker } from '@/hooks/useSfxDucker';
@@ -31,9 +32,17 @@ import {
     applyHomeAssistantLighting,
     getLightingCommandKey,
     HomeAssistantLightCommand,
+    normalizeTheaterLightingCues,
+    TheaterLightingCue,
 } from './homeAssistant';
-import ParentGate, { type StoryTone } from './ParentGate';
+import ParentGate, { type StoryTone, type StorybookMoviePacing } from './ParentGate';
 import type { IoTConfig } from './IoTSettingsModal';
+import {
+    DEFAULT_STORY_READER_VOICE_ID,
+    STORY_READER_VOICE_OPTIONS,
+    getStoryReaderVoiceOption,
+    normalizeStoryReaderVoiceId,
+} from './storyVoiceOptions';
 
 function MagicMirrorFallback({ mode }: MagicMirrorProps) {
     return <div className={`magic-mirror-fallback mirror-${mode}`} aria-hidden="true" />;
@@ -56,6 +65,7 @@ const TheaterMode = dynamic(
 );
 
 type AppPhase = 'gate' | 'mic-check' | 'story' | 'theater';
+type MicPermissionState = 'unknown' | 'prompt' | 'granted' | 'denied';
 type StoryFlowPhase =
     | 'opening'
     | 'chatting'
@@ -108,7 +118,8 @@ type SceneBranchPickerOptions = {
     selectedSceneNumber?: number | null;
     warning?: string | null;
 };
-const MIC_OK_KEY = 'storyteller_mic_ok';
+const MIC_OK_KEY = 'storyteller_mic_setup_v2';
+const MIC_DEVICE_KEY = 'storyteller_mic_device_id_v1';
 const STORYBOOK_ASSEMBLY_STORAGE_PREFIX = 'storyteller_assembly_ui:';
 const STORYBOOK_ASSEMBLY_STORAGE_TTL_MS = 15 * 60 * 1000;
 const QUICK_ACK_AUDIO_URL = '/audio/got-it-lets-go.mp3';
@@ -304,6 +315,173 @@ function resolveUploadUrl(): string {
     return normalized;
 }
 
+function resolvePageReadAloudUrl(): string {
+    const configured = process.env.NEXT_PUBLIC_PAGE_READ_ALOUD_URL ?? '';
+    if (typeof window === 'undefined') {
+        return configured || '/api/page-read-aloud';
+    }
+    const protocol = window.location.protocol;
+    const host = window.location.host;
+    const normalized = configured.trim();
+    if (!normalized) {
+        return `${protocol}//${host}/api/page-read-aloud`;
+    }
+    if (normalized.includes('localhost:8000') || normalized.includes('storyteller.example.com')) {
+        return `${protocol}//${host}/api/page-read-aloud`;
+    }
+    if (normalized.startsWith('/')) {
+        return `${protocol}//${host}${normalized}`;
+    }
+    return normalized;
+}
+
+type StoryCaptionToken = {
+    text: string;
+    isWord: boolean;
+    wordIndex: number;
+};
+type PageReadAloudPayload = {
+    audioBytes: ArrayBuffer;
+    wordStartsMs: number[];
+};
+
+const STORY_CAPTION_DECORATIVE_RE = /[✨🌟💫🎵🎶🪄🔊⏹️▶️]/g;
+const STORY_CAPTION_CHOICE_RE = /(?:\s+)?(?:what should we do(?: next)?|should we|do you want to|or maybe)\b.*$/i;
+const STORY_CAPTION_META_PREFIX_RE = /^(?:(?:sure|okay|ok|great|wonderful)[!,. ]+\s*)?here(?:'s| is)\s+(?:(?:a|an|the)\s+)?(?:(?:[\w']+(?:-[\w']+)?\s+){0,6})?(?:illustration|image|picture|page|caption)\s*(?::|-)\s*/i;
+
+function normalizeStoryCaptionText(raw: string | null | undefined): string {
+    const normalized = `${raw ?? ''}`
+        .normalize('NFKC')
+        .replace(/\u2018|\u2019/g, "'")
+        .replace(/\u201c|\u201d/g, '"')
+        .replace(/\u2013|\u2014/g, '-')
+        .replace(/\u2026/g, '...')
+        .replace(/<ctrl\d+>/gi, ' ')
+        .replace(/^(caption|storybeat|scene)\s*:\s*/i, '')
+        .replace(STORY_CAPTION_DECORATIVE_RE, ' ')
+        .replace(STORY_CAPTION_CHOICE_RE, '')
+        .replace(STORY_CAPTION_META_PREFIX_RE, '')
+        .replace(/\s+/g, ' ')
+        .trim()
+        .replace(/^["']+|["']+$/g, '');
+    if (!normalized) {
+        return '';
+    }
+    const firstSentence = normalized.match(/.*?[.!?](?=\s|$)/)?.[0]?.trim() ?? normalized;
+    const cleanedSentence = firstSentence.replace(/\s+/g, ' ').trim().replace(/[,:;\- ]+$/, '');
+    if (!cleanedSentence) {
+        return '';
+    }
+    return /[.!?]$/.test(cleanedSentence) ? cleanedSentence : `${cleanedSentence}.`;
+}
+
+function tokenizeStoryCaption(text: string): StoryCaptionToken[] {
+    const parts = text.match(/\S+|\s+/g) ?? [text];
+    let wordIndex = 0;
+    return parts.map((part) => {
+        const isWord = /\S/.test(part);
+        const token: StoryCaptionToken = {
+            text: part,
+            isWord,
+            wordIndex: isWord ? wordIndex : -1,
+        };
+        if (isWord) {
+            wordIndex += 1;
+        }
+        return token;
+    });
+}
+
+function estimateStoryCaptionWordWeight(rawWord: string): number {
+    const bareWord = rawWord.replace(/^[^A-Za-z0-9']+|[^A-Za-z0-9'!?.,;:]+$/g, '');
+    const lowered = bareWord.toLowerCase();
+    const vowelGroups = lowered.match(/[aeiouy]+/g) ?? [];
+    let syllables = vowelGroups.length || 1;
+    if (syllables > 1 && /(?:e|es|ed)$/.test(lowered) && !/(?:le|ue|ee)$/.test(lowered)) {
+        syllables -= 1;
+    }
+
+    let weight = 0.92 + syllables * 0.23 + Math.min(Math.max(bareWord.length, 1), 12) * 0.014;
+    if (/[,:;]/.test(rawWord)) {
+        weight += 0.18;
+    }
+    if (/[-–—]/.test(rawWord)) {
+        weight += 0.12;
+    }
+    if (/[.!?]/.test(rawWord)) {
+        weight += 0.3;
+    }
+    return weight;
+}
+
+function buildStoryCaptionWordBoundaries(tokens: StoryCaptionToken[]): number[] {
+    const wordTokens = tokens.filter((token) => token.isWord);
+    if (!wordTokens.length) {
+        return [];
+    }
+    let cumulative = 0;
+    const boundaries: number[] = [];
+    for (const token of wordTokens) {
+        const weight = estimateStoryCaptionWordWeight(token.text.trim());
+        cumulative += weight;
+        boundaries.push(cumulative);
+    }
+    return boundaries.map((value) => value / cumulative);
+}
+
+function highlightWordIndexForProgress(progress: number, boundaries: number[]): number {
+    if (!boundaries.length) {
+        return -1;
+    }
+    const adjustedProgress = Math.max(0, Math.min(1, progress));
+    for (let index = 0; index < boundaries.length; index += 1) {
+        if (adjustedProgress < boundaries[index]) {
+            return index;
+        }
+    }
+    return boundaries.length - 1;
+}
+
+function parsePageReadAloudWordStartsMs(headerValue: string | null): number[] {
+    if (!headerValue) {
+        return [];
+    }
+    return headerValue
+        .split(',')
+        .map((part) => Number(part.trim()))
+        .filter((value): value is number => Number.isFinite(value) && value >= 0)
+        .map((value) => Math.round(value));
+}
+
+function normalizePageReadAloudWordStartsMs(wordStartsMs: number[], totalWordCount: number): number[] {
+    if (!Array.isArray(wordStartsMs) || wordStartsMs.length !== totalWordCount || totalWordCount <= 0) {
+        return [];
+    }
+    const normalized: number[] = [];
+    let lastValue = 0;
+    for (const value of wordStartsMs) {
+        const safeValue = Math.max(lastValue, Math.round(value));
+        normalized.push(safeValue);
+        lastValue = safeValue;
+    }
+    return normalized;
+}
+
+function highlightWordIndexForElapsedMs(elapsedSpeechMs: number, wordStartsMs: number[]): number {
+    if (!wordStartsMs.length) {
+        return -1;
+    }
+    let activeIndex = 0;
+    for (let index = 0; index < wordStartsMs.length; index += 1) {
+        if (elapsedSpeechMs >= wordStartsMs[index]) {
+            activeIndex = index;
+        } else {
+            break;
+        }
+    }
+    return activeIndex;
+}
+
 function mergeStreamingTranscript(previous: string | null, incomingRaw: string): string {
     const incoming = incomingRaw.trim();
     if (!incoming) return previous?.trim() ?? '';
@@ -475,6 +653,64 @@ function buildTheaterLightingCommand(
     }
 }
 
+function storybookMoviePacingHelperCopy(mode: StorybookMoviePacing): string {
+    switch (mode) {
+        case 'read_to_me':
+            return 'Voice-first with shorter page text for pre-readers.';
+        case 'fast_movie':
+            return 'Brisker page turns for replays and quick sharing.';
+        case 'read_with_me':
+        default:
+            return 'Balanced read-along pacing with extra time for page text.';
+    }
+}
+
+function storyReaderVoiceHelperCopy(voiceId: string): string {
+    return getStoryReaderVoiceOption(voiceId).blurb;
+}
+
+function normalizeMicPermissionState(
+    state: PermissionState | MicPermissionState | null | undefined,
+): MicPermissionState {
+    if (state === 'granted' || state === 'denied' || state === 'prompt') {
+        return state;
+    }
+    return 'unknown';
+}
+
+function describeMicSetupError(error: unknown): { permissionState: MicPermissionState; message: string } {
+    if (error instanceof DOMException) {
+        if (error.name === 'NotAllowedError' || error.name === 'SecurityError') {
+            return {
+                permissionState: 'denied',
+                message: 'Microphone access was blocked. Tap the browser mic prompt and choose Allow, or reopen site permissions and enable the microphone.',
+            };
+        }
+        if (error.name === 'NotFoundError' || error.name === 'DevicesNotFoundError') {
+            return {
+                permissionState: 'prompt',
+                message: 'No microphone was found. Plug one in or switch to a different input and try again.',
+            };
+        }
+        if (error.name === 'NotReadableError' || error.name === 'TrackStartError') {
+            return {
+                permissionState: 'prompt',
+                message: 'That microphone is busy in another app. Close the other app or pick a different mic, then try again.',
+            };
+        }
+        if (error.name === 'OverconstrainedError') {
+            return {
+                permissionState: 'prompt',
+                message: 'That microphone is unavailable right now. Pick another one and try again.',
+            };
+        }
+    }
+    return {
+        permissionState: 'prompt',
+        message: 'We could not start the microphone test. Try again and allow access when your browser asks.',
+    };
+}
+
 export default function StorytellerLive() {
     const [phase, setPhase] = useState<AppPhase>('gate');
     const [storyPhase, setStoryPhase] = useState<StoryFlowPhase>('opening');
@@ -483,7 +719,11 @@ export default function StorytellerLive() {
     const calmModeRef = useRef(false);
     const storyToneRef = useRef<StoryTone>('cozy');
     const childAgeRef = useRef<number>(4);
+    const storybookMoviePacingRef = useRef<StorybookMoviePacing>('read_with_me');
+    const storyReaderVoiceIdRef = useRef<string>(DEFAULT_STORY_READER_VOICE_ID);
     const [childAge, setChildAge] = useState(4);
+    const [storybookMoviePacing, setStorybookMoviePacing] = useState<StorybookMoviePacing>('read_with_me');
+    const [storyReaderVoiceId, setStoryReaderVoiceId] = useState(DEFAULT_STORY_READER_VOICE_ID);
     const { playUiSound } = useUiSounds({ enabled: !calmMode, volume: 0.95 });
     const [voiceRms, setVoiceRms] = useState(0);
     const [currentSceneImageUrl, setCurrentSceneImageUrl] = useState<string | null>(null);
@@ -512,6 +752,9 @@ export default function StorytellerLive() {
     const [isNarrow, setIsNarrow] = useState(false);
     const [isCompact, setIsCompact] = useState(false);
     const [isLandscapePhone, setIsLandscapePhone] = useState(false);
+    const [isPageReadAloudActive, setIsPageReadAloudActive] = useState(false);
+    const [pageReadAloudError, setPageReadAloudError] = useState<string | null>(null);
+    const [pageReadAloudHighlightWordIndex, setPageReadAloudHighlightWordIndex] = useState(-1);
     const [userSpeaking, setUserSpeaking] = useState(false);
     const connectionStateRef = useRef<'connecting' | 'connected' | 'reconnecting' | 'disconnected'>('connecting');
     const [spyglassStream, setSpyglassStream] = useState<MediaStream | null>(null);
@@ -543,6 +786,19 @@ export default function StorytellerLive() {
     const pendingSceneImageRef = useRef<string | null>(null);
     const currentSceneImageUrlRef = useRef<string | null>(null);
     const activeSceneRequestIdRef = useRef<string | null>(null);
+    const pageReadAloudContentKeyRef = useRef('');
+    const pageReadAloudRunIdRef = useRef(0);
+    const isPageReadAloudActiveRef = useRef(false);
+    const stopPageReadAloudRef = useRef<(options?: { resumeMic?: boolean }) => void>(() => { });
+    const pageReadAloudStartLockUntilRef = useRef(0);
+    const pageReadAloudInterruptIgnoreUntilRef = useRef(0);
+    const pageReadAloudShouldResumeMicRef = useRef(false);
+    const pageReadAloudAbortControllerRef = useRef<AbortController | null>(null);
+    const pageReadAloudPrefetchAbortControllerRef = useRef<AbortController | null>(null);
+    const pageReadAloudPrefetchPromiseRef = useRef<Promise<PageReadAloudPayload> | null>(null);
+    const pageReadAloudPrefetchContentKeyRef = useRef('');
+    const pageReadAloudCachedPayloadRef = useRef<PageReadAloudPayload | null>(null);
+    const pageReadAloudCachedContentKeyRef = useRef('');
     const placeholderTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
     const previousSceneLoadingRef = useRef(false);
     const [sceneLoading, setSceneLoading] = useState(false);
@@ -553,15 +809,24 @@ export default function StorytellerLive() {
     const [assemblyRecentActivities, setAssemblyRecentActivities] = useState<string[]>([]);
     const [storybookNarration, setStorybookNarration] = useState<string[] | null>(null);
     const [storybookAudioAvailable, setStorybookAudioAvailable] = useState<boolean | null>(null);
+    const [storybookLightingCues, setStorybookLightingCues] = useState<TheaterLightingCue[]>([]);
     const [storybookWaitElapsedSeconds, setStorybookWaitElapsedSeconds] = useState(0);
     const [serverVadEnabled, setServerVadEnabled] = useState(false);
     const [micCheckError, setMicCheckError] = useState<string | null>(null);
-    const micCheckTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-    const micCheckCompletedRef = useRef(false);
+    const [micPermissionState, setMicPermissionState] = useState<MicPermissionState>('unknown');
+    const [availableMicDevices, setAvailableMicDevices] = useState<MediaDeviceInfo[]>([]);
+    const [selectedMicDeviceId, setSelectedMicDeviceId] = useState('');
+    const [micSetupBusy, setMicSetupBusy] = useState(false);
+    const [micSetupHeardVoice, setMicSetupHeardVoice] = useState(false);
+    const permissionStatusRef = useRef<PermissionStatus | null>(null);
+    const selectedMicDeviceIdRef = useRef('');
     const iotConfigRef = useRef<IoTConfig | null>(null);
     const phaseRef = useRef<AppPhase>('gate');
-    const completeMicCheckRef = useRef<(reason: 'heard' | 'timeout' | 'skip') => void>(() => { });
+    const completeMicCheckRef = useRef<(reason: 'heard' | 'timeout' | 'skip') => void | Promise<void>>(() => { });
     const sendClientReadyRef = useRef<() => void>(() => { });
+    const stopStoryReaderVoicePreviewRef = useRef<() => void>(() => { });
+    const isStoryReaderVoicePreviewActiveRef = useRef(false);
+    const storyReaderVoicePreviewShouldResumeMicRef = useRef(false);
     const hasEverConnectedRef = useRef(false);
     const lastUserTranscriptRef = useRef<string>('');
     const lastAgentTranscriptRef = useRef<string>('');
@@ -582,6 +847,10 @@ export default function StorytellerLive() {
     }, [storybookStatus]);
 
     useEffect(() => {
+        selectedMicDeviceIdRef.current = selectedMicDeviceId;
+    }, [selectedMicDeviceId]);
+
+    useEffect(() => {
         const wasLoading = previousSceneLoadingRef.current;
         if (sceneLoading && !wasLoading) {
             playUiSound('magic');
@@ -590,22 +859,6 @@ export default function StorytellerLive() {
         }
         previousSceneLoadingRef.current = sceneLoading;
     }, [currentSceneImageUrl, playUiSound, sceneError, sceneLoading]);
-
-    useEffect(() => {
-        if (!showParentControls) {
-            return;
-        }
-        if (showRestartConfirm || showEndStoryConfirm || showSceneBranchPicker || toyShareOverlayOpen || phase !== 'story') {
-            setShowParentControls(false);
-        }
-    }, [
-        phase,
-        showEndStoryConfirm,
-        showParentControls,
-        showRestartConfirm,
-        showSceneBranchPicker,
-        toyShareOverlayOpen,
-    ]);
 
     const scheduleToyShareReset = useCallback((delayMs = 3500) => {
         if (toyShareResetTimeoutRef.current) {
@@ -702,6 +955,110 @@ export default function StorytellerLive() {
             // ignore
         }
     }, []);
+
+    const clearMicOk = useCallback(() => {
+        try {
+            if (typeof window !== 'undefined') {
+                localStorage.removeItem(MIC_OK_KEY);
+            }
+        } catch {
+            // ignore
+        }
+    }, []);
+
+    const getStoredMicDeviceId = useCallback(() => {
+        try {
+            if (typeof window === 'undefined') {
+                return '';
+            }
+            return localStorage.getItem(MIC_DEVICE_KEY) ?? '';
+        } catch {
+            return '';
+        }
+    }, []);
+
+    const persistMicDeviceId = useCallback((deviceId: string) => {
+        if (!deviceId) {
+            return;
+        }
+        try {
+            if (typeof window !== 'undefined') {
+                localStorage.setItem(MIC_DEVICE_KEY, deviceId);
+            }
+        } catch {
+            // ignore
+        }
+    }, []);
+
+    const refreshMicPermissionState = useCallback(async () => {
+        if (typeof navigator === 'undefined' || !navigator.permissions?.query) {
+            setMicPermissionState((current) => (current === 'granted' || current === 'denied' ? current : 'prompt'));
+            return;
+        }
+        try {
+            if (permissionStatusRef.current) {
+                permissionStatusRef.current.onchange = null;
+            }
+            const status = await navigator.permissions.query({ name: 'microphone' as PermissionName });
+            permissionStatusRef.current = status;
+            const applyState = () => {
+                setMicPermissionState(normalizeMicPermissionState(status.state));
+            };
+            applyState();
+            status.onchange = applyState;
+        } catch {
+            setMicPermissionState((current) => (current === 'granted' || current === 'denied' ? current : 'prompt'));
+        }
+    }, []);
+
+    const refreshMicDevices = useCallback(async (preferredDeviceId?: string | null) => {
+        if (typeof navigator === 'undefined' || !navigator.mediaDevices?.enumerateDevices) {
+            setAvailableMicDevices([]);
+            return;
+        }
+        try {
+            const devices = await navigator.mediaDevices.enumerateDevices();
+            const microphones = devices.filter((device) => device.kind === 'audioinput');
+            setAvailableMicDevices(microphones);
+            const nextDeviceId = [
+                preferredDeviceId ?? null,
+                selectedMicDeviceIdRef.current || null,
+                getStoredMicDeviceId() || null,
+                microphones[0]?.deviceId ?? null,
+            ].find((candidate) => candidate && microphones.some((device) => device.deviceId === candidate)) ?? '';
+            setSelectedMicDeviceId(nextDeviceId);
+            if (nextDeviceId) {
+                persistMicDeviceId(nextDeviceId);
+            }
+        } catch {
+            setAvailableMicDevices([]);
+        }
+    }, [getStoredMicDeviceId, persistMicDeviceId]);
+
+    useEffect(() => {
+        const storedDeviceId = getStoredMicDeviceId();
+        if (storedDeviceId) {
+            setSelectedMicDeviceId(storedDeviceId);
+        }
+    }, [getStoredMicDeviceId]);
+
+    useEffect(() => {
+        if (phase !== 'mic-check') {
+            if (permissionStatusRef.current) {
+                permissionStatusRef.current.onchange = null;
+                permissionStatusRef.current = null;
+            }
+            return;
+        }
+        void refreshMicPermissionState();
+        void refreshMicDevices(selectedMicDeviceIdRef.current || getStoredMicDeviceId() || null);
+        return () => {
+            if (permissionStatusRef.current) {
+                permissionStatusRef.current.onchange = null;
+                permissionStatusRef.current = null;
+            }
+        };
+    }, [getStoredMicDeviceId, phase, refreshMicDevices, refreshMicPermissionState]);
 
     useEffect(() => {
         currentSceneImageUrlRef.current = currentSceneImageUrl;
@@ -831,11 +1188,12 @@ export default function StorytellerLive() {
     const sessionIdRef = useRef<string>('');
     const wsUrlRef = useRef<string>(resolveFrontendWebSocketUrl());
     const uploadUrlRef = useRef<string>(resolveUploadUrl());
+    const pageReadAloudUrlRef = useRef<string>(resolvePageReadAloudUrl());
 
     // ── Audio (defined FIRST — provides playPcmChunk) ────────────────────────────
     const sendRef = useRef<(data: string | ArrayBuffer) => void>(() => { });
     const streamAudioRef = useRef(false);
-    const startListeningRef = useRef<() => Promise<void>>(async () => { });
+    const startListeningRef = useRef<(options?: { deviceId?: string | null }) => Promise<void>>(async () => { });
     const {
         audioState,
         narrationGainNode,
@@ -843,6 +1201,8 @@ export default function StorytellerLive() {
         startListening,
         stopListening,
         playPcmChunk,
+        playBufferedClip,
+        stopBufferedClip,
         flushPlaybackBuffer,
         setNarrationMuted,
     } =
@@ -859,11 +1219,22 @@ export default function StorytellerLive() {
                 }
             }, []),
             onVoiceActivityStart: useCallback(() => {
+                if (
+                    isPageReadAloudActiveRef.current
+                    && performance.now() < pageReadAloudInterruptIgnoreUntilRef.current
+                ) {
+                    return;
+                }
+                if (isPageReadAloudActiveRef.current) {
+                    stopPageReadAloudRef.current({ resumeMic: false });
+                }
+                if (isStoryReaderVoicePreviewActiveRef.current) {
+                    stopStoryReaderVoicePreviewRef.current();
+                }
                 setAgentThinking(false);
                 setUserSpeaking(true);
                 if (phaseRef.current === 'mic-check') {
-                    streamAudioRef.current = true;
-                    completeMicCheckRef.current('heard');
+                    setMicSetupHeardVoice(true);
                     return;
                 }
                 if (phaseRef.current !== 'story') {
@@ -903,6 +1274,401 @@ export default function StorytellerLive() {
     startListeningRef.current = startListening;
     playPcmChunkRef.current = playPcmChunk;
     flushPlaybackBufferRef.current = flushPlaybackBuffer;
+    const {
+        previewError: storyReaderVoicePreviewError,
+        previewLoading: storyReaderVoicePreviewLoading,
+        previewPlaying: storyReaderVoicePreviewPlaying,
+        previewVoiceId: storyReaderVoicePreviewVoiceId,
+        previewVoice: previewStoryReaderVoice,
+        stopPreview: stopStoryReaderVoicePreview,
+    } = useStoryVoicePreview({
+        childAge,
+        storybookMoviePacing,
+        sessionId: sessionIdRef.current || null,
+        onPreviewStart: () => {
+            if (isPageReadAloudActiveRef.current) {
+                stopPageReadAloudRef.current({ resumeMic: false });
+            }
+            const shouldResumeMic = phaseRef.current === 'story' && !isMicMutedRef.current;
+            storyReaderVoicePreviewShouldResumeMicRef.current = shouldResumeMic;
+            if (shouldResumeMic) {
+                stopListening();
+            }
+        },
+        onPreviewEnd: () => {
+            const shouldResumeMic = storyReaderVoicePreviewShouldResumeMicRef.current;
+            storyReaderVoicePreviewShouldResumeMicRef.current = false;
+            if (shouldResumeMic && phaseRef.current === 'story' && !isMicMutedRef.current) {
+                void startListeningRef.current();
+            }
+        },
+    });
+    isStoryReaderVoicePreviewActiveRef.current = storyReaderVoicePreviewLoading || storyReaderVoicePreviewPlaying;
+    stopStoryReaderVoicePreviewRef.current = () => {
+        storyReaderVoicePreviewShouldResumeMicRef.current = false;
+        stopStoryReaderVoicePreview();
+    };
+
+    useEffect(() => {
+        if (!showParentControls) {
+            stopStoryReaderVoicePreview();
+            return;
+        }
+        if (showRestartConfirm || showEndStoryConfirm || showSceneBranchPicker || toyShareOverlayOpen || phase !== 'story') {
+            setShowParentControls(false);
+        }
+    }, [
+        phase,
+        showEndStoryConfirm,
+        showParentControls,
+        showRestartConfirm,
+        showSceneBranchPicker,
+        stopStoryReaderVoicePreview,
+        toyShareOverlayOpen,
+    ]);
+
+    useEffect(() => {
+        if (storyReaderVoicePreviewVoiceId && storyReaderVoicePreviewVoiceId !== storyReaderVoiceId) {
+            stopStoryReaderVoicePreview();
+        }
+    }, [stopStoryReaderVoicePreview, storyReaderVoiceId, storyReaderVoicePreviewVoiceId]);
+
+    useEffect(() => {
+        if (phase !== 'story') {
+            stopStoryReaderVoicePreview();
+        }
+    }, [phase, stopStoryReaderVoicePreview]);
+
+    const clearPageReadAloudCache = useCallback(() => {
+        pageReadAloudPrefetchAbortControllerRef.current?.abort();
+        pageReadAloudPrefetchAbortControllerRef.current = null;
+        pageReadAloudPrefetchPromiseRef.current = null;
+        pageReadAloudPrefetchContentKeyRef.current = '';
+        pageReadAloudCachedPayloadRef.current = null;
+        pageReadAloudCachedContentKeyRef.current = '';
+    }, []);
+
+    const buildPageReadAloudContentKey = useCallback((
+        imageUrl: string | null | undefined,
+        text: string,
+        voiceId: string,
+    ): string => `${imageUrl ?? ''}::${normalizeStoryReaderVoiceId(voiceId)}::${text}`, []);
+
+    const fetchPageReadAloudAudio = useCallback(async (
+        text: string,
+        contentKey: string,
+        signal?: AbortSignal,
+    ): Promise<PageReadAloudPayload> => {
+        const cachedPayload = pageReadAloudCachedContentKeyRef.current === contentKey
+            ? pageReadAloudCachedPayloadRef.current
+            : null;
+        if (cachedPayload?.audioBytes.byteLength) {
+            return cachedPayload;
+        }
+
+        if (
+            pageReadAloudPrefetchContentKeyRef.current === contentKey
+            && pageReadAloudPrefetchPromiseRef.current
+        ) {
+            return pageReadAloudPrefetchPromiseRef.current;
+        }
+
+        const response = await fetch(pageReadAloudUrlRef.current, {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+            },
+            signal,
+            body: JSON.stringify({
+                session_id: sessionIdRef.current,
+                text,
+                child_age: childAgeRef.current,
+                storybook_movie_pacing: storybookMoviePacingRef.current,
+                storybook_elevenlabs_voice_id: storyReaderVoiceIdRef.current,
+            }),
+        });
+        if (!response.ok) {
+            let message = 'Read page is unavailable right now.';
+            try {
+                const payload = await response.json() as { message?: unknown };
+                if (typeof payload?.message === 'string' && payload.message.trim()) {
+                    message = payload.message.trim();
+                }
+            } catch {
+                // Keep the generic error copy.
+            }
+            throw new Error(message);
+        }
+        const audioBytes = await response.arrayBuffer();
+        if (!audioBytes.byteLength) {
+            throw new Error('page_read_aloud_empty_audio');
+        }
+        const wordStartsMs = parsePageReadAloudWordStartsMs(
+            response.headers.get('X-StorySpark-Word-Starts-Ms'),
+        );
+        const payload: PageReadAloudPayload = { audioBytes, wordStartsMs };
+        clearPageReadAloudCache();
+        pageReadAloudCachedPayloadRef.current = payload;
+        pageReadAloudCachedContentKeyRef.current = contentKey;
+        return payload;
+    }, [clearPageReadAloudCache]);
+
+    const finishPageReadAloud = useCallback((runId: number, shouldResumeMic: boolean) => {
+        if (pageReadAloudRunIdRef.current !== runId) {
+            return;
+        }
+        pageReadAloudAbortControllerRef.current = null;
+        pageReadAloudInterruptIgnoreUntilRef.current = 0;
+        isPageReadAloudActiveRef.current = false;
+        setIsPageReadAloudActive(false);
+        setPageReadAloudHighlightWordIndex(-1);
+        pageReadAloudShouldResumeMicRef.current = false;
+        pageReadAloudContentKeyRef.current = '';
+        if (shouldResumeMic && phaseRef.current === 'story' && !isMicMutedRef.current) {
+            void startListening();
+        }
+    }, [startListening]);
+
+    const stopPageReadAloud = useCallback((options?: { resumeMic?: boolean }) => {
+        const resumeMic = options?.resumeMic ?? true;
+        pageReadAloudRunIdRef.current += 1;
+        const shouldResumeMic = resumeMic && pageReadAloudShouldResumeMicRef.current;
+        pageReadAloudShouldResumeMicRef.current = false;
+        pageReadAloudContentKeyRef.current = '';
+        pageReadAloudInterruptIgnoreUntilRef.current = 0;
+        pageReadAloudAbortControllerRef.current?.abort();
+        pageReadAloudAbortControllerRef.current = null;
+        isPageReadAloudActiveRef.current = false;
+        stopBufferedClip();
+        setIsPageReadAloudActive(false);
+        setPageReadAloudHighlightWordIndex(-1);
+        if (shouldResumeMic && phaseRef.current === 'story' && !isMicMutedRef.current) {
+            void startListening();
+        }
+    }, [startListening, stopBufferedClip]);
+    stopPageReadAloudRef.current = stopPageReadAloud;
+
+    const readCurrentPageAloud = useCallback(async () => {
+        const text = normalizeStoryCaptionText(currentSceneStorybeatText);
+        if (!text) {
+            return;
+        }
+        const now = performance.now();
+        if (isPageReadAloudActiveRef.current) {
+            playUiSound('close');
+            stopPageReadAloud({ resumeMic: true });
+            return;
+        }
+        if (now < pageReadAloudStartLockUntilRef.current) {
+            return;
+        }
+
+        const runId = pageReadAloudRunIdRef.current + 1;
+        pageReadAloudRunIdRef.current = runId;
+        pageReadAloudStartLockUntilRef.current = now + 500;
+        const contentKey = buildPageReadAloudContentKey(
+            currentSceneImageUrl,
+            text,
+            storyReaderVoiceIdRef.current,
+        );
+        const wordBoundaries = buildStoryCaptionWordBoundaries(tokenizeStoryCaption(text));
+        const totalWordCount = wordBoundaries.length;
+        const shouldResumeMic = phaseRef.current === 'story' && !isMicMutedRef.current;
+        pageReadAloudShouldResumeMicRef.current = shouldResumeMic;
+        pageReadAloudContentKeyRef.current = contentKey;
+        pageReadAloudInterruptIgnoreUntilRef.current = now + 1500;
+        isPageReadAloudActiveRef.current = true;
+        setIsPageReadAloudActive(true);
+        setPageReadAloudError(null);
+        setPageReadAloudHighlightWordIndex(totalWordCount > 0 ? 0 : -1);
+        const updateHighlight = (
+            timing: BufferedClipProgress,
+            exactWordStartsMs: number[],
+        ) => {
+            if (totalWordCount <= 0) {
+                return;
+            }
+            const nextIndex = exactWordStartsMs.length
+                ? highlightWordIndexForElapsedMs(timing.elapsedSpeechMs, exactWordStartsMs)
+                : highlightWordIndexForProgress(timing.progress, wordBoundaries);
+            setPageReadAloudHighlightWordIndex(nextIndex);
+        };
+        if (shouldResumeMic) {
+            stopListening();
+        }
+
+        try {
+            await primeAudio();
+            const cachedPayload = pageReadAloudCachedContentKeyRef.current === contentKey
+                ? pageReadAloudCachedPayloadRef.current
+                : null;
+
+            if (cachedPayload) {
+                const exactWordStartsMs = normalizePageReadAloudWordStartsMs(
+                    cachedPayload.wordStartsMs,
+                    totalWordCount,
+                );
+                const played = await playBufferedClip(cachedPayload.audioBytes, {
+                    onProgress: (timing) => updateHighlight(timing, exactWordStartsMs),
+                    onEnded: () => finishPageReadAloud(runId, shouldResumeMic),
+                });
+                if (!played) {
+                    finishPageReadAloud(runId, shouldResumeMic);
+                }
+                return;
+            }
+
+            const controller = new AbortController();
+            pageReadAloudAbortControllerRef.current = controller;
+            const payload = await fetchPageReadAloudAudio(text, contentKey, controller.signal);
+            if (pageReadAloudRunIdRef.current !== runId) {
+                return;
+            }
+
+            const exactWordStartsMs = normalizePageReadAloudWordStartsMs(
+                payload.wordStartsMs,
+                totalWordCount,
+            );
+            const played = await playBufferedClip(payload.audioBytes, {
+                onProgress: (timing) => updateHighlight(timing, exactWordStartsMs),
+                onEnded: () => finishPageReadAloud(runId, shouldResumeMic),
+            });
+            if (!played) {
+                finishPageReadAloud(runId, shouldResumeMic);
+            }
+        } catch (error) {
+            if ((error as Error)?.name === 'AbortError' || pageReadAloudRunIdRef.current !== runId) {
+                return;
+            }
+            console.warn('Page read-aloud failed:', error);
+            setPageReadAloudError(
+                error instanceof Error && error.message.trim()
+                    ? error.message.trim()
+                    : 'Read page is unavailable right now.',
+            );
+            finishPageReadAloud(runId, shouldResumeMic);
+        }
+    }, [
+        currentSceneImageUrl,
+        currentSceneStorybeatText,
+        buildPageReadAloudContentKey,
+        fetchPageReadAloudAudio,
+        finishPageReadAloud,
+        playBufferedClip,
+        playUiSound,
+        primeAudio,
+        stopListening,
+        stopPageReadAloud,
+    ]);
+
+    useEffect(() => {
+        const currentCaptionText = normalizeStoryCaptionText(currentSceneStorybeatText);
+        const currentContentKey = buildPageReadAloudContentKey(
+            currentSceneImageUrl,
+            currentCaptionText,
+            storyReaderVoiceId,
+        );
+        if (currentContentKey !== pageReadAloudCachedContentKeyRef.current) {
+            clearPageReadAloudCache();
+        }
+        if (currentContentKey !== pageReadAloudPrefetchContentKeyRef.current) {
+            pageReadAloudPrefetchAbortControllerRef.current?.abort();
+            pageReadAloudPrefetchAbortControllerRef.current = null;
+            pageReadAloudPrefetchPromiseRef.current = null;
+            pageReadAloudPrefetchContentKeyRef.current = '';
+        }
+        if (!isPageReadAloudActive) {
+            isPageReadAloudActiveRef.current = false;
+            setPageReadAloudHighlightWordIndex(-1);
+        }
+        if (!isPageReadAloudActive) {
+            return;
+        }
+        if (phase !== 'story' || currentContentKey !== pageReadAloudContentKeyRef.current) {
+            stopPageReadAloud({ resumeMic: true });
+        }
+    }, [
+        clearPageReadAloudCache,
+        buildPageReadAloudContentKey,
+        currentSceneStorybeatText,
+        currentSceneImageUrl,
+        isPageReadAloudActive,
+        phase,
+        storyReaderVoiceId,
+        stopPageReadAloud,
+    ]);
+
+    useEffect(() => {
+        setPageReadAloudError(null);
+        setPageReadAloudHighlightWordIndex(-1);
+    }, [currentSceneImageUrl, currentSceneStorybeatText]);
+
+    useEffect(() => {
+        const text = normalizeStoryCaptionText(currentSceneStorybeatText);
+        const contentKey = buildPageReadAloudContentKey(
+            currentSceneImageUrl,
+            text,
+            storyReaderVoiceId,
+        );
+        if (
+            phase !== 'story'
+            || !text
+            || !currentSceneImageUrl
+            || pageReadAloudCachedContentKeyRef.current === contentKey
+            || pageReadAloudPrefetchContentKeyRef.current === contentKey
+        ) {
+            return;
+        }
+
+        void primeAudio().catch(() => {
+            // Browser gesture rules may still block priming; prefetch can continue.
+        });
+
+        pageReadAloudPrefetchAbortControllerRef.current?.abort();
+        const controller = new AbortController();
+        pageReadAloudPrefetchAbortControllerRef.current = controller;
+        pageReadAloudPrefetchContentKeyRef.current = contentKey;
+        const prefetchPromise = fetchPageReadAloudAudio(text, contentKey, controller.signal);
+        pageReadAloudPrefetchPromiseRef.current = prefetchPromise;
+        void prefetchPromise.catch((error) => {
+            if ((error as Error)?.name !== 'AbortError') {
+                console.warn('Page read-aloud prefetch failed:', error);
+            }
+        }).finally(() => {
+            if (pageReadAloudPrefetchPromiseRef.current === prefetchPromise) {
+                pageReadAloudPrefetchPromiseRef.current = null;
+                pageReadAloudPrefetchAbortControllerRef.current = null;
+                pageReadAloudPrefetchContentKeyRef.current = '';
+            }
+        });
+
+        return () => {
+            if (pageReadAloudPrefetchAbortControllerRef.current === controller) {
+                controller.abort();
+                pageReadAloudPrefetchAbortControllerRef.current = null;
+                pageReadAloudPrefetchPromiseRef.current = null;
+                pageReadAloudPrefetchContentKeyRef.current = '';
+            }
+        };
+    }, [
+        buildPageReadAloudContentKey,
+        currentSceneImageUrl,
+        currentSceneStorybeatText,
+        fetchPageReadAloudAudio,
+        phase,
+        primeAudio,
+        storyReaderVoiceId,
+    ]);
+
+    useEffect(() => {
+        return () => {
+            pageReadAloudAbortControllerRef.current?.abort();
+            pageReadAloudPrefetchAbortControllerRef.current?.abort();
+            isPageReadAloudActiveRef.current = false;
+            stopBufferedClip();
+            clearPageReadAloudCache();
+        };
+    }, [clearPageReadAloudCache, stopBufferedClip]);
 
     // ── SFX Ducker (defined SECOND — provides enqueueSfx) ────────────────────────
     const { enqueueSfx } = useSfxDucker(narrationGainNode);
@@ -949,6 +1715,12 @@ export default function StorytellerLive() {
     const { connectionState, sendJson, send, sessionId } = useWebSocket({
         url: wsUrlRef.current,
         onBinaryMessage: useCallback((data: ArrayBuffer) => {
+            if (isPageReadAloudActiveRef.current) {
+                stopPageReadAloudRef.current({ resumeMic: false });
+            }
+            if (isStoryReaderVoicePreviewActiveRef.current) {
+                stopStoryReaderVoicePreviewRef.current();
+            }
             // PCM audio from Gemini native audio — forward to playback worklet
             playPcmChunkRef.current(data);
             setAgentThinking(false);
@@ -1085,6 +1857,7 @@ export default function StorytellerLive() {
                             ? (msg.payload?.audio_available as boolean)
                             : null;
                         setStorybookAudioAvailable(audioAvailable);
+                        setStorybookLightingCues(normalizeTheaterLightingCues(msg.payload?.lighting_cues));
                     }
                     setStoryPhase(normalizeStoryFlowPhase(msg.payload?.story_phase ?? 'theater'));
                     setPhase('theater');
@@ -1263,7 +2036,22 @@ export default function StorytellerLive() {
                             const text = (msg.payload.current_scene_storybeat_text as string).trim();
                             setCurrentSceneStorybeatText(text || null);
                         }
-                        if (msg.payload?.ending_story) {
+                        const rehydratedAssemblyStatus = typeof msg.payload?.assembly_status === 'string'
+                            ? (msg.payload.assembly_status as string).trim().toLowerCase()
+                            : '';
+                        const rehydratedAssemblyError = typeof msg.payload?.assembly_error === 'string'
+                            ? (msg.payload.assembly_error as string).trim()
+                            : '';
+                        const assemblyStillRunning =
+                            rehydratedAssemblyStatus === 'assembling'
+                            || rehydratedAssemblyStatus === 'reviewing_storyboard';
+                        if (rehydratedAssemblyStatus === 'failed') {
+                            clearPersistedStorybookAssemblyState(sessionIdRef.current);
+                            setSceneError(rehydratedAssemblyError || 'Movie assembly failed before the final video was created.');
+                            setStorybookStatus(null);
+                            setIsEndingStory(false);
+                            setStoryPhase('waiting_for_child');
+                        } else if (msg.payload?.ending_story || assemblyStillRunning) {
                             setIsEndingStory(true);
                             const rehydratedEtaSeconds = Number(msg.payload?.assembly_eta_seconds ?? 0);
                             const rehydratedStartedAtMs = Number(msg.payload?.assembly_started_at_epoch_ms ?? 0);
@@ -1281,6 +2069,13 @@ export default function StorytellerLive() {
                                         startedAtMs: validStartedAtMs ?? current.startedAtMs,
                                     };
                                 }
+                                if (persistedAssemblyState?.status) {
+                                    return {
+                                        ...persistedAssemblyState.status,
+                                        etaSeconds: persistedAssemblyState.status.etaSeconds ?? validEtaSeconds,
+                                        startedAtMs: validStartedAtMs ?? persistedAssemblyState.status.startedAtMs,
+                                    };
+                                }
                                 return {
                                     message: 'Making your storybook movie…',
                                     etaSeconds: validEtaSeconds,
@@ -1290,18 +2085,18 @@ export default function StorytellerLive() {
                                     startedAtMs: validStartedAtMs ?? Date.now(),
                                 };
                             });
-                        } else if (persistedAssemblyState) {
-                            setStorybookStatus(persistedAssemblyState.status);
-                            setStoryPhase(persistedAssemblyState.storyPhase);
-                            setIsEndingStory(true);
-                            if (persistedAssemblyState.storyTitle) {
-                                setStorybookTitle(persistedAssemblyState.storyTitle);
-                            }
-                            if (persistedAssemblyState.childName) {
-                                setStorybookChildName(persistedAssemblyState.childName);
-                            }
+                            setStoryPhase(
+                                normalizeStoryFlowPhase(
+                                    msg.payload?.story_phase
+                                    ?? (rehydratedAssemblyStatus === 'reviewing_storyboard' ? 'remake' : 'assembling_movie')
+                                )
+                            );
                         } else if (!shouldStayInTheater) {
-                            setIsEndingStory(Boolean(storybookStatusRef.current));
+                            if (persistedAssemblyState) {
+                                clearPersistedStorybookAssemblyState(sessionIdRef.current);
+                            }
+                            setIsEndingStory(false);
+                            setStorybookStatus(null);
                         }
 
                         if (shouldStayInTheater) {
@@ -1386,6 +2181,15 @@ export default function StorytellerLive() {
                     break;
                 case 'user_transcription':
                     {
+                        if (isPageReadAloudActiveRef.current) {
+                            if (performance.now() < pageReadAloudInterruptIgnoreUntilRef.current) {
+                                break;
+                            }
+                            stopPageReadAloudRef.current({ resumeMic: false });
+                        }
+                        if (isStoryReaderVoicePreviewActiveRef.current) {
+                            stopStoryReaderVoicePreviewRef.current();
+                        }
                         const text = msg.payload?.text as string;
                         const finished = !!msg.payload?.finished;
                         if (text) {
@@ -1412,6 +2216,15 @@ export default function StorytellerLive() {
                     break;
                 case 'agent_transcription':
                     {
+                        if (isPageReadAloudActiveRef.current) {
+                            if (performance.now() < pageReadAloudInterruptIgnoreUntilRef.current) {
+                                break;
+                            }
+                            stopPageReadAloudRef.current({ resumeMic: false });
+                        }
+                        if (isStoryReaderVoicePreviewActiveRef.current) {
+                            stopStoryReaderVoicePreviewRef.current();
+                        }
                         const text = msg.payload?.text as string;
                         const finished = !!msg.payload?.finished;
                         if (text) {
@@ -1526,6 +2339,8 @@ export default function StorytellerLive() {
                 panel,
                 story_tone: storyToneRef.current,
                 child_age: childAgeRef.current,
+                storybook_movie_pacing: storybookMoviePacingRef.current,
+                storybook_elevenlabs_voice_id: storyReaderVoiceIdRef.current,
                 network,
             },
         });
@@ -1581,6 +2396,18 @@ export default function StorytellerLive() {
             });
     }, []);
 
+    const applyTheaterLightingCue = useCallback((cue: TheaterLightingCue) => {
+        const config = iotConfigRef.current;
+        if (!config?.ha_url || !config?.ha_token) {
+            return;
+        }
+
+        void applyHomeAssistantLighting(config, cue)
+            .catch((error) => {
+                console.warn('Home Assistant theater cue failed:', error);
+            });
+    }, []);
+
     useEffect(() => {
         connectionStateRef.current = connectionState;
         if (connectionState === 'connected') {
@@ -1604,21 +2431,50 @@ export default function StorytellerLive() {
         }
     }, [connectionState, stopListening]);
 
-    const completeMicCheck = useCallback((reason: 'heard' | 'timeout' | 'skip') => {
-        if (micCheckCompletedRef.current) return;
-        micCheckCompletedRef.current = true;
-        if (micCheckTimeoutRef.current) {
-            clearTimeout(micCheckTimeoutRef.current);
-            micCheckTimeoutRef.current = null;
-        }
+    const requestMicSetupTest = useCallback(async (deviceIdOverride?: string | null): Promise<boolean> => {
+        const requestedDeviceId = deviceIdOverride ?? (selectedMicDeviceIdRef.current || getStoredMicDeviceId() || null);
+        setMicSetupBusy(true);
         setMicCheckError(null);
+        setMicSetupHeardVoice(false);
+        setVoiceRms(0);
+        try {
+            await startListening({ deviceId: requestedDeviceId });
+            setMicPermissionState('granted');
+            await refreshMicDevices(requestedDeviceId);
+            return true;
+        } catch (error) {
+            console.error('Microphone test failed:', error);
+            stopListening();
+            clearMicOk();
+            setVoiceRms(0);
+            const describedError = describeMicSetupError(error);
+            setMicPermissionState(describedError.permissionState);
+            setMicCheckError(describedError.message);
+            await refreshMicDevices(getStoredMicDeviceId() || null);
+            return false;
+        } finally {
+            setMicSetupBusy(false);
+        }
+    }, [clearMicOk, getStoredMicDeviceId, refreshMicDevices, startListening, stopListening]);
+
+    const completeMicCheck = useCallback(async (_reason: 'heard' | 'timeout' | 'skip') => {
+        setMicCheckError(null);
+        const ready = audioState === 'listening'
+            ? true
+            : await requestMicSetupTest(selectedMicDeviceIdRef.current || null);
+        if (!ready) {
+            return;
+        }
+        if (selectedMicDeviceIdRef.current) {
+            persistMicDeviceId(selectedMicDeviceIdRef.current);
+        }
         markMicOk();
         setPhase('story');
         setStoryPhase('opening');
         setHasHeardAgent(false);
         setAgentThinking(true);
         sendClientReady();
-    }, [markMicOk, sendClientReady]);
+    }, [audioState, markMicOk, persistMicDeviceId, requestMicSetupTest, sendClientReady]);
 
     useEffect(() => {
         if (!sessionId || storybookStatusRef.current || phaseRef.current === 'theater') {
@@ -1660,33 +2516,42 @@ export default function StorytellerLive() {
 
     useEffect(() => {
         completeMicCheckRef.current = completeMicCheck;
-        return () => {
-            if (micCheckTimeoutRef.current) {
-                clearTimeout(micCheckTimeoutRef.current);
-                micCheckTimeoutRef.current = null;
-            }
-        };
     }, [completeMicCheck]);
 
     // ── Parent Gate approval ─────────────────────────────────────────────────────
-    const handleGateApproved = useCallback(async (calm: boolean, iotConfig: IoTConfig | null, storyTone: StoryTone, childAge: number) => {
+    const handleGateApproved = useCallback(async (
+        calm: boolean,
+        iotConfig: IoTConfig | null,
+        storyTone: StoryTone,
+        childAge: number,
+        nextStorybookMoviePacing: StorybookMoviePacing,
+        nextStoryReaderVoiceId: string,
+    ) => {
         setCalmMode(calm);
         calmModeRef.current = calm;
         storyToneRef.current = storyTone;
         childAgeRef.current = childAge;
+        storybookMoviePacingRef.current = nextStorybookMoviePacing;
+        storyReaderVoiceIdRef.current = normalizeStoryReaderVoiceId(nextStoryReaderVoiceId);
+        clearPageReadAloudCache();
         setChildAge(childAge);
+        setStorybookMoviePacing(nextStorybookMoviePacing);
+        setStoryReaderVoiceId(storyReaderVoiceIdRef.current);
         setShowParentControls(false);
         setNarrationMuted(calm);
         setMusicEnabledRef.current(!calm);
         setHasHeardAgent(false);
         setMicCheckError(null);
+        setMicPermissionState('prompt');
+        setMicSetupHeardVoice(false);
+        setVoiceRms(0);
         setStoryPhase('opening');
-        micCheckCompletedRef.current = false;
         iotConfigRef.current = iotConfig;
         lastLightingCommandRef.current = '';
         lastStoryLightingCommandRef.current = null;
         lastTheaterLightingCommandRef.current = '';
         theaterLightingStageRef.current = null;
+        setStorybookLightingCues([]);
         const skipMicCheck = hasStoredMicOk();
         try {
             // Prime playback so Amelia can speak immediately, then start mic capture asynchronously.
@@ -1694,35 +2559,65 @@ export default function StorytellerLive() {
             setAgentThinking(false);
         } catch (e) {
             console.error('Microphone initialization failed:', e);
+            clearMicOk();
             setAgentThinking(false);
-            setMicCheckError('Microphone is blocked. Please allow mic access.');
-            return;
-        }
-        try {
-            await startListening();
-        } catch (e) {
-            console.error('Microphone initialization failed:', e);
-            setMicCheckError('Microphone is blocked. Please allow mic access.');
-            setPhase('mic-check');
+            setMicCheckError('Speaker setup could not start. Refresh and try again.');
             return;
         }
 
         if (skipMicCheck) {
-            markMicOk();
-            setPhase('story');
-            setAgentThinking(true);
-            sendClientReady();
-            return;
+            try {
+                const storedDeviceId = getStoredMicDeviceId() || null;
+                await startListening({ deviceId: storedDeviceId });
+                await refreshMicPermissionState();
+                await refreshMicDevices(storedDeviceId);
+                markMicOk();
+                setPhase('story');
+                setAgentThinking(true);
+                sendClientReady();
+                return;
+            } catch (e) {
+                console.error('Microphone warm start failed:', e);
+                stopListening();
+                clearMicOk();
+                const describedError = describeMicSetupError(e);
+                setMicPermissionState(describedError.permissionState);
+                setMicCheckError(describedError.message);
+            }
         }
 
         setPhase('mic-check');
-        if (micCheckTimeoutRef.current) {
-            clearTimeout(micCheckTimeoutRef.current);
+        await refreshMicPermissionState();
+        await refreshMicDevices(selectedMicDeviceIdRef.current || getStoredMicDeviceId() || null);
+    }, [clearMicOk, clearPageReadAloudCache, getStoredMicDeviceId, hasStoredMicOk, markMicOk, primeAudio, refreshMicDevices, refreshMicPermissionState, sendClientReady, setNarrationMuted, startListening, stopListening]);
+
+    const handleStorybookMoviePacingChange = useCallback((nextMode: StorybookMoviePacing) => {
+        storybookMoviePacingRef.current = nextMode;
+        setStorybookMoviePacing(nextMode);
+        try {
+            localStorage.setItem('storyteller_storybook_movie_pacing', nextMode);
+        } catch {
+            // Ignore storage failures.
         }
-        micCheckTimeoutRef.current = setTimeout(() => {
-            completeMicCheckRef.current('timeout');
-        }, 7000);
-    }, [hasStoredMicOk, markMicOk, primeAudio, sendClientReady, setNarrationMuted, startListening]);
+        if (phaseRef.current !== 'gate') {
+            sendClientReadyRef.current();
+        }
+    }, []);
+
+    const handleStoryReaderVoiceChange = useCallback((nextVoiceId: string) => {
+        const normalized = normalizeStoryReaderVoiceId(nextVoiceId);
+        storyReaderVoiceIdRef.current = normalized;
+        setStoryReaderVoiceId(normalized);
+        clearPageReadAloudCache();
+        try {
+            localStorage.setItem('storyteller_story_reader_voice_id', normalized);
+        } catch {
+            // Ignore storage failures.
+        }
+        if (phaseRef.current !== 'gate') {
+            sendClientReadyRef.current();
+        }
+    }, [clearPageReadAloudCache]);
 
     // Orb is display-only: turn boundaries are detected automatically from voice activity.
 
@@ -1755,7 +2650,13 @@ export default function StorytellerLive() {
         setAgentThinking(true);
         flushPlaybackBufferRef.current();
         if (notifyBackend) {
-            sendJson({ type: 'end_story', session_id: sessionId, payload: {} });
+            sendJson({
+                type: 'end_story',
+                session_id: sessionId,
+                payload: {
+                    storybook_elevenlabs_voice_id: storyReaderVoiceIdRef.current,
+                },
+            });
         }
     }, [isEndingStory, sendJson, sessionId, storybookChildName, storybookTitle]);
     beginEndingStoryRef.current = beginEndingStory;
@@ -1858,10 +2759,19 @@ export default function StorytellerLive() {
     }, []);
 
     const restartStoryNow = useCallback(() => {
+        if (phaseRef.current === 'theater' && sessionIdRef.current) {
+            applyTheaterLightingStage('close');
+            sendJson({
+                type: 'theater_close',
+                session_id: sessionIdRef.current,
+                payload: {},
+            });
+        }
         clearPersistedStorybookAssemblyState(sessionIdRef.current);
+        clearMicOk();
         sessionStorage.removeItem('storyteller_session_id');
         window.location.reload();
-    }, []);
+    }, [applyTheaterLightingStage, clearMicOk, sendJson]);
     restartStoryNowRef.current = restartStoryNow;
 
     const confirmRestart = useCallback(() => {
@@ -2052,6 +2962,7 @@ export default function StorytellerLive() {
         }
         applyTheaterLightingStage('close');
         setFinalMovieUrl(null);
+        setStorybookLightingCues([]);
         setPhase('story');
         setStoryPhase('remake');
         setIsEndingStory(true);
@@ -2071,6 +2982,7 @@ export default function StorytellerLive() {
                 rating: payload.rating,
                 reasons: payload.reasons,
                 note: payload.note,
+                storybook_elevenlabs_voice_id: storyReaderVoiceIdRef.current,
             },
         });
     }, [applyTheaterLightingStage, sendJson, sessionId, storybookChildName, storybookTitle]);
@@ -2101,6 +3013,7 @@ export default function StorytellerLive() {
         setFinalMovieUrl(null);
         setStorybookNarration(null);
         setStorybookAudioAvailable(null);
+        setStorybookLightingCues([]);
         void startListening();
     }, [applyTheaterLightingStage, sendJson, sessionId, startListening]);
 
@@ -2116,28 +3029,127 @@ export default function StorytellerLive() {
     }
 
     if (phase === 'mic-check') {
-        const micLevel = Math.min(1, Math.max(0, (voiceRms - 0.002) / 0.02));
+        const micLevel = audioState === 'listening'
+            ? Math.min(1, Math.max(0, (voiceRms - 0.002) / 0.02))
+            : 0;
+        const permissionLabel = micPermissionState === 'granted'
+            ? 'Mic allowed'
+            : micPermissionState === 'denied'
+                ? 'Mic blocked'
+                : 'Permission needed';
+        const permissionCopy = micPermissionState === 'granted'
+            ? 'Great. Say “Hi Amelia!” and watch the level bar move.'
+            : micPermissionState === 'denied'
+                ? 'Your browser blocked microphone access. Reopen the mic prompt or site settings, then try again.'
+                : 'Tap the button below. Your browser will still show the microphone prompt, and you should choose Allow.';
         return (
             <main className="storyteller-main mic-check-stage" aria-label="Microphone check">
-                <div className="mic-check-card" role="status" aria-live="polite">
-                    <div className="mic-check-icon" aria-hidden="true">🎤</div>
-                    <div className="mic-check-title">Let’s test the mic</div>
-                    <div className="mic-check-subtitle">Say “Hi Amelia!”</div>
-                    <div className="mic-check-meter" aria-hidden="true">
-                        <div className="mic-check-fill" style={{ width: `${micLevel * 100}%` }} />
-                    </div>
-                    {micCheckError && <div className="mic-check-error">{micCheckError}</div>}
-                    <button
-                        className="mic-check-skip"
-                        onClick={() => {
-                            playUiSound('close');
-                            completeMicCheckRef.current('skip');
-                        }}
-                        aria-label="Skip microphone test"
-                        disabled={!!micCheckError}
-                    >
-                        Skip
-                    </button>
+                <div className="mic-setup-card" role="status" aria-live="polite">
+                    <section className="mic-setup-copy-column">
+                        <div className="mic-check-icon" aria-hidden="true">🎙️</div>
+                        <div className="mic-setup-eyebrow">Before Amelia joins</div>
+                        <div className="mic-check-title">Check the microphone like a meeting lobby</div>
+                        <div className="mic-check-subtitle">
+                            We can&apos;t bypass the browser microphone prompt with AI or the model.
+                            The browser must ask first, but we can make that step clear and easy.
+                        </div>
+                        <ol className="mic-setup-steps">
+                            <li>Tap <strong>Allow &amp; test microphone</strong>.</li>
+                            <li>Choose <strong>Allow</strong> in the browser popup.</li>
+                            <li>Say <strong>&ldquo;Hi Amelia!&rdquo;</strong> and watch the bar bounce.</li>
+                            <li>Start the story when everything looks good.</li>
+                        </ol>
+                        <div className={`mic-setup-permission-pill is-${micPermissionState}`}>
+                            <span className="mic-setup-permission-label">{permissionLabel}</span>
+                            <span className="mic-setup-permission-copy">{permissionCopy}</span>
+                        </div>
+                    </section>
+
+                    <section className="mic-setup-controls-column">
+                        <label className="mic-setup-field">
+                            <span className="mic-setup-field-label">Microphone</span>
+                            <select
+                                value={selectedMicDeviceId}
+                                onChange={(event) => {
+                                    const nextDeviceId = event.target.value;
+                                    setSelectedMicDeviceId(nextDeviceId);
+                                    persistMicDeviceId(nextDeviceId);
+                                    setMicSetupHeardVoice(false);
+                                    if (audioState === 'listening') {
+                                        void requestMicSetupTest(nextDeviceId);
+                                    }
+                                }}
+                                disabled={micSetupBusy || availableMicDevices.length === 0}
+                                aria-label="Choose a microphone"
+                            >
+                                {availableMicDevices.length === 0 ? (
+                                    <option value="">
+                                        {micPermissionState === 'granted'
+                                            ? 'Using browser default microphone'
+                                            : 'Allow mic access to list devices'}
+                                    </option>
+                                ) : (
+                                    availableMicDevices.map((device, index) => (
+                                        <option key={device.deviceId || `mic-${index}`} value={device.deviceId}>
+                                            {device.label || `Microphone ${index + 1}`}
+                                        </option>
+                                    ))
+                                )}
+                            </select>
+                        </label>
+
+                        <div className="mic-setup-meter-card">
+                            <div className="mic-setup-meter-header">
+                                <span className="mic-setup-field-label">Mic level</span>
+                                <span className={`mic-setup-meter-status ${micSetupHeardVoice ? 'is-good' : ''}`}>
+                                    {micSetupHeardVoice
+                                        ? 'We heard you'
+                                        : audioState === 'listening'
+                                            ? 'Listening now'
+                                            : 'Waiting to test'}
+                                </span>
+                            </div>
+                            <div className="mic-check-meter" aria-hidden="true">
+                                <div className="mic-check-fill" style={{ width: `${micLevel * 100}%` }} />
+                            </div>
+                            <p className="mic-setup-meter-copy">
+                                {audioState === 'listening'
+                                    ? 'Say “Hi Amelia!” or count to three. The bar should bounce as you talk.'
+                                    : 'Once the browser prompt appears, allow microphone access to begin the test.'}
+                            </p>
+                        </div>
+
+                        {micCheckError && <div className="mic-check-error">{micCheckError}</div>}
+
+                        <div className="mic-setup-actions">
+                            <button
+                                className="mic-setup-primary"
+                                onClick={() => {
+                                    playUiSound('magic');
+                                    void requestMicSetupTest(selectedMicDeviceIdRef.current || null);
+                                }}
+                                disabled={micSetupBusy}
+                                aria-label={audioState === 'listening' ? 'Retest microphone' : 'Allow and test microphone'}
+                            >
+                                {micSetupBusy
+                                    ? 'Starting…'
+                                    : audioState === 'listening'
+                                        ? 'Retest microphone'
+                                        : 'Allow & test microphone'}
+                            </button>
+                            <button
+                                className="mic-setup-secondary"
+                                onClick={() => {
+                                    playUiSound('tap');
+                                    void completeMicCheckRef.current('skip');
+                                }}
+                                disabled={micSetupBusy || (micPermissionState !== 'granted' && audioState !== 'listening')}
+                                aria-label="Start the story"
+                            >
+                                Start the story
+                            </button>
+                        </div>
+                    </section>
                 </div>
             </main>
         );
@@ -2152,6 +3164,7 @@ export default function StorytellerLive() {
                 tradingCardUrl={tradingCardUrl ?? undefined}
                 narrationLines={storybookNarration ?? undefined}
                 audioAvailable={storybookAudioAvailable ?? undefined}
+                lightingCues={storybookLightingCues}
                 calmMode={calmMode}
                 uiSoundsEnabled={!calmMode}
                 onSubmitFeedback={handleMovieFeedbackSubmit}
@@ -2160,6 +3173,8 @@ export default function StorytellerLive() {
                 onPlaybackStart={() => applyTheaterLightingStage('play')}
                 onPlaybackPause={() => applyTheaterLightingStage('pause')}
                 onPlaybackEnded={() => applyTheaterLightingStage('end')}
+                onLightingCueChange={applyTheaterLightingCue}
+                onMakeAnotherStory={restartStoryNow}
                 onClose={handleTheaterClose}
             />
         );
@@ -2179,6 +3194,7 @@ export default function StorytellerLive() {
     const useCompactLayout = isCompact || isLandscapePhone;
     const showBackground = !useCompactLayout;
     const hasScene = Boolean(currentSceneImageUrl || currentSceneVideoUrl);
+    const currentSceneCaptionText = normalizeStoryCaptionText(currentSceneStorybeatText);
     const shouldRenderStorybookPanel = hasScene || sceneLoading || Boolean(sceneError);
     const isStorybookPanelWaitingForMedia = !currentSceneImageUrl && !currentSceneVideoUrl;
     const isStarting = phase === 'story' && (storyPhase === 'opening' || !hasHeardAgent);
@@ -2193,6 +3209,16 @@ export default function StorytellerLive() {
                 : 'idle';
     const sceneBranchReady = phase === 'story' && !isEndingStory && !isStorybookAssembling && !sceneLoading && sceneHistory.length > 1;
     const rewindButtonReady = phase === 'story' && !isEndingStory && !isStorybookAssembling && !sceneLoading && Boolean(sessionId) && (sceneBranchReady || hasScene);
+    const canReadCurrentPage = Boolean(
+        currentSceneCaptionText
+        && phase === 'story'
+        && !isStorybookAssembling
+        && !sceneError
+    );
+    const pageReadAloudBusy = isSpeaking || isThinking || userSpeaking || sceneLoading;
+    const captionTokens = currentSceneCaptionText
+        ? tokenizeStoryCaption(currentSceneCaptionText)
+        : [];
     const toySharingReady = phase === 'story' && Boolean(sessionId);
     const toyShareLabel = toyShareState === 'uploading'
         ? 'Adding Toy...'
@@ -2222,6 +3248,9 @@ export default function StorytellerLive() {
     const isYoungChildMode = childAge <= 5;
     const showInlineHudControls = !isYoungChildMode;
     const selectedScene = sceneHistory.find((scene) => scene.scene_number === selectedSceneNumber) ?? null;
+    const currentScenePageNumber = sceneHistory.length
+        ? sceneHistory[sceneHistory.length - 1]?.scene_number ?? null
+        : null;
     const etaSeconds = storybookStatus?.etaSeconds ?? 0;
     const etaLabel = etaSeconds ? `About ${Math.ceil(etaSeconds / 30) * 30} seconds` : null;
     const assemblingMilestones = storybookStatus?.kind === 'remake'
@@ -2333,92 +3362,155 @@ export default function StorytellerLive() {
                     className={`storybook-panel ${isStorybookPanelWaitingForMedia ? 'is-loading-panel' : ''}`}
                     aria-live="polite"
                 >
-                    {isStorybookPanelWaitingForMedia && (
-                        <div className="storybook-loading-backdrop" aria-hidden="true" />
-                    )}
-                    {currentSceneThumbnailB64 && (
-                        <img
-                            src={`data:image/jpeg;base64,${currentSceneThumbnailB64}`}
-                            alt=""
-                            className="storybook-media"
-                            style={{ filter: 'blur(30px)', position: 'absolute', top: 0, left: 0, zIndex: 0, width: '100%', height: '100%', objectFit: 'cover' }}
-                            aria-hidden="true"
-                        />
-                    )}
-                    {currentSceneImageUrl && (
-                        <img
-                            src={currentSceneImageUrl}
-                            alt="Story scene illustration"
-                            className={`storybook-media ${isNewScene ? 'arriving' : ''}`}
-                            style={{ position: 'relative', zIndex: 1 }}
-                            loading="eager"
-                            decoding="async"
-                            onLoad={() => {
-                                if (!currentSceneImageUrl?.startsWith('data:image/svg+xml')) {
-                                    setSceneLoading(false);
-                                    setSceneError(null);
-                                }
-                            }}
-                            onError={() => {
-                                if (!currentSceneImageUrl?.startsWith('data:image/svg+xml')) {
-                                    setSceneLoading(false);
-                                    setSceneError('Picture unavailable right now.');
-                                }
-                            }}
-                            onClick={() => {
-                                setZoomedImageUrl(currentSceneImageUrl);
-                            }}
-                        />
-                    )}
-                    {!currentSceneImageUrl && currentSceneVideoUrl && (
-                        <video
-                            src={currentSceneVideoUrl}
-                            autoPlay
-                            loop
-                            muted={calmMode}
-                            playsInline
-                            className="storybook-media"
-                            aria-hidden="true"
-                        />
-                    )}
-                    {sceneLoading && (
-                        <div className="storybook-loading" role="status" aria-live="polite">
-                            <div className="storybook-loading-stage" aria-hidden="true">
-                                <div className="loading-comet">
-                                    <div className="loading-ribbon" />
-                                    <div className="loading-wand" />
-                                </div>
-                                <div className="loading-sparkle sparkle-1" />
-                                <div className="loading-sparkle sparkle-2" />
-                                <div className="loading-sparkle sparkle-3" />
-                                <div className="loading-orbit">
-                                    <div className="loading-orb orb-1" />
-                                    <div className="loading-orb orb-2" />
-                                    <div className="loading-orb orb-3" />
-                                </div>
-                                <div className="loading-buddy">
-                                    <span className="buddy-eye left" />
-                                    <span className="buddy-eye right" />
-                                    <span className="buddy-mouth" />
-                                </div>
+                    <div className="storybook-page-shell">
+                        <div className="storybook-page">
+                            <div className="storybook-illustration-frame">
+                                {isStorybookPanelWaitingForMedia && (
+                                    <div className="storybook-loading-backdrop" aria-hidden="true" />
+                                )}
+                                {currentSceneThumbnailB64 && (
+                                    <img
+                                        src={`data:image/jpeg;base64,${currentSceneThumbnailB64}`}
+                                        alt=""
+                                        className="storybook-media"
+                                        style={{ filter: 'blur(30px)', position: 'absolute', top: 0, left: 0, zIndex: 0, width: '100%', height: '100%', objectFit: 'cover' }}
+                                        aria-hidden="true"
+                                    />
+                                )}
+                                {currentSceneImageUrl && (
+                                    <img
+                                        src={currentSceneImageUrl}
+                                        alt="Story scene illustration"
+                                        className={`storybook-media ${isNewScene ? 'arriving' : ''}`}
+                                        style={{ position: 'relative', zIndex: 1 }}
+                                        loading="eager"
+                                        decoding="async"
+                                        onLoad={() => {
+                                            if (!currentSceneImageUrl?.startsWith('data:image/svg+xml')) {
+                                                setSceneLoading(false);
+                                                setSceneError(null);
+                                            }
+                                        }}
+                                        onError={() => {
+                                            if (!currentSceneImageUrl?.startsWith('data:image/svg+xml')) {
+                                                setSceneLoading(false);
+                                                setSceneError('Picture unavailable right now.');
+                                            }
+                                        }}
+                                        onClick={() => {
+                                            setZoomedImageUrl(currentSceneImageUrl);
+                                        }}
+                                    />
+                                )}
+                                {!currentSceneImageUrl && currentSceneVideoUrl && (
+                                    <video
+                                        src={currentSceneVideoUrl}
+                                        autoPlay
+                                        loop
+                                        muted={calmMode}
+                                        playsInline
+                                        className="storybook-media"
+                                        aria-hidden="true"
+                                    />
+                                )}
+                                {sceneLoading && (
+                                    <div className="storybook-loading" role="status" aria-live="polite">
+                                        <div className="storybook-loading-stage" aria-hidden="true">
+                                            <div className="loading-comet">
+                                                <div className="loading-ribbon" />
+                                                <div className="loading-wand" />
+                                            </div>
+                                            <div className="loading-sparkle sparkle-1" />
+                                            <div className="loading-sparkle sparkle-2" />
+                                            <div className="loading-sparkle sparkle-3" />
+                                            <div className="loading-orbit">
+                                                <div className="loading-orb orb-1" />
+                                                <div className="loading-orb orb-2" />
+                                                <div className="loading-orb orb-3" />
+                                            </div>
+                                            <div className="loading-buddy">
+                                                <span className="buddy-eye left" />
+                                                <span className="buddy-eye right" />
+                                                <span className="buddy-mouth" />
+                                            </div>
+                                        </div>
+                                        <div className="loading-dots" aria-hidden="true">
+                                            <span />
+                                            <span />
+                                            <span />
+                                        </div>
+                                        <div className="storybook-loading-copy" aria-hidden="true">
+                                            <strong>Amelia is drawing the next page.</strong>
+                                            <span>Keep talking while the next picture catches up.</span>
+                                        </div>
+                                        <span className="sr-only">Amelia is drawing the picture.</span>
+                                    </div>
+                                )}
+                                {sceneError && !sceneLoading && (
+                                    <div className="storybook-error" role="status" aria-live="polite">
+                                        {sceneError}
+                                    </div>
+                                )}
                             </div>
-                            <div className="loading-dots" aria-hidden="true">
-                                <span />
-                                <span />
-                                <span />
-                            </div>
-                            <div className="storybook-loading-copy" aria-hidden="true">
-                                <strong>Amelia is drawing the next page.</strong>
-                                <span>Keep talking. The story can move while the picture catches up.</span>
-                            </div>
-                            <span className="sr-only">Amelia is drawing the picture.</span>
                         </div>
-                    )}
-                    {sceneError && !sceneLoading && (
-                        <div className="storybook-error" role="status" aria-live="polite">
-                            {sceneError}
-                        </div>
-                    )}
+                        {currentSceneCaptionText && !sceneError && (
+                            <div className="storybook-reading-strip" role="status" aria-live="polite">
+                                <div className="storybook-reading-meta">
+                                    {currentScenePageNumber && (
+                                        <span className="storybook-page-chip">Page {currentScenePageNumber}</span>
+                                    )}
+                                    {canReadCurrentPage && (
+                                        <button
+                                            type="button"
+                                            className={`storybook-read-btn ${isPageReadAloudActive ? 'is-active' : ''}`}
+                                            onClick={() => {
+                                                playUiSound(isPageReadAloudActive ? 'close' : 'tap');
+                                                void readCurrentPageAloud();
+                                            }}
+                                            disabled={!isPageReadAloudActive && pageReadAloudBusy}
+                                            aria-pressed={isPageReadAloudActive}
+                                            aria-label={isPageReadAloudActive ? 'Stop reading this page aloud' : 'Read this page aloud'}
+                                        >
+                                            {isPageReadAloudActive ? '⏹ Stop reading' : '🔊 Read page'}
+                                        </button>
+                                    )}
+                                </div>
+                                {pageReadAloudError && (
+                                    <div className="storybook-read-error" role="status" aria-live="polite">
+                                        {pageReadAloudError}
+                                    </div>
+                                )}
+                                {currentSceneCaptionText && (
+                                    <div className="storybook-caption storybook-caption-readalong">
+                                        {captionTokens.map((token, index) => {
+                                            const isCurrentWord =
+                                                isPageReadAloudActive
+                                                && token.isWord
+                                                && token.wordIndex === pageReadAloudHighlightWordIndex;
+                                            const isReadWord =
+                                                isPageReadAloudActive
+                                                && token.isWord
+                                                && pageReadAloudHighlightWordIndex > 0
+                                                && token.wordIndex < pageReadAloudHighlightWordIndex;
+                                            return (
+                                                <span
+                                                    key={`${index}-${token.wordIndex}-${token.text}`}
+                                                    className={[
+                                                        'storybook-caption-token',
+                                                        token.isWord ? 'is-word' : 'is-space',
+                                                        isCurrentWord ? 'is-current' : '',
+                                                        isReadWord ? 'is-read' : '',
+                                                    ].filter(Boolean).join(' ')}
+                                                >
+                                                    {token.text}
+                                                </span>
+                                            );
+                                        })}
+                                    </div>
+                                )}
+                            </div>
+                        )}
+                    </div>
                 </section>
             )}
 
@@ -2470,7 +3562,7 @@ export default function StorytellerLive() {
                             ))}
                         </div>
                         <div className="storybook-assembling-helper">
-                            Amelia can still chat while the movie sparkles together.
+                            Amelia can still chat while the movie gets ready.
                         </div>
                         <div className="storybook-assembling-mission">
                             <div className="storybook-assembling-mission-kicker">
@@ -2555,6 +3647,78 @@ export default function StorytellerLive() {
                                 <div className="adult-tools-copy">
                                     <strong>Grown-up controls</strong>
                                     <span>Keep the child screen simple while you handle the big buttons.</span>
+                                </div>
+                                <div className="adult-tools-setting">
+                                    <label className="adult-tools-setting-label" htmlFor="adult-storybook-movie-pacing">
+                                        Final movie pace
+                                    </label>
+                                    <select
+                                        id="adult-storybook-movie-pacing"
+                                        className="adult-tools-setting-select"
+                                        value={storybookMoviePacing}
+                                        disabled={isEndingStory}
+                                        onChange={(event) => {
+                                            playUiSound('tap');
+                                            handleStorybookMoviePacingChange(event.target.value as StorybookMoviePacing);
+                                        }}
+                                    >
+                                        <option value="read_to_me">Read to Me</option>
+                                        <option value="read_with_me">Read with Me</option>
+                                        <option value="fast_movie">Fast Movie</option>
+                                    </select>
+                                    <span className="adult-tools-setting-copy">
+                                        {storybookMoviePacingHelperCopy(storybookMoviePacing)}
+                                    </span>
+                                </div>
+                                <div className="adult-tools-setting">
+                                    <label className="adult-tools-setting-label" htmlFor="adult-story-reader-voice">
+                                        Reader voice
+                                    </label>
+                                    <div className="story-reader-voice-row">
+                                        <select
+                                            id="adult-story-reader-voice"
+                                            className="adult-tools-setting-select"
+                                            value={storyReaderVoiceId}
+                                            disabled={isEndingStory}
+                                            onChange={(event) => {
+                                                playUiSound('tap');
+                                                handleStoryReaderVoiceChange(event.target.value);
+                                            }}
+                                        >
+                                            {STORY_READER_VOICE_OPTIONS.map((voice) => (
+                                                <option key={voice.id} value={voice.id}>
+                                                    {voice.name}
+                                                </option>
+                                            ))}
+                                        </select>
+                                        <button
+                                            type="button"
+                                            className={`story-reader-voice-preview-btn ${(storyReaderVoicePreviewLoading || storyReaderVoicePreviewPlaying) && storyReaderVoicePreviewVoiceId === storyReaderVoiceId ? 'is-active' : ''}`}
+                                            disabled={isEndingStory}
+                                            onClick={() => {
+                                                playUiSound((storyReaderVoicePreviewLoading || storyReaderVoicePreviewPlaying) && storyReaderVoicePreviewVoiceId === storyReaderVoiceId ? 'close' : 'tap');
+                                                void previewStoryReaderVoice(storyReaderVoiceId);
+                                            }}
+                                            aria-label={(storyReaderVoicePreviewLoading || storyReaderVoicePreviewPlaying) && storyReaderVoicePreviewVoiceId === storyReaderVoiceId
+                                                ? 'Stop voice preview'
+                                                : `Preview ${getStoryReaderVoiceOption(storyReaderVoiceId).name} voice`}
+                                            aria-pressed={(storyReaderVoicePreviewLoading || storyReaderVoicePreviewPlaying) && storyReaderVoicePreviewVoiceId === storyReaderVoiceId}
+                                        >
+                                            {storyReaderVoicePreviewLoading && storyReaderVoicePreviewVoiceId === storyReaderVoiceId
+                                                ? 'Loading...'
+                                                : storyReaderVoicePreviewPlaying && storyReaderVoicePreviewVoiceId === storyReaderVoiceId
+                                                    ? 'Stop'
+                                                    : 'Preview'}
+                                        </button>
+                                    </div>
+                                    <span className="adult-tools-setting-copy">
+                                        {storyReaderVoiceHelperCopy(storyReaderVoiceId)}
+                                    </span>
+                                    {storyReaderVoicePreviewError ? (
+                                        <span className="story-reader-voice-preview-error" role="status">
+                                            {storyReaderVoicePreviewError}
+                                        </span>
+                                    ) : null}
                                 </div>
                                 <div className="adult-tools-actions">
                                     {rewindButtonReady && (

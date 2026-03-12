@@ -1,4 +1,4 @@
-"""All native ADK async tools for the Interactive Storyteller.
+"""All native ADK async tools for StorySpark.
 
 Every tool is an async Python function available to the agent.
 """
@@ -10,6 +10,7 @@ import base64
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import html
+import io
 import json
 import logging
 import os
@@ -25,8 +26,9 @@ import uuid
 from datetime import timedelta
 from io import BytesIO
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal, Mapping
 from urllib.parse import urlparse
+import wave
 
 import httpx
 import tenacity
@@ -34,7 +36,17 @@ from google import genai as google_genai
 from google.adk.tools import ToolContext
 from google.cloud import firestore, storage
 from pydantic import BaseModel, ConfigDict, Field
-from shared.meta_learning import build_principles_injection_text, record_prompt_feedback
+from agent.state import (
+    CharacterBibleEntry,
+    CharacterVisualReference,
+    SceneVisualAuditRecord,
+    VisualContinuityPlan,
+)
+from shared.meta_learning import (
+    build_principles_injection_text,
+    build_scene_visual_audit_feedback_signal,
+    record_prompt_feedback,
+)
 from shared.storybook_assembly_workflow import (
     build_storyboard_report_from_workflow_state,
     run_storybook_director_workflow,
@@ -47,6 +59,7 @@ from shared.storybook_movie_quality import (
     SFX_VOLUME_MAX,
     StoryboardShotPlan,
     child_age_band,
+    choose_readalong_text,
     clamp_music_volume,
     clamp_narration_volume,
     clamp_page_seconds,
@@ -57,7 +70,11 @@ from shared.storybook_movie_quality import (
     motion_timing,
     narration_required_default,
     narration_max_words_for_age,
+    normalize_storybook_movie_pacing,
     plan_storyboard_shots,
+    storybook_tts_speaking_rate,
+    storybook_tts_tempo_factor,
+    storybook_page_duration_seconds,
     storybook_release_gate,
 )
 from shared.story_continuity import (
@@ -66,7 +83,13 @@ from shared.story_continuity import (
     should_render_new_scene_page,
     validate_live_scene_request,
 )
-from shared.storybook_pages import story_pages_from_state_data
+from shared.story_text import (
+    clean_story_text as shared_clean_story_text,
+    normalize_storybeat_text as shared_normalize_storybeat_text,
+    split_story_sentences as shared_split_story_sentences,
+    truncate_story_sentence as shared_truncate_story_sentence,
+)
+from shared.storybook_pages import count_rendered_story_pages, story_pages_from_state_data
 from shared.storybook_studio_workflow import (
     build_storybook_studio_plan_from_workflow_state,
     build_storybook_studio_summary,
@@ -99,6 +122,38 @@ _DEFAULT_ELEVENLABS_VOICE_ID = "JBFqnCBsd6RMkjVDRZzb"
 _ALLOWED_STORY_TONES = {"cozy", "gentle_spooky", "adventure_spooky"}
 _DEFAULT_VERTEX_IMAGE_MODEL = "gemini-2.5-flash-image"
 _DEFAULT_API_KEY_IMAGE_MODEL = "gemini-3.1-flash-image-preview"
+_MAX_CHARACTER_REFERENCE_IMAGES = 2
+_MAX_ACTIVE_CHARACTER_REFERENCE_IMAGES = 4
+_CHARACTER_CROP_COORD_MAX = 1000
+_CHARACTER_CROP_PADDING_RATIO = 0.18
+_VISUAL_MEMORY_COLOR_WORDS = {
+    "amber", "black", "blue", "bronze", "brown", "gold", "golden", "gray", "green",
+    "orange", "pink", "purple", "rainbow", "red", "silver", "teal", "violet", "white",
+    "yellow",
+}
+_VISUAL_MEMORY_TRAIT_WORDS = {
+    "brave", "friendly", "glowing", "happy", "little", "playful", "shiny", "silly",
+    "sleepy", "smiling", "soft", "sparkly", "tiny", "warm",
+}
+_VISUAL_MEMORY_ACCESSORY_WORDS = {
+    "backpack", "book", "cape", "crown", "glasses", "hat", "key", "lantern", "scarf",
+    "wand", "wings",
+}
+_VISUAL_MEMORY_SPECIES_HINTS = {
+    "dragon": "dragon",
+    "ghost": "ghost",
+    "wizard": "wizard",
+    "witch": "witch",
+    "elf": "elf",
+    "reindeer": "reindeer",
+    "princess": "princess",
+    "prince": "prince",
+    "queen": "queen",
+    "king": "king",
+    "sidekick": "sidekick",
+}
+_DEFAULT_VISUAL_CONTINUITY_PLAN = VisualContinuityPlan().model_dump(exclude_none=True)
+_DEFAULT_SCENE_VISUAL_AUDIT = SceneVisualAuditRecord().model_dump(exclude_none=True)
 
 
 class _SupersededSceneRequest(RuntimeError):
@@ -128,6 +183,12 @@ def _story_tone_from_state(state: dict[str, Any] | None) -> str:
     if not isinstance(state, dict):
         return "cozy"
     return _normalize_story_tone(state.get("story_tone"))
+
+
+def _storybook_movie_pacing_from_state(state: dict[str, Any] | None) -> str:
+    if not isinstance(state, dict):
+        return normalize_storybook_movie_pacing(None)
+    return normalize_storybook_movie_pacing(state.get("storybook_movie_pacing"))
 
 
 def _visual_negative_prompt_for_tone(story_tone: str) -> str:
@@ -201,6 +262,51 @@ class VisualArgs(BaseModel):
     delivery_quality: int = Field(default=72, description="Client transport encoding quality.")
     delivery_max_side: int | None = Field(default=None, description="Optional max image side for the first still delivered to the browser.")
     quota_retry_count: int = Field(default=0, description="How many quota/backpressure relaunches have already been attempted.")
+    continuity_plan: dict[str, Any] = Field(
+        default_factory=dict,
+        description="Structured continuity contract for the requested scene.",
+    )
+    active_character_bible: list[dict[str, Any]] = Field(
+        default_factory=list,
+        description="Relevant recurring character memory to preserve in the next image.",
+    )
+
+
+class SceneVisualAuditIssue(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    severity: Literal["minor", "major", "critical"] = Field(default="minor")
+    kind: str = Field(default="")
+    issue: str = Field(default="")
+
+
+class SceneVisualAudit(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    status: Literal["pass", "repair", "fail"] = Field(default="pass")
+    should_retry: bool = Field(default=False)
+    repair_prompt_suffix: str = Field(default="")
+    notes: list[str] = Field(default_factory=list, max_length=6)
+    issues: list[SceneVisualAuditIssue] = Field(default_factory=list, max_length=6)
+
+
+class CharacterCropCandidate(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    character_key: str = Field(default="")
+    label: str = Field(default="")
+    visible: bool = Field(default=True)
+    x: int = Field(default=0, ge=0, le=1000)
+    y: int = Field(default=0, ge=0, le=1000)
+    width: int = Field(default=0, ge=0, le=1000)
+    height: int = Field(default=0, ge=0, le=1000)
+    notes: str = Field(default="")
+
+
+class CharacterCropDetection(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    crops: list[CharacterCropCandidate] = Field(default_factory=list, max_length=6)
 
 CLASSIC_STORYBOOK_STYLES = [
     "Ultra-consistent, high-quality children's storybook illustration. Watercolor and ink, reminiscent of Beatrix Potter or E.H. Shepard. Soft pastels, gentle lighting, timeless and nostalgic.",
@@ -276,6 +382,57 @@ class LightArgs(BaseModel):
     scene_description: str = ""
 
 
+class PostMovieIssue(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    scene_index: int = Field(ge=1)
+    severity: Literal["minor", "major", "critical"]
+    issue: str
+
+
+class PostMovieMetaReview(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    global_feedback: list[str] = Field(
+        default_factory=list,
+        max_length=2,
+    )
+    warnings: list[str] = Field(
+        default_factory=list,
+        max_length=4,
+    )
+    issues: list[PostMovieIssue] = Field(default_factory=list, max_length=4)
+
+
+def _require_typed_model_response(
+    response: Any,
+    schema_type: type[BaseModel],
+    *,
+    label: str,
+) -> dict[str, Any] | None:
+    parsed = getattr(response, "parsed", None)
+    if isinstance(parsed, schema_type):
+        return parsed.model_dump(exclude_none=True)
+    if isinstance(parsed, dict):
+        try:
+            return schema_type.model_validate(parsed).model_dump(exclude_none=True)
+        except Exception as exc:
+            logger.warning(
+                "%s returned parsed dict that failed %s validation: %s",
+                label,
+                schema_type.__name__,
+                exc,
+            )
+            return None
+    logger.warning(
+        "%s returned no typed parsed response for schema %s (parsed_type=%s).",
+        label,
+        schema_type.__name__,
+        type(parsed).__name__ if parsed is not None else "None",
+    )
+    return None
+
+
 def _session_id_from_context(tool_context: ToolContext | None) -> str | None:
     if tool_context is None:
         return None
@@ -286,7 +443,7 @@ def _session_id_from_context(tool_context: ToolContext | None) -> str | None:
 
 
 def _story_end_progress(tool_context: ToolContext | None) -> tuple[bool, int, int, int]:
-    """Return whether final-story tools are allowed plus simple turn progress."""
+    """Return whether final-story tools are allowed plus rendered-page progress."""
     state = _load_tool_state(tool_context)
 
     try:
@@ -296,10 +453,10 @@ def _story_end_progress(tool_context: ToolContext | None) -> tuple[bool, int, in
     max_turns = max(1, min(max_turns, 20))
 
     try:
-        current_turn = int(state.get("turn_number", 1) or 1)
+        current_turn = int(state.get("story_page_count", count_rendered_story_pages(state)) or 0)
     except (TypeError, ValueError):
-        current_turn = 1
-    current_turn = max(1, min(current_turn, max_turns))
+        current_turn = 0
+    current_turn = max(0, min(current_turn, max_turns))
 
     limit_reached = bool(state.get("story_turn_limit_reached", False)) or current_turn >= max_turns
     turns_remaining = max(max_turns - current_turn, 0)
@@ -368,6 +525,98 @@ def _remember_last_light_color(tool_context: ToolContext | None, session_id: str
         cache_storybook_state(session_id, cached)
 
 
+def _resolve_story_page_for_lighting(tool_state: dict[str, Any]) -> dict[str, Any]:
+    pages = story_pages_from_state_data(tool_state)
+    active_request_id = str(tool_state.get("active_scene_request_id", "") or "").strip()
+    if active_request_id:
+        for page in reversed(pages):
+            if str(page.get("request_id", "") or "").strip() == active_request_id:
+                return dict(page)
+    if pages:
+        return dict(pages[-1])
+    current_scene_description = str(tool_state.get("current_scene_description", "") or "").strip()
+    current_storybeat_text = str(tool_state.get("current_scene_storybeat_text", "") or "").strip()
+    scene_number = max(1, len(pages) + 1)
+    return {
+        "scene_number": scene_number,
+        "request_id": active_request_id,
+        "scene_description": current_scene_description,
+        "storybeat_text": current_storybeat_text,
+    }
+
+
+def _remember_scene_lighting_command(
+    tool_context: ToolContext | None,
+    session_id: str | None,
+    *,
+    hex_color: str,
+    rgb_color: list[int],
+    brightness: int,
+    transition: float,
+    scene_description: str,
+) -> None:
+    tool_state = _load_tool_state(tool_context)
+    page = _resolve_story_page_for_lighting(tool_state)
+    try:
+        scene_number = max(1, int(page.get("scene_number") or 1))
+    except Exception:
+        scene_number = 1
+    request_id = str(page.get("request_id", "") or "").strip()
+    merged_scene_description = (
+        str(scene_description or "").strip()
+        or str(page.get("storybeat_text", "") or "").strip()
+        or str(page.get("scene_description", "") or "").strip()
+    )
+    cue_entry = {
+        "scene_number": scene_number,
+        "request_id": request_id,
+        "hex_color": hex_color,
+        "rgb_color": list(rgb_color),
+        "brightness": int(brightness),
+        "transition": float(transition),
+        "scene_description": merged_scene_description,
+        "storybeat_text": str(page.get("storybeat_text", "") or "").strip(),
+    }
+    cues = [
+        dict(item)
+        for item in list(tool_state.get("scene_lighting_cues", []) or [])
+        if isinstance(item, dict)
+    ]
+    replaced = False
+    for idx, existing in enumerate(cues):
+        existing_request_id = str(existing.get("request_id", "") or "").strip()
+        try:
+            existing_scene_number = int(existing.get("scene_number") or 0)
+        except Exception:
+            existing_scene_number = 0
+        if request_id and existing_request_id == request_id:
+            cues[idx] = cue_entry
+            replaced = True
+            break
+        if not request_id and existing_scene_number == scene_number:
+            cues[idx] = cue_entry
+            replaced = True
+            break
+    if not replaced:
+        cues.append(cue_entry)
+    cues = cues[-40:]
+
+    if tool_context is not None:
+        try:
+            tool_context.state["scene_lighting_cues"] = cues
+        except Exception:
+            pass
+
+    if session_id:
+        cached = dict(_storybook_state_cache.get(session_id) or {})
+        cached["scene_lighting_cues"] = cues
+        cache_storybook_state(session_id, cached)
+        try:
+            _update_storybook_firestore(session_id, {"scene_lighting_cues": cues})
+        except Exception:
+            logger.debug("Could not persist scene lighting cues for %s", session_id, exc_info=True)
+
+
 def _publish_lighting_command(session_id: str, payload: dict[str, Any]) -> None:
     publish_session_event(
         session_id,
@@ -380,32 +629,92 @@ def _publish_lighting_command(session_id: str, payload: dict[str, Any]) -> None:
 
 def _load_tool_state(tool_context: ToolContext | None) -> dict[str, Any]:
     raw = getattr(tool_context, "state", None) if tool_context else None
-    if raw is None:
+    state = _copy_state_mapping(raw)
+    if not state:
+        if raw is None:
+            return {}
         return {}
-    if hasattr(raw, "to_dict"):
+    ensure_story_continuity_state(state)
+    _ensure_visual_memory_state(state)
+    _sync_story_page_progress_in_state(state)
+    return state
+
+
+def _copy_state_mapping(raw_state: Any) -> dict[str, Any]:
+    if raw_state is None:
+        return {}
+    if hasattr(raw_state, "to_dict"):
         try:
-            state = dict(raw.to_dict() or {})
-            ensure_story_continuity_state(state)
-            return state
+            return dict(raw_state.to_dict() or {})
         except Exception:
             return {}
-    if hasattr(raw, "_value"):
+    if hasattr(raw_state, "_value"):
         try:
-            state = dict(getattr(raw, "_value", {}) or {})
-            ensure_story_continuity_state(state)
-            return state
+            value = getattr(raw_state, "_value", {}) or {}
+            if isinstance(value, Mapping):
+                return dict(value)
         except Exception:
             return {}
-    if isinstance(raw, dict):
-        state = dict(raw)
-        ensure_story_continuity_state(state)
-        return state
+    if isinstance(raw_state, dict):
+        return dict(raw_state)
+    if isinstance(raw_state, Mapping):
+        return dict(raw_state)
     try:
-        state = dict(raw)
-        ensure_story_continuity_state(state)
-        return state
+        return dict(raw_state)
     except Exception:
         return {}
+
+
+def _normalize_text_fragment(value: Any, *, limit: int = 220) -> str:
+    cleaned = re.sub(r"\s+", " ", str(value or "")).strip()
+    return cleaned[:limit]
+
+
+def _stable_visual_key(label: str) -> str:
+    cleaned = re.sub(r"[^a-z0-9]+", "_", str(label or "").lower()).strip("_")
+    return cleaned[:64] or "character"
+
+
+def _ensure_visual_memory_state(state: dict[str, Any] | None) -> dict[str, Any]:
+    if not isinstance(state, dict):
+        return {}
+
+    raw_bible = state.get("character_bible", {})
+    cleaned_bible: dict[str, Any] = {}
+    if isinstance(raw_bible, Mapping):
+        for raw_key, raw_entry in raw_bible.items():
+            if not isinstance(raw_entry, Mapping):
+                continue
+            try:
+                entry = CharacterBibleEntry.model_validate(
+                    {
+                        **dict(raw_entry),
+                        "character_key": str(raw_entry.get("character_key") or raw_key or "").strip(),
+                    }
+                )
+            except Exception:
+                continue
+            if entry.character_key:
+                cleaned_bible[entry.character_key] = entry.model_dump(exclude_none=True)
+    state["character_bible"] = cleaned_bible
+
+    try:
+        continuity_plan = VisualContinuityPlan.model_validate(
+            state.get("current_visual_continuity_plan", {}) or {}
+        )
+        state["current_visual_continuity_plan"] = continuity_plan.model_dump(exclude_none=True)
+    except Exception:
+        state["current_visual_continuity_plan"] = dict(_DEFAULT_VISUAL_CONTINUITY_PLAN)
+
+    try:
+        last_audit = SceneVisualAuditRecord.model_validate(
+            state.get("last_scene_visual_audit", {}) or {}
+        )
+        state["last_scene_visual_audit"] = last_audit.model_dump(exclude_none=True)
+    except Exception:
+        state["last_scene_visual_audit"] = dict(_DEFAULT_SCENE_VISUAL_AUDIT)
+
+    return state
 
 
 def _scene_tool_turn_is_open(state: dict[str, Any] | None) -> bool:
@@ -484,6 +793,8 @@ def cache_storybook_state(session_id: str, state: dict[str, Any]) -> None:
         return
     cached = dict(state or {})
     ensure_story_continuity_state(cached)
+    _ensure_visual_memory_state(cached)
+    _sync_story_page_progress_in_state(cached)
     _storybook_state_cache[session_id] = cached
 
 
@@ -498,11 +809,27 @@ def load_storybook_resume_state(session_id: str) -> dict[str, Any]:
     if cached_state:
         merged.update(cached_state)
     ensure_story_continuity_state(merged)
+    _ensure_visual_memory_state(merged)
+    _sync_story_page_progress_in_state(merged)
     return merged
 
 
 def _story_pages_from_state(state: dict[str, Any] | None) -> list[dict[str, Any]]:
     return story_pages_from_state_data(state if isinstance(state, dict) else {})
+
+
+def _sync_story_page_progress_in_state(state: dict[str, Any] | None) -> None:
+    if not isinstance(state, dict):
+        return
+    try:
+        max_turns = int(state.get("max_story_turns", os.environ.get("MAX_STORY_TURNS", "20")) or 20)
+    except (TypeError, ValueError):
+        max_turns = 20
+    max_turns = max(1, min(max_turns, 20))
+    rendered_page_count = count_rendered_story_pages(state)
+    state["story_page_count"] = rendered_page_count
+    state["story_pages_remaining"] = max(max_turns - rendered_page_count, 0)
+    state["story_page_limit_reached"] = rendered_page_count >= max_turns
 
 
 def _sync_story_pages_in_state(state: dict[str, Any]) -> list[dict[str, Any]]:
@@ -528,6 +855,7 @@ def _sync_story_pages_in_state(state: dict[str, Any]) -> list[dict[str, Any]]:
         for page in pages
         if str(page.get("storybeat_text", "") or "").strip()
     ][-40:]
+    _sync_story_page_progress_in_state(state)
     return pages
 
 
@@ -546,6 +874,29 @@ def _storybook_scene_descriptions(state: dict[str, Any]) -> list[str]:
         for item in list(state.get("scene_descriptions", []) or [])
         if str(item).strip()
     ]
+
+
+def _storybook_narration_source_texts(state: dict[str, Any]) -> list[str]:
+    pages = _story_pages_from_state(state)
+    if pages:
+        return [
+            shared_normalize_storybeat_text(
+                page.get("storybeat_text")
+                or page.get("scene_description")
+                or ""
+            )
+            for page in pages
+            if shared_normalize_storybeat_text(
+                page.get("storybeat_text")
+                or page.get("scene_description")
+                or ""
+            )
+        ]
+    return [
+        shared_normalize_storybeat_text(item)
+        for item in list(state.get("scene_storybeat_texts", []) or [])
+        if shared_normalize_storybeat_text(item)
+    ] or _storybook_scene_descriptions(state)
 
 
 def reset_storybook_assembly_lock(session_id: str) -> None:
@@ -584,10 +935,39 @@ def _continuity_anchor_text(tool_context: ToolContext | None) -> str:
     current_scene_base_description = str(state.get("current_scene_base_description", "")).strip()
     current_scene_visual_summary = str(state.get("current_scene_visual_summary", "")).strip()
     scene_descriptions_raw = list(state.get("scene_descriptions", []) or [])
+    recent_scene_refs = _recent_scene_reference_entries(state)
+    world = state.get("continuity_world_state", {})
+    if not isinstance(world, Mapping):
+        world = {}
+    active_character_keys = [
+        str(item).strip()
+        for item in list(world.get("pending_character_keys", []) or [])
+        if str(item).strip()
+    ] or [
+        str(item).strip()
+        for item in list(world.get("active_character_keys", []) or [])
+        if str(item).strip()
+    ]
+    character_bible_entries = _character_bible_entries_for_keys(state, active_character_keys[:3])
     recent_scene_descriptions = [
         str(item).strip()
         for item in scene_descriptions_raw[-3:]
         if str(item).strip()
+    ]
+    recent_scene_ref_summaries = [
+        str(
+            ref.get("visual_summary")
+            or ref.get("storybeat_text")
+            or ref.get("description")
+            or ""
+        ).strip()
+        for ref in recent_scene_refs
+        if str(
+            ref.get("visual_summary")
+            or ref.get("storybeat_text")
+            or ref.get("description")
+            or ""
+        ).strip()
     ]
 
     # Intentionally omit child name from visual anchors to avoid image model refusals.
@@ -635,6 +1015,27 @@ def _continuity_anchor_text(tool_context: ToolContext | None) -> str:
             "recent visual history: "
             + " | ".join(recent_scene_descriptions).replace("\n", " ").strip()[-360:]
         )
+    if recent_scene_ref_summaries:
+        anchors.append(
+            "recent image trail (oldest to newest): "
+            + " | ".join(recent_scene_ref_summaries).replace("\n", " ").strip()[-420:]
+        )
+    if character_bible_entries:
+        character_bits: list[str] = []
+        for entry in character_bible_entries[:3]:
+            label = _normalize_text_fragment(entry.get("label", ""), limit=80)
+            latest_visual_summary = _normalize_text_fragment(entry.get("latest_visual_summary", ""), limit=120)
+            traits = [
+                _normalize_text_fragment(item, limit=60)
+                for item in list(entry.get("canonical_visual_traits", []) or [])
+                if _normalize_text_fragment(item, limit=60)
+            ]
+            if label and traits:
+                character_bits.append(f"{label}: {', '.join(traits[:2])}")
+            elif label and latest_visual_summary:
+                character_bits.append(f"{label}: {latest_visual_summary}")
+        if character_bits:
+            anchors.append("character bible: " + " | ".join(character_bits)[:320])
 
     return "; ".join(anchors)
 
@@ -754,6 +1155,117 @@ def _make_thumbnail_b64(image_bytes: bytes, max_side: int = 384) -> tuple[str, s
         from PIL import Image
     except Exception:
         return None
+    try:
+        with Image.open(BytesIO(image_bytes)) as img:
+            img = img.convert("RGB")
+            img.thumbnail((max_side, max_side), Image.Resampling.LANCZOS)
+            out = BytesIO()
+            img.save(out, format="JPEG", quality=70, optimize=True, progressive=True)
+            b64 = base64.b64encode(out.getvalue()).decode("ascii")
+            return b64, "image/jpeg"
+    except Exception:
+        return None
+
+
+def _scene_character_crop_model() -> str:
+    return _scene_continuity_vision_model()
+
+
+def _character_reference_crops_enabled() -> bool:
+    return _env_enabled("ENABLE_CHARACTER_REFERENCE_CROPS", default=True)
+
+
+def _crop_image_to_thumbnail_b64(
+    image_bytes: bytes,
+    *,
+    crop_box: Mapping[str, Any],
+    max_side: int = 384,
+) -> tuple[str, str] | None:
+    try:
+        from PIL import Image
+    except Exception:
+        return None
+
+    try:
+        with Image.open(BytesIO(image_bytes)) as img:
+            img = img.convert("RGB")
+            width = max(int(img.width), 1)
+            height = max(int(img.height), 1)
+            x = max(0, min(int(crop_box.get("x", 0) or 0), _CHARACTER_CROP_COORD_MAX))
+            y = max(0, min(int(crop_box.get("y", 0) or 0), _CHARACTER_CROP_COORD_MAX))
+            box_w = max(0, min(int(crop_box.get("width", 0) or 0), _CHARACTER_CROP_COORD_MAX))
+            box_h = max(0, min(int(crop_box.get("height", 0) or 0), _CHARACTER_CROP_COORD_MAX))
+            if box_w <= 0 or box_h <= 0:
+                return None
+
+            left = int(width * x / _CHARACTER_CROP_COORD_MAX)
+            top = int(height * y / _CHARACTER_CROP_COORD_MAX)
+            right = int(width * (x + box_w) / _CHARACTER_CROP_COORD_MAX)
+            bottom = int(height * (y + box_h) / _CHARACTER_CROP_COORD_MAX)
+            if right <= left or bottom <= top:
+                return None
+
+            pad = int(max(right - left, bottom - top) * _CHARACTER_CROP_PADDING_RATIO)
+            min_side = max(int(min(width, height) * 0.16), 48)
+            crop_width = max(right - left, min_side)
+            crop_height = max(bottom - top, min_side)
+            center_x = (left + right) // 2
+            center_y = (top + bottom) // 2
+            half_w = crop_width // 2 + pad
+            half_h = crop_height // 2 + pad
+            crop_left = max(0, center_x - half_w)
+            crop_top = max(0, center_y - half_h)
+            crop_right = min(width, center_x + half_w)
+            crop_bottom = min(height, center_y + half_h)
+            if crop_right - crop_left < 8 or crop_bottom - crop_top < 8:
+                return None
+
+            cropped = img.crop((crop_left, crop_top, crop_right, crop_bottom))
+            cropped.thumbnail((max_side, max_side), Image.Resampling.LANCZOS)
+            out = BytesIO()
+            cropped.save(out, format="JPEG", quality=76, optimize=True, progressive=True)
+            return base64.b64encode(out.getvalue()).decode("ascii"), "image/jpeg"
+    except Exception:
+        return None
+
+
+def _character_crop_references_from_detection(
+    *,
+    image_bytes: bytes,
+    detection_payload: Mapping[str, Any] | None,
+) -> list[dict[str, Any]]:
+    if not isinstance(detection_payload, Mapping):
+        return []
+    references: list[dict[str, Any]] = []
+    for raw_crop in list(detection_payload.get("crops", []) or []):
+        if not isinstance(raw_crop, Mapping):
+            continue
+        if not bool(raw_crop.get("visible", True)):
+            continue
+        character_key = _normalize_text_fragment(raw_crop.get("character_key", ""), limit=80)
+        if not character_key:
+            continue
+        crop_box = {
+            "x": max(0, min(int(raw_crop.get("x", 0) or 0), _CHARACTER_CROP_COORD_MAX)),
+            "y": max(0, min(int(raw_crop.get("y", 0) or 0), _CHARACTER_CROP_COORD_MAX)),
+            "width": max(0, min(int(raw_crop.get("width", 0) or 0), _CHARACTER_CROP_COORD_MAX)),
+            "height": max(0, min(int(raw_crop.get("height", 0) or 0), _CHARACTER_CROP_COORD_MAX)),
+        }
+        thumb = _crop_image_to_thumbnail_b64(image_bytes, crop_box=crop_box)
+        if not thumb:
+            continue
+        references.append(
+            {
+                "character_key": character_key,
+                "focus_label": _normalize_text_fragment(raw_crop.get("label", ""), limit=120),
+                "thumbnail_b64": thumb[0],
+                "thumbnail_mime": thumb[1],
+                "reference_kind": "character_crop",
+                "crop_box": crop_box,
+                "notes": _normalize_text_fragment(raw_crop.get("notes", ""), limit=180),
+            }
+        )
+    return references
 
 
 def _scene_continuity_vision_model() -> str:
@@ -812,16 +1324,646 @@ async def _describe_scene_image_for_continuity(image_bytes: bytes) -> str:
         logger.warning("Scene continuity vision summary failed: %s", exc)
         return ""
 
+
+async def _detect_character_reference_crops(
+    *,
+    image_bytes: bytes,
+    image_mime: str,
+    active_character_bible: list[dict[str, Any]] | None,
+) -> list[dict[str, Any]]:
+    if not image_bytes or not _character_reference_crops_enabled():
+        return []
+    active_entries = [entry for entry in list(active_character_bible or []) if isinstance(entry, Mapping)]
+    if not active_entries:
+        return []
+
+    vision_bytes = image_bytes
+    vision_mime = image_mime or _sniff_mime_type(image_bytes)
+    thumb = _make_thumbnail_b64(image_bytes, max_side=768)
+    if thumb:
+        try:
+            vision_bytes = base64.b64decode(thumb[0])
+            vision_mime = thumb[1] or "image/jpeg"
+        except Exception:
+            vision_bytes = image_bytes
+            vision_mime = image_mime or _sniff_mime_type(image_bytes)
+
+    character_specs: list[str] = []
+    for entry in active_entries[:4]:
+        key = _normalize_text_fragment(entry.get("character_key", ""), limit=80)
+        label = _normalize_text_fragment(entry.get("label", ""), limit=120)
+        traits = [
+            _normalize_text_fragment(item, limit=60)
+            for item in list(entry.get("canonical_visual_traits", []) or [])
+            if _normalize_text_fragment(item, limit=60)
+        ]
+        accessories = [
+            _normalize_text_fragment(item, limit=60)
+            for item in list(entry.get("outfit_accessories", []) or [])
+            if _normalize_text_fragment(item, limit=60)
+        ]
+        if not key or not label:
+            continue
+        detail_bits = []
+        if traits:
+            detail_bits.append("traits: " + ", ".join(traits[:2]))
+        if accessories:
+            detail_bits.append("accessories: " + ", ".join(accessories[:2]))
+        if detail_bits:
+            character_specs.append(f"{key} = {label} ({'; '.join(detail_bits)})")
+        else:
+            character_specs.append(f"{key} = {label}")
+    if not character_specs:
+        return []
+
+    prompt = (
+        "Find tight crop boxes for the recurring story characters in this image. "
+        "Return only characters that are visibly present. "
+        "Use normalized coordinates from 0 to 1000 for x, y, width, and height, with x/y as the top-left corner. "
+        "Make each box contain mostly that character and a little surrounding context, but not the whole scene. "
+        "If a named character is not visible, omit it entirely.\n\n"
+        "Characters to look for:\n- "
+        + "\n- ".join(character_specs[:4])
+    )
+
+    def _run() -> list[dict[str, Any]]:
+        client = _build_google_genai_client()
+        response = client.models.generate_content(
+            model=_scene_character_crop_model(),
+            contents=[
+                prompt,
+                google_genai.types.Part.from_bytes(data=vision_bytes, mime_type=vision_mime),
+            ],
+            config=google_genai.types.GenerateContentConfig(
+                temperature=0.0,
+                max_output_tokens=768,
+                thinking_config=google_genai.types.ThinkingConfig(thinking_budget=0),
+                response_mime_type="application/json",
+                response_json_schema=CharacterCropDetection.model_json_schema(),
+            ),
+        )
+        payload = _require_typed_model_response(
+            response,
+            CharacterCropDetection,
+            label="Character crop detection",
+        )
+        return _character_crop_references_from_detection(
+            image_bytes=image_bytes,
+            detection_payload=payload,
+        )
+
     try:
-        with Image.open(BytesIO(image_bytes)) as img:
-            img = img.convert("RGB")
-            img.thumbnail((max_side, max_side), Image.Resampling.LANCZOS)
-            out = BytesIO()
-            img.save(out, format="JPEG", quality=70, optimize=True, progressive=True)
-            b64 = base64.b64encode(out.getvalue()).decode("ascii")
-            return b64, "image/jpeg"
-    except Exception:
-        return None
+        return await asyncio.to_thread(_run)
+    except Exception as exc:
+        logger.warning("Character crop detection failed: %s", exc)
+        return []
+
+
+_MAX_RECENT_SCENE_REFERENCE_IMAGES = 3
+
+
+def _recent_scene_reference_entries(
+    state: Mapping[str, Any] | None,
+    *,
+    max_count: int = _MAX_RECENT_SCENE_REFERENCE_IMAGES,
+) -> list[dict[str, str]]:
+    raw_refs = []
+    if isinstance(state, Mapping):
+        raw_refs = list(state.get("recent_scene_references", []) or [])
+    cleaned_refs: list[dict[str, str]] = []
+    for item in raw_refs:
+        if not isinstance(item, Mapping):
+            continue
+        thumb_b64 = str(item.get("thumbnail_b64", "") or "").strip()
+        if not thumb_b64:
+            continue
+        cleaned_refs.append(
+            {
+                "request_id": str(item.get("request_id", "") or "").strip(),
+                "thumbnail_b64": thumb_b64,
+                "thumbnail_mime": str(item.get("thumbnail_mime", "") or "image/jpeg").strip() or "image/jpeg",
+                "description": str(item.get("description", "") or "").strip(),
+                "storybeat_text": str(item.get("storybeat_text", "") or "").strip(),
+                "visual_summary": str(item.get("visual_summary", "") or "").strip(),
+            }
+        )
+    if max_count <= 0:
+        return cleaned_refs
+    return cleaned_refs[-max_count:]
+
+
+def _remember_recent_scene_reference(
+    state: dict[str, Any],
+    *,
+    request_id: str = "",
+    description: str = "",
+    storybeat_text: str = "",
+    visual_summary: str = "",
+    thumbnail_b64: str = "",
+    thumbnail_mime: str = "image/jpeg",
+) -> None:
+    cleaned_b64 = str(thumbnail_b64 or "").strip()
+    if not cleaned_b64:
+        return
+    refs = _recent_scene_reference_entries(state, max_count=0)
+    entry = {
+        "request_id": str(request_id or "").strip(),
+        "thumbnail_b64": cleaned_b64,
+        "thumbnail_mime": str(thumbnail_mime or "image/jpeg").strip() or "image/jpeg",
+        "description": str(description or "").strip(),
+        "storybeat_text": str(storybeat_text or "").strip(),
+        "visual_summary": str(visual_summary or "").strip(),
+    }
+    deduped: list[dict[str, str]] = []
+    entry_request_id = entry["request_id"]
+    for existing in refs:
+        existing_request_id = str(existing.get("request_id", "") or "").strip()
+        if entry_request_id and existing_request_id == entry_request_id:
+            continue
+        if existing.get("thumbnail_b64") == cleaned_b64:
+            continue
+        deduped.append(existing)
+    deduped.append(entry)
+    state["recent_scene_references"] = deduped[-_MAX_RECENT_SCENE_REFERENCE_IMAGES:]
+
+
+def _registry_entity_label(state: Mapping[str, Any], bucket: str, key: str) -> str:
+    registry = state.get("continuity_entity_registry", {})
+    if not isinstance(registry, Mapping):
+        return ""
+    bucket_map = registry.get(bucket, {})
+    if not isinstance(bucket_map, Mapping):
+        return ""
+    entity = bucket_map.get(key, {})
+    if not isinstance(entity, Mapping):
+        return ""
+    return _normalize_text_fragment(entity.get("label", ""), limit=120)
+
+
+def _dedupe_preserving_order(items: list[str], *, limit: int) -> list[str]:
+    cleaned: list[str] = []
+    seen: set[str] = set()
+    for item in items:
+        value = _normalize_text_fragment(item, limit=120)
+        lowered = value.lower()
+        if not value or lowered in seen:
+            continue
+        seen.add(lowered)
+        cleaned.append(value)
+    return cleaned[:limit]
+
+
+def _infer_character_species(label: str) -> str:
+    lowered = _normalize_text_fragment(label, limit=120).lower()
+    for token, species in _VISUAL_MEMORY_SPECIES_HINTS.items():
+        if token in lowered:
+            return species
+    return lowered.split()[-1] if lowered else ""
+
+
+def _infer_character_role(state: Mapping[str, Any], character_key: str, label: str) -> str:
+    sidekick_description = _normalize_text_fragment(state.get("sidekick_description", ""), limit=180).lower()
+    lowered_label = _normalize_text_fragment(label, limit=120).lower()
+    if lowered_label and lowered_label in sidekick_description:
+        return "sidekick"
+    if "sidekick" in sidekick_description and character_key:
+        world = state.get("continuity_world_state", {})
+        if isinstance(world, Mapping):
+            active_keys = list(world.get("active_character_keys", []) or [])
+            if active_keys and active_keys[0] == character_key:
+                return "sidekick"
+    species = _infer_character_species(label)
+    if species in {"dragon", "ghost", "reindeer"}:
+        return "recurring_creature"
+    return "story_character"
+
+
+def _extract_character_visual_traits(label: str, *texts: str) -> list[str]:
+    lowered_label = _normalize_text_fragment(label, limit=120).lower()
+    label_tokens = set(re.findall(r"[a-zA-Z][a-zA-Z'\-]+", lowered_label))
+    trait_bits: list[str] = []
+    for raw_text in texts:
+        text = _normalize_text_fragment(raw_text, limit=260)
+        if not text:
+            continue
+        lowered = text.lower()
+        if lowered_label and lowered_label not in lowered and label_tokens and not (label_tokens & set(re.findall(r"[a-zA-Z][a-zA-Z'\-]+", lowered))):
+            continue
+        colors = [word for word in re.findall(r"[a-zA-Z][a-zA-Z'\-]+", lowered) if word in _VISUAL_MEMORY_COLOR_WORDS]
+        traits = [word for word in re.findall(r"[a-zA-Z][a-zA-Z'\-]+", lowered) if word in _VISUAL_MEMORY_TRAIT_WORDS]
+        phrase_pattern = re.compile(
+            rf"((?:\b[a-zA-Z][a-zA-Z'\-]+\b[\s,]+){{0,3}}{re.escape(label)}(?:[\s,]+\b[a-zA-Z][a-zA-Z'\-]+\b){{0,3}})",
+            flags=re.IGNORECASE,
+        )
+        for match in phrase_pattern.finditer(text):
+            trait_bits.append(match.group(1).strip(" ,.;"))
+        if colors:
+            trait_bits.append("colors: " + ", ".join(colors[:2]))
+        if traits:
+            trait_bits.append("traits: " + ", ".join(traits[:3]))
+    return _dedupe_preserving_order(trait_bits, limit=4)
+
+
+def _extract_character_accessories(label: str, *texts: str) -> list[str]:
+    lowered_label = _normalize_text_fragment(label, limit=120).lower()
+    accessories: list[str] = []
+    for raw_text in texts:
+        text = _normalize_text_fragment(raw_text, limit=260)
+        if not text:
+            continue
+        lowered = text.lower()
+        if lowered_label and lowered_label not in lowered:
+            continue
+        found = [word for word in re.findall(r"[a-zA-Z][a-zA-Z'\-]+", lowered) if word in _VISUAL_MEMORY_ACCESSORY_WORDS]
+        accessories.extend(found[:3])
+    return _dedupe_preserving_order(accessories, limit=3)
+
+
+def _scene_history_entry_for_request(
+    state: Mapping[str, Any],
+    *,
+    request_id: str,
+    scene_number: int | None = None,
+) -> dict[str, Any]:
+    history = list(state.get("continuity_scene_history", []) or [])
+    normalized_request_id = _normalize_text_fragment(request_id, limit=80)
+    for entry in reversed(history):
+        if not isinstance(entry, Mapping):
+            continue
+        if normalized_request_id and _normalize_text_fragment(entry.get("request_id", ""), limit=80) == normalized_request_id:
+            return dict(entry)
+        if scene_number and int(entry.get("scene_number", 0) or 0) == int(scene_number):
+            return dict(entry)
+    if history and isinstance(history[-1], Mapping):
+        return dict(history[-1])
+    return {}
+
+
+def _remember_character_visual_references(
+    state: dict[str, Any],
+    *,
+    request_id: str = "",
+    description: str = "",
+    storybeat_text: str = "",
+    visual_summary: str = "",
+    thumbnail_b64: str = "",
+    thumbnail_mime: str = "image/jpeg",
+    focused_reference_images: list[dict[str, Any]] | None = None,
+    scene_number: int | None = None,
+) -> None:
+    cleaned_thumbnail = str(thumbnail_b64 or "").strip()
+    focused_reference_images = [
+        dict(item)
+        for item in list(focused_reference_images or [])
+        if isinstance(item, Mapping)
+    ]
+    if not cleaned_thumbnail and not focused_reference_images:
+        return
+    _ensure_visual_memory_state(state)
+    scene_entry = _scene_history_entry_for_request(
+        state,
+        request_id=request_id,
+        scene_number=scene_number,
+    )
+    character_keys = [
+        str(item).strip()
+        for item in list(scene_entry.get("character_keys", []) or [])
+        if str(item).strip()
+    ]
+    if not character_keys:
+        world = state.get("continuity_world_state", {})
+        if isinstance(world, Mapping):
+            character_keys = [
+                str(item).strip()
+                for item in list(world.get("active_character_keys", []) or [])
+                if str(item).strip()
+            ]
+    if not character_keys:
+        return
+
+    bible = dict(state.get("character_bible", {}) or {})
+    scene_number_value = int(scene_entry.get("scene_number", 0) or scene_number or 0)
+    for character_key in character_keys:
+        label = _registry_entity_label(state, "characters", character_key) or character_key.replace("_", " ")
+        existing_payload = dict(bible.get(character_key, {}) or {})
+        existing_refs = list(existing_payload.get("reference_images", []) or [])
+        filtered_refs: list[dict[str, Any]] = []
+        for raw_ref in existing_refs:
+            if not isinstance(raw_ref, Mapping):
+                continue
+            if request_id and _normalize_text_fragment(raw_ref.get("request_id", ""), limit=80) == _normalize_text_fragment(request_id, limit=80):
+                continue
+            if str(raw_ref.get("thumbnail_b64", "") or "").strip() == cleaned_thumbnail:
+                continue
+            filtered_refs.append(dict(raw_ref))
+        matching_focus_refs = [
+            item
+            for item in focused_reference_images
+            if _normalize_text_fragment(item.get("character_key", ""), limit=80) == character_key
+        ]
+        if matching_focus_refs:
+            for focused_ref in matching_focus_refs[-1:]:
+                filtered_refs.append(
+                    CharacterVisualReference(
+                        request_id=_normalize_text_fragment(request_id, limit=80),
+                        scene_number=scene_number_value,
+                        thumbnail_b64=str(focused_ref.get("thumbnail_b64", "") or "").strip(),
+                        thumbnail_mime=str(focused_ref.get("thumbnail_mime", "") or "image/jpeg").strip() or "image/jpeg",
+                        description=_normalize_text_fragment(description, limit=220),
+                        storybeat_text=_normalize_text_fragment(storybeat_text, limit=220),
+                        visual_summary=_normalize_text_fragment(
+                            focused_ref.get("notes") or visual_summary,
+                            limit=220,
+                        ),
+                        reference_kind=_normalize_text_fragment(focused_ref.get("reference_kind", ""), limit=80)
+                        or "character_crop",
+                        focus_label=_normalize_text_fragment(
+                            focused_ref.get("focus_label") or label,
+                            limit=120,
+                        ),
+                        crop_box={
+                            str(key): int(value)
+                            for key, value in dict(focused_ref.get("crop_box", {}) or {}).items()
+                            if str(key) in {"x", "y", "width", "height"}
+                        },
+                    ).model_dump(exclude_none=True)
+                )
+        elif cleaned_thumbnail:
+            filtered_refs.append(
+                CharacterVisualReference(
+                    request_id=_normalize_text_fragment(request_id, limit=80),
+                    scene_number=scene_number_value,
+                    thumbnail_b64=cleaned_thumbnail,
+                    thumbnail_mime=str(thumbnail_mime or "image/jpeg").strip() or "image/jpeg",
+                    description=_normalize_text_fragment(description, limit=220),
+                    storybeat_text=_normalize_text_fragment(storybeat_text, limit=220),
+                    visual_summary=_normalize_text_fragment(visual_summary, limit=220),
+                    reference_kind="scene_thumbnail",
+                    focus_label=_normalize_text_fragment(label, limit=120),
+                ).model_dump(exclude_none=True)
+            )
+        visual_traits = _dedupe_preserving_order(
+            list(existing_payload.get("canonical_visual_traits", []) or [])
+            + _extract_character_visual_traits(label, visual_summary, storybeat_text, description),
+            limit=5,
+        )
+        accessories = _dedupe_preserving_order(
+            list(existing_payload.get("outfit_accessories", []) or [])
+            + _extract_character_accessories(label, visual_summary, storybeat_text, description),
+            limit=4,
+        )
+        entry = CharacterBibleEntry.model_validate(
+            {
+                **existing_payload,
+                "character_key": character_key,
+                "label": _normalize_text_fragment(existing_payload.get("label") or label, limit=120),
+                "species": _normalize_text_fragment(existing_payload.get("species") or _infer_character_species(label), limit=80),
+                "role": _normalize_text_fragment(existing_payload.get("role") or _infer_character_role(state, character_key, label), limit=80)
+                or "story_character",
+                "canonical_visual_traits": visual_traits,
+                "outfit_accessories": accessories,
+                "latest_visual_summary": _normalize_text_fragment(visual_summary or existing_payload.get("latest_visual_summary", ""), limit=220),
+                "reference_images": filtered_refs[-_MAX_CHARACTER_REFERENCE_IMAGES:],
+            }
+        )
+        bible[character_key] = entry.model_dump(exclude_none=True)
+    state["character_bible"] = bible
+
+
+def _character_bible_entries_for_keys(
+    state: Mapping[str, Any],
+    character_keys: list[str],
+) -> list[dict[str, Any]]:
+    raw_bible = state.get("character_bible", {})
+    if not isinstance(raw_bible, Mapping):
+        raw_bible = {}
+    entries: list[dict[str, Any]] = []
+    for key in character_keys:
+        raw_entry = raw_bible.get(key, {})
+        label = _registry_entity_label(state, "characters", key) or key.replace("_", " ")
+        if not isinstance(raw_entry, Mapping):
+            raw_entry = {
+                "character_key": key,
+                "label": label,
+                "species": _infer_character_species(label),
+                "role": _infer_character_role(state, key, label),
+            }
+        try:
+            entry = CharacterBibleEntry.model_validate(
+                {
+                    **dict(raw_entry),
+                    "character_key": str(raw_entry.get("character_key") or key or "").strip(),
+                }
+            )
+        except Exception:
+            continue
+        if entry.character_key:
+            entries.append(entry.model_dump(exclude_none=True))
+    return entries
+
+
+def _character_reference_images_for_keys(
+    state: Mapping[str, Any],
+    character_keys: list[str],
+) -> list[dict[str, str]]:
+    references: list[dict[str, str]] = []
+    seen_b64: set[str] = set()
+    for entry in _character_bible_entries_for_keys(state, character_keys):
+        entry_key = str(entry.get("character_key", "") or "").strip()
+        raw_refs = list(entry.get("reference_images", []) or [])
+        raw_refs.sort(
+            key=lambda item: (
+                int(item.get("scene_number", 0) or 0),
+                1 if str(item.get("reference_kind", "") or "").strip() == "character_crop" else 0,
+            )
+        )
+        for raw_ref in raw_refs[-_MAX_CHARACTER_REFERENCE_IMAGES:]:
+            if not isinstance(raw_ref, Mapping):
+                continue
+            thumb_b64 = str(raw_ref.get("thumbnail_b64", "") or "").strip()
+            if not thumb_b64 or thumb_b64 in seen_b64:
+                continue
+            seen_b64.add(thumb_b64)
+            reference_kind = _normalize_text_fragment(raw_ref.get("reference_kind", ""), limit=80) or "latest"
+            references.append(
+                {
+                    "b64": thumb_b64,
+                    "mime": str(raw_ref.get("thumbnail_mime", "") or "image/jpeg").strip() or "image/jpeg",
+                    "role": f"character_{entry_key}_{reference_kind}",
+                }
+            )
+            if len(references) >= _MAX_ACTIVE_CHARACTER_REFERENCE_IMAGES:
+                return references
+    return references
+
+
+def _build_visual_continuity_plan(
+    state: dict[str, Any],
+    *,
+    validation: Any,
+    request_description: str,
+) -> dict[str, Any]:
+    _ensure_visual_memory_state(state)
+    world = state.get("continuity_world_state", {})
+    current_location = _normalize_text_fragment(world.get("current_location_label", ""), limit=120)
+    pending_transition = _normalize_text_fragment(world.get("pending_transition", ""), limit=80)
+    target_location = _normalize_text_fragment(getattr(validation, "location_label", ""), limit=120) or current_location
+    if not pending_transition:
+        if current_location and target_location and current_location.lower() == target_location.lower():
+            pending_transition = "same_room"
+        elif re.search(r"\b(?:path|trail|road|direction|way)\b", request_description or "", flags=re.IGNORECASE):
+            pending_transition = "route_progress"
+        elif current_location and target_location and current_location.lower() != target_location.lower():
+            pending_transition = "location_change"
+        else:
+            pending_transition = "new_scene"
+
+    active_character_keys = [
+        str(item).strip()
+        for item in (
+            list(world.get("pending_character_keys", []) or [])
+            or list(getattr(validation, "character_keys", []) or [])
+            or list(world.get("active_character_keys", []) or [])
+        )
+        if str(item).strip()
+    ][:6]
+    active_character_labels = [
+        _registry_entity_label(state, "characters", item)
+        for item in active_character_keys
+        if _registry_entity_label(state, "characters", item)
+    ][:6]
+    required_prop_keys = [
+        str(item).strip()
+        for item in (
+            list(world.get("pending_prop_keys", []) or [])
+            or list(getattr(validation, "prop_keys", []) or [])
+            or (
+                list(world.get("active_prop_keys", []) or [])
+                if current_location and target_location and current_location.lower() == target_location.lower()
+                else []
+            )
+        )
+        if str(item).strip()
+    ][:4]
+    required_prop_labels = [
+        _registry_entity_label(state, "props", item)
+        for item in required_prop_keys
+        if _registry_entity_label(state, "props", item)
+    ][:4]
+
+    forbidden_drift: list[str] = []
+    if current_location and target_location and current_location.lower() == target_location.lower():
+        forbidden_drift.append(f"Do not leave {target_location} unless the child explicitly asks.")
+    elif current_location and pending_transition in {"door", "inside", "tower", "window"}:
+        forbidden_drift.append(
+            f"Do not teleport away from {current_location}; keep the next scene directly connected to that space."
+        )
+    for entry in _character_bible_entries_for_keys(state, active_character_keys):
+        label = _normalize_text_fragment(entry.get("label", ""), limit=120)
+        traits = list(entry.get("canonical_visual_traits", []) or [])
+        accessories = list(entry.get("outfit_accessories", []) or [])
+        if traits or accessories:
+            detail_bits = []
+            if traits:
+                detail_bits.append(", ".join(str(item).strip() for item in traits[:2] if str(item).strip()))
+            if accessories:
+                detail_bits.append("accessories: " + ", ".join(str(item).strip() for item in accessories[:2] if str(item).strip()))
+            forbidden_drift.append(f"Keep {label} visually consistent ({'; '.join(detail_bits)}).")
+        elif label:
+            forbidden_drift.append(f"Do not redesign {label}.")
+
+    continuity_notes = _dedupe_preserving_order(
+        [
+            _normalize_text_fragment(state.get("current_scene_visual_summary", ""), limit=220),
+            _normalize_text_fragment(state.get("previous_scene_visual_summary", ""), limit=220),
+            _normalize_text_fragment(state.get("continuity_world_state_text", ""), limit=220),
+            *[
+                _normalize_text_fragment(
+                    ref.get("visual_summary") or ref.get("storybeat_text") or ref.get("description") or "",
+                    limit=220,
+                )
+                for ref in _recent_scene_reference_entries(state)
+            ],
+        ],
+        limit=5,
+    )
+
+    plan = VisualContinuityPlan.model_validate(
+        {
+            "previous_location": current_location,
+            "target_location": target_location,
+            "transition_type": pending_transition,
+            "active_character_keys": active_character_keys,
+            "active_character_labels": active_character_labels,
+            "required_prop_keys": required_prop_keys,
+            "required_prop_labels": required_prop_labels,
+            "forbidden_drift": _dedupe_preserving_order(forbidden_drift, limit=5),
+            "continuity_notes": continuity_notes,
+        }
+    )
+    state["current_visual_continuity_plan"] = plan.model_dump(exclude_none=True)
+    return state["current_visual_continuity_plan"]
+
+
+def _continuity_plan_prompt(
+    continuity_plan: Mapping[str, Any] | None,
+    active_character_bible: list[dict[str, Any]] | None,
+) -> str:
+    if not isinstance(continuity_plan, Mapping):
+        return ""
+    bits: list[str] = []
+    target_location = _normalize_text_fragment(continuity_plan.get("target_location", ""), limit=120)
+    transition_type = _normalize_text_fragment(continuity_plan.get("transition_type", ""), limit=80).replace("_", " ")
+    if target_location:
+        bits.append(f"Story continuity target: keep this page in or directly connected to {target_location}.")
+    if transition_type:
+        bits.append(f"Transition type: {transition_type}.")
+    active_labels = [
+        _normalize_text_fragment(item, limit=120)
+        for item in list(continuity_plan.get("active_character_labels", []) or [])
+        if _normalize_text_fragment(item, limit=120)
+    ]
+    if active_labels:
+        bits.append("Active recurring cast: " + ", ".join(active_labels[:4]) + ".")
+    required_props = [
+        _normalize_text_fragment(item, limit=120)
+        for item in list(continuity_plan.get("required_prop_labels", []) or [])
+        if _normalize_text_fragment(item, limit=120)
+    ]
+    if required_props:
+        bits.append("Carry over these props if they belong in the connected space: " + ", ".join(required_props[:3]) + ".")
+    for entry in list(active_character_bible or [])[:3]:
+        if not isinstance(entry, Mapping):
+            continue
+        label = _normalize_text_fragment(entry.get("label", ""), limit=120)
+        traits = [
+            _normalize_text_fragment(item, limit=100)
+            for item in list(entry.get("canonical_visual_traits", []) or [])
+            if _normalize_text_fragment(item, limit=100)
+        ]
+        accessories = [
+            _normalize_text_fragment(item, limit=80)
+            for item in list(entry.get("outfit_accessories", []) or [])
+            if _normalize_text_fragment(item, limit=80)
+        ]
+        if not label:
+            continue
+        detail_bits: list[str] = []
+        if traits:
+            detail_bits.append(", ".join(traits[:2]))
+        if accessories:
+            detail_bits.append("accessories: " + ", ".join(accessories[:2]))
+        if detail_bits:
+            bits.append(f"Keep {label} recognizable with the same look cues: {'; '.join(detail_bits)}.")
+        else:
+            bits.append(f"Keep {label} recognizable as the same recurring character.")
+    forbidden_drift = [
+        _normalize_text_fragment(item, limit=160)
+        for item in list(continuity_plan.get("forbidden_drift", []) or [])
+        if _normalize_text_fragment(item, limit=160)
+    ]
+    bits.extend(forbidden_drift[:3])
+    return " ".join(bits[:8]).strip()
 
 
 def _encode_transport_image(
@@ -880,6 +2022,7 @@ def _persist_uploaded_scene_asset(
     gcs_uri: str | None,
     thumbnail_b64: str | None,
     thumbnail_mime: str | None,
+    focused_character_references: list[dict[str, Any]] | None = None,
     request_id: str | None = None,
     preview_image_url: str | None = None,
 ) -> None:
@@ -888,6 +2031,7 @@ def _persist_uploaded_scene_asset(
 
     state = load_storybook_resume_state(session_id)
     ensure_story_continuity_state(state)
+    _ensure_visual_memory_state(state)
     pages = _story_pages_from_state(state)
     normalized_request_id = str(request_id or "").strip()
     target_index = -1
@@ -1009,6 +2153,15 @@ def _persist_uploaded_scene_asset(
         if not str(updated_state.get("canonical_scene_thumbnail_b64", "") or "").strip():
             updated_state["canonical_scene_thumbnail_b64"] = thumbnail_b64
             updated_state["canonical_scene_thumbnail_mime"] = thumbnail_mime or "image/jpeg"
+        _remember_recent_scene_reference(
+            updated_state,
+            request_id=normalized_request_id,
+            description=description,
+            storybeat_text=storybeat_text,
+            visual_summary=scene_visual_summary,
+            thumbnail_b64=thumbnail_b64,
+            thumbnail_mime=thumbnail_mime or "image/jpeg",
+        )
 
     record_continuity_scene(
         updated_state,
@@ -1016,6 +2169,17 @@ def _persist_uploaded_scene_asset(
         storybeat_text=storybeat_text,
         visual_summary=scene_visual_summary,
         request_id=normalized_request_id,
+        scene_number=max(1, int(target_page.get("scene_number", target_index + 1) or (target_index + 1))),
+    )
+    _remember_character_visual_references(
+        updated_state,
+        request_id=normalized_request_id,
+        description=description,
+        storybeat_text=storybeat_text,
+        visual_summary=scene_visual_summary,
+        thumbnail_b64=thumbnail_b64 or "",
+        thumbnail_mime=thumbnail_mime or "image/jpeg",
+        focused_reference_images=focused_character_references,
         scene_number=max(1, int(target_page.get("scene_number", target_index + 1) or (target_index + 1))),
     )
 
@@ -1036,6 +2200,10 @@ def _persist_uploaded_scene_asset(
             "canonical_scene_visual_summary": str(updated_state.get("canonical_scene_visual_summary", "") or "").strip(),
             "canonical_scene_thumbnail_b64": str(updated_state.get("canonical_scene_thumbnail_b64", "") or "").strip(),
             "canonical_scene_thumbnail_mime": str(updated_state.get("canonical_scene_thumbnail_mime", "") or "").strip(),
+            "recent_scene_references": list(updated_state.get("recent_scene_references", []) or []),
+            "character_bible": dict(updated_state.get("character_bible", {}) or {}),
+            "current_visual_continuity_plan": dict(updated_state.get("current_visual_continuity_plan", {}) or {}),
+            "last_scene_visual_audit": dict(updated_state.get("last_scene_visual_audit", {}) or {}),
         },
     )
 
@@ -1088,20 +2256,14 @@ def _extract_storybeat_text(response: Any) -> str:
         return ""
 
     merged = re.sub(r"\s+", " ", " ".join(segments)).strip()
-    merged = re.sub(r"^(caption|storybeat|scene)\s*:\s*", "", merged, flags=re.IGNORECASE)
-    merged = merged.strip(" \"'")
-    return merged[:220]
+    return shared_normalize_storybeat_text(merged)
 
 
 def _fallback_storybeat_text(description: str) -> str:
-    text = re.sub(r"\s+", " ", description).strip()
+    text = shared_normalize_storybeat_text(description, max_chars=220)
     if not text:
         return "A magical new page appears in the storybook."
-    text = re.split(r"(?<=[.!?])\s+", text, maxsplit=1)[0].strip()
-    text = text.strip(" \"'")
-    if len(text) > 220:
-        text = text[:217].rstrip(" ,;:") + "..."
-    return text or "A magical new page appears in the storybook."
+    return text
 
 
 def _extract_first_uri(obj: Any) -> str | None:
@@ -1224,6 +2386,8 @@ def _generate_scene_still(
     image_model: str,
     reference_images: list[dict[str, str]] | None = None,
     style_prompt: str | None = None,
+    continuity_plan: Mapping[str, Any] | None = None,
+    active_character_bible: list[dict[str, Any]] | None = None,
 ) -> tuple[bytes, str, str]:
     client = _build_google_genai_client()
     meta_guidance = build_principles_injection_text("interactive_scene_visual")
@@ -1243,17 +2407,33 @@ def _generate_scene_still(
         "and several distinctive props or landmarks that make the setting unmistakable."
     )
     prompt += (
+        "\nCharacter discipline: show only the characters, creatures, toys, or vehicles explicitly named "
+        "in the description or continuity references. Do not invent extra dragons, animals, helpers, "
+        "or side characters unless the child clearly asked for them."
+    )
+    prompt += (
         "\nStorybeat text: In the same response, include exactly one short child-friendly storybook caption "
         "that matches the illustration. Use one vivid present-tense sentence, maximum 22 words, with no markdown, labels, or quotation marks."
+    )
+    prompt += (
+        "\nDo not mention the illustration, image, page, caption, prompt, or story generation process. "
+        "Do not say things like 'Here is the illustration for your story' or 'This image shows'."
+    )
+    prompt += (
+        "\nThe caption must describe only the visible page moment. "
+        "Do not praise the child's idea, do not speak to the child, do not ask questions, "
+        "and do not include dialogue like 'Oh, I love that idea!' or 'Let's go see'."
     )
 
     reference_images = list(reference_images or [])
     reference_roles = [str(item.get("role", "")).strip().lower() for item in reference_images if isinstance(item, dict)]
     has_setting_ref = "canonical_setting" in reference_roles
     has_recent_scene_ref = "previous_scene" in reference_roles
+    has_recent_trail_ref = any(role.startswith("recent_scene_") for role in reference_roles)
+    has_character_ref = any(role.startswith("character_") for role in reference_roles)
     has_toy_ref = "toy" in reference_roles
 
-    if has_setting_ref or has_recent_scene_ref:
+    if has_setting_ref or has_recent_scene_ref or has_recent_trail_ref:
         prompt += (
             "\nContinuity rules: keep recurring characters, wardrobe, props, architecture, palette, "
             "lighting, and room/layout details consistent with the reference images. "
@@ -1261,10 +2441,82 @@ def _generate_scene_still(
         )
     if has_setting_ref:
         prompt += "\nReference priority: the canonical-setting image is the stable world/look anchor when revisiting the same place."
+    if has_recent_trail_ref:
+        prompt += (
+            "\nReference priority: the recent-scene trail images are ordered from older to newer and show the path into this moment. "
+            "Use them to keep travel, doorways, and hidden-room reveals spatially adjacent and logically connected."
+        )
     if has_recent_scene_ref:
         prompt += "\nReference priority: the recent-scene image is the immediate carry-over anchor for poses, props, and camera-world continuity."
+        prompt += (
+            "\nIf the child just moved through a door, hallway, stair, path, or secret passage, treat the next image as the directly connected next space "
+            "instead of teleporting to an unrelated outdoor biome or a redesigned world."
+        )
+    if has_character_ref:
+        prompt += (
+            "\nCharacter reference priority: the character reference images define the recurring cast. "
+            "Keep the same creature/person identity, colors, accessories, silhouette, and proportions unless the child explicitly asked for a transformation."
+        )
     if has_toy_ref:
-        prompt += "\nIf a toy reference is present, use it only for the sidekick's appearance and colors, not for replacing the whole setting."
+        toy_summary = _normalize_text_fragment(state.get("toy_reference_visual_summary", ""), limit=220) if state else ""
+        prompt += (
+            "\nToy reference priority: the shared toy is a recurring helper or sidekick in the story. "
+            "Keep it visibly present when the story beat allows, and match the toy's shape, colors, and overall identity from the reference image."
+        )
+        if toy_summary:
+            prompt += f"\nShared toy details: {toy_summary}."
+        prompt += "\nUse the toy as a recurring companion, not just a loose color reference, and do not replace the whole setting with the toy photo."
+    if isinstance(continuity_plan, Mapping):
+        transition_type = _normalize_text_fragment(continuity_plan.get("transition_type", ""), limit=80).replace("_", " ")
+        target_location = _normalize_text_fragment(continuity_plan.get("target_location", ""), limit=120)
+        if transition_type or target_location:
+            prompt += (
+                "\nStructured continuity plan: "
+                + " ".join(
+                    bit
+                    for bit in [
+                        f"transition={transition_type}." if transition_type else "",
+                        f"target place={target_location}." if target_location else "",
+                    ]
+                    if bit
+                )
+            )
+        forbidden = [
+            _normalize_text_fragment(item, limit=160)
+            for item in list(continuity_plan.get("forbidden_drift", []) or [])
+            if _normalize_text_fragment(item, limit=160)
+        ]
+        if forbidden:
+            prompt += "\nForbidden drift: " + " ".join(forbidden[:3])
+    if active_character_bible:
+        character_notes: list[str] = []
+        for entry in active_character_bible[:3]:
+            if not isinstance(entry, Mapping):
+                continue
+            label = _normalize_text_fragment(entry.get("label", ""), limit=120)
+            traits = [
+                _normalize_text_fragment(item, limit=80)
+                for item in list(entry.get("canonical_visual_traits", []) or [])
+                if _normalize_text_fragment(item, limit=80)
+            ]
+            accessories = [
+                _normalize_text_fragment(item, limit=80)
+                for item in list(entry.get("outfit_accessories", []) or [])
+                if _normalize_text_fragment(item, limit=80)
+            ]
+            if not label:
+                continue
+            detail_bits = []
+            if traits:
+                detail_bits.append(", ".join(traits[:2]))
+            if accessories:
+                detail_bits.append("accessories: " + ", ".join(accessories[:2]))
+            if detail_bits:
+                character_notes.append(f"{label} must stay recognizable with {'; '.join(detail_bits)}.")
+            else:
+                character_notes.append(f"{label} must stay recognizable as the same recurring character.")
+        if character_notes:
+            prompt += "\nActive character bible: " + " ".join(character_notes)
 
     contents: list[Any] = [prompt]
     for ref in reference_images:
@@ -1308,6 +2560,110 @@ def _generate_scene_still(
         raise RuntimeError("Image model returned no image bytes.")
     storybeat_text = _extract_storybeat_text(response) or _fallback_storybeat_text(description)
     return blob[0], blob[1], storybeat_text
+
+
+def _scene_visual_audit_enabled() -> bool:
+    return _env_enabled("ENABLE_SCENE_VISUAL_AUDIT", default=True)
+
+
+def _repair_visual_args_from_audit(args: VisualArgs, audit_payload: Mapping[str, Any] | None) -> VisualArgs | None:
+    if not isinstance(audit_payload, Mapping):
+        return None
+    if not bool(audit_payload.get("should_retry", False)):
+        return None
+    repair_suffix = _normalize_text_fragment(audit_payload.get("repair_prompt_suffix", ""), limit=260)
+    if not repair_suffix:
+        issue_texts = [
+            _normalize_text_fragment(item.get("issue", ""), limit=140)
+            for item in list(audit_payload.get("issues", []) or [])
+            if isinstance(item, Mapping) and _normalize_text_fragment(item.get("issue", ""), limit=140)
+        ]
+        if issue_texts:
+            repair_suffix = "Repair continuity issues: " + "; ".join(issue_texts[:2]) + "."
+    if not repair_suffix:
+        return None
+    repaired_description = f"{args.description.rstrip('. ')}. Repair continuity: {repair_suffix}"
+    repaired_base_description = args.base_description or args.description
+    repaired_base_description = f"{repaired_base_description.rstrip('. ')}. {repair_suffix}"
+    return args.model_copy(
+        update={
+            "description": repaired_description,
+            "base_description": repaired_base_description,
+        }
+    )
+
+
+async def _audit_scene_visual_continuity(
+    *,
+    image_bytes: bytes,
+    image_mime: str,
+    args: VisualArgs,
+) -> dict[str, Any] | None:
+    if not image_bytes or not _scene_visual_audit_enabled():
+        return None
+
+    continuity_plan_text = json.dumps(args.continuity_plan or {}, ensure_ascii=True)
+    character_bible_text = json.dumps(args.active_character_bible or [], ensure_ascii=True)
+    prompt = (
+        "You are a strict continuity auditor for a children's story image. "
+        "The first image is the newly generated candidate. Remaining images, if any, are continuity references. "
+        "Check whether the candidate preserves the intended location transition, recurring characters, carried props, and spatial logic. "
+        "Fail if the image teleports to an unrelated place, drops a required recurring character, or visibly redesigns the established cast. "
+        "Use repair only when one stronger retry prompt can likely fix the issue. "
+        "Return compact JSON only that matches the schema.\n\n"
+        f"Requested scene description: {_normalize_text_fragment(args.description, limit=500)}\n"
+        f"Continuity plan: {continuity_plan_text[:1400]}\n"
+        f"Active character bible: {character_bible_text[:1800]}"
+    )
+
+    def _run() -> dict[str, Any] | None:
+        client = _build_google_genai_client()
+        contents: list[Any] = [
+            prompt,
+            "Candidate image:",
+            google_genai.types.Part.from_bytes(data=image_bytes, mime_type=image_mime or "image/jpeg"),
+        ]
+        for ref in list(args.reference_images or [])[:_MAX_ACTIVE_CHARACTER_REFERENCE_IMAGES]:
+            ref_b64 = str(ref.get("b64", "") or "").strip()
+            if not ref_b64:
+                continue
+            try:
+                ref_bytes = base64.b64decode(ref_b64)
+            except Exception:
+                continue
+            role = _normalize_text_fragment(ref.get("role", ""), limit=80) or "continuity_reference"
+            contents.extend(
+                [
+                    f"Continuity reference ({role}):",
+                    google_genai.types.Part.from_bytes(
+                        data=ref_bytes,
+                        mime_type=str(ref.get("mime", "") or "image/jpeg").strip() or "image/jpeg",
+                    ),
+                ]
+            )
+
+        response = client.models.generate_content(
+            model=_scene_continuity_vision_model(),
+            contents=contents,
+            config=google_genai.types.GenerateContentConfig(
+                temperature=0.0,
+                max_output_tokens=1024,
+                thinking_config=google_genai.types.ThinkingConfig(thinking_budget=0),
+                response_mime_type="application/json",
+                response_json_schema=SceneVisualAudit.model_json_schema(),
+            ),
+        )
+        return _require_typed_model_response(
+            response,
+            SceneVisualAudit,
+            label="Scene visual audit",
+        )
+
+    try:
+        return await asyncio.to_thread(_run)
+    except Exception as exc:
+        logger.warning("Scene visual audit failed: %s", exc)
+        return None
 
 
 def _poll_veo_operation(project: str, location: str, operation_name: str, timeout_seconds: float = 120.0) -> str:
@@ -1377,10 +2733,20 @@ async def generate_scene_visuals(
             merged_state.update(latest_state)
             state = merged_state
         ensure_story_continuity_state(state)
+        _ensure_visual_memory_state(state)
         story_tone = _story_tone_from_state(state)
         base_description = description.strip()
         continuity_validation = validate_live_scene_request(state, base_description)
         base_description = continuity_validation.resolved_description
+        continuity_plan = _build_visual_continuity_plan(
+            state,
+            validation=continuity_validation,
+            request_description=base_description,
+        )
+        active_character_bible = _character_bible_entries_for_keys(
+            state,
+            list(continuity_plan.get("active_character_keys", []) or []),
+        )
         render_decision = should_render_new_scene_page(
             state,
             base_description,
@@ -1410,6 +2776,9 @@ async def generate_scene_visuals(
             visual_description = (
                 f"{visual_description}. Keep temporal/character continuity with: {continuity}."
             )
+        continuity_plan_prompt = _continuity_plan_prompt(continuity_plan, active_character_bible)
+        if continuity_plan_prompt:
+            visual_description = f"{visual_description}. {continuity_plan_prompt}"
         tone_guidance = _visual_tone_guidance(story_tone)
         if tone_guidance:
             visual_description = f"{visual_description}. {tone_guidance}"
@@ -1441,10 +2810,29 @@ async def generate_scene_visuals(
                 canonical_mime = str(state.get("canonical_scene_thumbnail_mime", "") or "").strip()
                 if canonical_b64:
                     _append_reference_image(canonical_b64, canonical_mime, "canonical_setting")
+                recent_scene_refs = _recent_scene_reference_entries(state)
+                for idx, ref in enumerate(recent_scene_refs, start=1):
+                    ref_b64 = str(ref.get("thumbnail_b64", "") or "").strip()
+                    if not ref_b64 or ref_b64 == canonical_b64:
+                        continue
+                    _append_reference_image(
+                        ref_b64,
+                        str(ref.get("thumbnail_mime", "") or "image/jpeg").strip() or "image/jpeg",
+                        f"recent_scene_{idx}",
+                    )
                 candidate_b64 = str(state.get("previous_scene_thumbnail_b64", "") or "").strip()
                 candidate_mime = str(state.get("previous_scene_thumbnail_mime", "") or "").strip()
                 if candidate_b64:
                     _append_reference_image(candidate_b64, candidate_mime, "previous_scene")
+                for ref in _character_reference_images_for_keys(
+                    state,
+                    list(continuity_plan.get("active_character_keys", []) or []),
+                ):
+                    _append_reference_image(
+                        ref.get("b64", ""),
+                        ref.get("mime", ""),
+                        ref.get("role", "character_latest"),
+                    )
             toy_b64 = str(state.get("toy_reference_thumbnail_b64", "") or "").strip()
             toy_mime = str(state.get("toy_reference_thumbnail_mime", "") or "").strip()
             if toy_b64:
@@ -1480,13 +2868,12 @@ async def generate_scene_visuals(
         session_style: str | None = None
         if tool_context:
             try:
-                # ADK ToolContext.state is usually a dict-like, but we ensure string keys.
-                state = tool_context.state
-                session_style = str(state.get("illustration_style") or "").strip()
+                raw_tool_state = tool_context.state
+                session_style = str(raw_tool_state.get("illustration_style") or "").strip()
                 if not session_style:
                     import random
                     session_style = random.choice(CLASSIC_STORYBOOK_STYLES)
-                    state["illustration_style"] = session_style
+                    raw_tool_state["illustration_style"] = session_style
                     logger.info("Assigned new random illustration style for session %s: %s", session_id, session_style[:40])
             except Exception as e:
                 logger.warning("Could not manage illustration_style state: %s", str(e))
@@ -1505,6 +2892,8 @@ async def generate_scene_visuals(
                 delivery_format=delivery_format,
                 delivery_quality=delivery_quality,
                 delivery_max_side=delivery_max_side,
+                continuity_plan=continuity_plan,
+                active_character_bible=active_character_bible,
             )
         except Exception as ve:
             logger.error(f"VisualArgs validation failed: {ve}", exc_info=True)
@@ -1539,6 +2928,8 @@ async def generate_scene_visuals(
             tool_context.state["previous_scene_description"] = tool_context.state.get(
                 "current_scene_description", ""
             )
+            tool_context.state["current_visual_continuity_plan"] = dict(continuity_plan or {})
+            tool_context.state["character_bible"] = dict(state.get("character_bible", {}) or {})
             tool_context.state["previous_scene_base_description"] = tool_context.state.get(
                 "current_scene_base_description", ""
             )
@@ -1546,6 +2937,12 @@ async def generate_scene_visuals(
             tool_context.state["current_scene_base_description"] = base_description
             tool_context.state["active_scene_request_id"] = request_id
             ensure_story_continuity_state(tool_context.state)
+            _ensure_visual_memory_state(tool_context.state)
+        if session_id:
+            cached_generation_state = _copy_state_mapping(state)
+            cached_generation_state["current_visual_continuity_plan"] = dict(continuity_plan or {})
+            cached_generation_state["character_bible"] = dict(state.get("character_bible", {}) or {})
+            cache_storybook_state(session_id, cached_generation_state)
 
         _elapsed = int((time.monotonic() - _tool_entry_t) * 1000)
         logger.info(f"⏱️ TIMING [generate_scene_visuals] entry processing complete | elapsed={_elapsed}ms | session={session_id}")
@@ -1609,9 +3006,14 @@ async def _run_visual_pipeline(
     project = os.environ["GOOGLE_CLOUD_PROJECT"]
     location = os.environ.get("GOOGLE_CLOUD_LOCATION", "us-central1")
     image_bytes: bytes | None = None
+    image_mime = "image/jpeg"
     gcs_uri: str | None = None
     storybeat_text = _fallback_storybeat_text(args.base_description or args.description)
     superseded_render = False
+    audit_payload: dict[str, Any] | None = None
+    audit_history: list[dict[str, Any]] = []
+    audit_learning_prompt_text = args.base_description or args.description
+    focused_character_references: list[dict[str, Any]] = []
 
     # Track timing and description for the session.
     if session_id:
@@ -1634,66 +3036,128 @@ async def _run_visual_pipeline(
         async with _still_semaphore:
             _sem_elapsed = int((time.monotonic() - _pipeline_t0) * 1000)
             logger.info(f"⏱️ TIMING [pipeline] SEMAPHORE ACQUIRED | elapsed={_sem_elapsed}ms | session={session_id}")
-            # Attempt 1: short prompt, no negative prompt (fast & reliable).
-            # Attempt 2: full prompt, no negative prompt.
-            base_desc = args.base_description or args.description
-            simple_desc = re.sub(r"\s+", " ", base_desc).strip()
-            simple_desc = simple_desc[:220] if simple_desc else (base_desc[:220] or base_desc)
-            prefixed_simple = f"A whimsical children's storybook illustration of: {simple_desc}"
-            retry_plans = [
-                (prefixed_simple, args.negative_prompt),
-                (base_desc, args.negative_prompt),
-            ]
-            for attempt, (desc, neg) in enumerate(retry_plans, start=1):
-                _attempt_t0 = time.monotonic()
-                effective_size = args.image_size
-                try:
-                    image_bytes, _, storybeat_text = await asyncio.wait_for(
-                        asyncio.to_thread(
-                            _generate_scene_still,
-                            desc,
-                            neg,
-                            args.aspect_ratio,
-                            effective_size,
-                            args.image_model,
-                            args.reference_images,
-                            args.illustration_style,
-                        ),
-                        timeout=45.0,
-                    )
-                    if image_bytes:
-                        _attempt_elapsed = int((time.monotonic() - _attempt_t0) * 1000)
-                        _total_elapsed = int((time.monotonic() - _pipeline_t0) * 1000)
-                        logger.info(f"⏱️ TIMING [pipeline] IMAGE GEN attempt {attempt} SUCCESS | attempt_ms={_attempt_elapsed} | total_ms={_total_elapsed} | bytes={len(image_bytes)} | session={session_id}")
-                        args.image_size = effective_size
+            render_args = args
+            for repair_attempt in range(2):
+                base_desc = render_args.base_description or render_args.description
+                simple_desc = re.sub(r"\s+", " ", base_desc).strip()
+                simple_desc = simple_desc[:220] if simple_desc else (base_desc[:220] or base_desc)
+                prefixed_simple = f"A whimsical children's storybook illustration of: {simple_desc}"
+                retry_plans = [
+                    (prefixed_simple, render_args.negative_prompt),
+                    (base_desc, render_args.negative_prompt),
+                ]
+                image_bytes = None
+                for attempt, (desc, neg) in enumerate(retry_plans, start=1):
+                    _attempt_t0 = time.monotonic()
+                    effective_size = render_args.image_size
+                    try:
+                        image_bytes, image_mime, storybeat_text = await asyncio.wait_for(
+                            asyncio.to_thread(
+                                _generate_scene_still,
+                                desc,
+                                neg,
+                                render_args.aspect_ratio,
+                                effective_size,
+                                render_args.image_model,
+                                render_args.reference_images,
+                                render_args.illustration_style,
+                                render_args.continuity_plan,
+                                render_args.active_character_bible,
+                            ),
+                            timeout=45.0,
+                        )
+                        if image_bytes:
+                            _attempt_elapsed = int((time.monotonic() - _attempt_t0) * 1000)
+                            _total_elapsed = int((time.monotonic() - _pipeline_t0) * 1000)
+                            logger.info(
+                                "⏱️ TIMING [pipeline] IMAGE GEN attempt %d SUCCESS | attempt_ms=%d | total_ms=%d | bytes=%d | session=%s",
+                                attempt,
+                                _attempt_elapsed,
+                                _total_elapsed,
+                                len(image_bytes),
+                                session_id,
+                            )
+                            render_args.image_size = effective_size
+                            if session_id and session_id in _session_cancel_current:
+                                superseded_render = True
+                            break
+                    except Exception as exc:
                         if session_id and session_id in _session_cancel_current:
-                            superseded_render = True
-                        break  # success
-                except Exception as exc:
-                    if session_id and session_id in _session_cancel_current:
-                        logger.info(
-                            "Abandoning superseded scene render for session %s after attempt %d failure: %s",
-                            session_id,
-                            attempt,
-                            exc,
-                        )
-                        raise _SupersededSceneRequest("newer scene queued during retry window") from exc
-                    if attempt < len(retry_plans):
-                        wait = 0.4 if attempt == 1 else 0.6
-                        logger.warning(
-                            "Image generation attempt %d/%d failed (size=%s): %s — "
-                            "waiting %.1fs before retry.",
-                            attempt, len(retry_plans), effective_size, exc, wait,
-                        )
-                        await asyncio.sleep(wait)
-                    else:
-                        raise  # propagate after final attempt
+                            logger.info(
+                                "Abandoning superseded scene render for session %s after attempt %d failure: %s",
+                                session_id,
+                                attempt,
+                                exc,
+                            )
+                            raise _SupersededSceneRequest("newer scene queued during retry window") from exc
+                        if attempt < len(retry_plans):
+                            wait = 0.4 if attempt == 1 else 0.6
+                            logger.warning(
+                                "Image generation attempt %d/%d failed (size=%s): %s — "
+                                "waiting %.1fs before retry.",
+                                attempt,
+                                len(retry_plans),
+                                effective_size,
+                                exc,
+                                wait,
+                            )
+                            await asyncio.sleep(wait)
+                        else:
+                            raise
+                if not image_bytes:
+                    raise RuntimeError("Image generation completed without bytes.")
+                audit_payload = await _audit_scene_visual_continuity(
+                    image_bytes=image_bytes,
+                    image_mime=image_mime,
+                    args=render_args,
+                )
+                args = render_args
+                if session_id and audit_payload:
+                    cached_state = load_storybook_resume_state(session_id)
+                    cached_state["last_scene_visual_audit"] = dict(audit_payload or {})
+                    cache_storybook_state(session_id, cached_state)
+                if isinstance(audit_payload, Mapping):
+                    audit_history.append(dict(audit_payload))
+                repaired_args = _repair_visual_args_from_audit(render_args, audit_payload)
+                if repaired_args is None or repair_attempt >= 1:
+                    break
+                logger.info(
+                    "Scene visual audit requested one repair retry for session %s: %s",
+                    session_id,
+                    _normalize_text_fragment(audit_payload.get("repair_prompt_suffix", "") if isinstance(audit_payload, Mapping) else "", limit=180),
+                )
+                render_args = repaired_args
         _gen_total = int((time.monotonic() - _pipeline_t0) * 1000)
         logger.info(f"⏱️ TIMING [pipeline] IMAGE GEN COMPLETE | total_ms={_gen_total} | raw_bytes={len(image_bytes)} | session={session_id}")
         if session_id:
             _session_image_backoff_until.pop(session_id, None)
         if session_id and session_id in _session_cancel_current:
             raise _SupersededSceneRequest("newer scene queued before delivery encode")
+        audit_feedback = build_scene_visual_audit_feedback_signal(
+            audit_history,
+            original_prompt_text=audit_learning_prompt_text,
+            final_prompt_config={
+                "continuity_plan": dict(args.continuity_plan or {}),
+                "reference_images": list(args.reference_images or []),
+                "image_model": args.image_model,
+                "image_size": args.image_size,
+                "aspect_ratio": args.aspect_ratio,
+            },
+        )
+        if audit_feedback:
+            schedule_background_task(
+                asyncio.to_thread(
+                    record_prompt_feedback,
+                    "interactive_scene_visual",
+                    outcome=str(audit_feedback.get("outcome", "audit_observed")),
+                    issues=list(audit_feedback.get("issues", []) or []),
+                    issue_tags=list(audit_feedback.get("issue_tags", []) or []),
+                    prompt_text=audit_learning_prompt_text,
+                    session_id=session_id or "",
+                    metadata=dict(audit_feedback.get("metadata", {}) or {}),
+                    force_log=True,
+                )
+            )
         
         _delivery_t0 = time.monotonic()
         transport_bytes, transport_mime = _encode_transport_image(
@@ -1760,6 +3224,13 @@ async def _run_visual_pipeline(
                 tool_context.state["previous_scene_visual_summary"] = scene_visual_summary
                 if not str(tool_context.state.get("canonical_scene_visual_summary", "") or "").strip():
                     tool_context.state["canonical_scene_visual_summary"] = scene_visual_summary
+        focused_character_references = await _detect_character_reference_crops(
+            image_bytes=image_bytes,
+            image_mime=image_mime,
+            active_character_bible=args.active_character_bible,
+        )
+        if audit_payload and tool_context and isinstance(getattr(tool_context, "state", None), dict):
+            tool_context.state["last_scene_visual_audit"] = dict(audit_payload or {})
 
         # 2. Background asset prep/upload: persistence matters for theater mode and
         # remakes, but it should not delay first paint on slower phones.
@@ -1799,6 +3270,7 @@ async def _run_visual_pipeline(
                     gcs_uri=gcs_uri,
                     thumbnail_b64=thumbnail_b64,
                     thumbnail_mime=thumbnail_mime,
+                    focused_character_references=focused_character_references,
                     request_id=args.request_id,
                     preview_image_url=still_url,
                 )
@@ -1817,6 +3289,7 @@ async def _run_visual_pipeline(
                     gcs_uri=None,
                     thumbnail_b64=None,
                     thumbnail_mime=None,
+                    focused_character_references=focused_character_references,
                     request_id=args.request_id,
                     preview_image_url=still_url,
                 )
@@ -2174,7 +3647,7 @@ async def assemble_story_video(
         allowed_to_finish, current_turn, max_turns, turns_remaining = _story_end_progress(tool_context)
         if not allowed_to_finish:
             logger.info(
-                "assemble_story_video blocked early for %s at turn %s/%s",
+                "assemble_story_video blocked early for %s at page %s/%s",
                 args.session_id,
                 current_turn,
                 max_turns,
@@ -2185,7 +3658,7 @@ async def assemble_story_video(
                     "then give one final choice and keep the story going."
                 )
             return (
-                f"System: Not movie time yet. There are still {turns_remaining} story turns left. "
+                f"System: Not movie time yet. There are still {turns_remaining} story pages left. "
                 "Keep the adventure going and give the child one fun next choice."
             )
 
@@ -2346,9 +3819,26 @@ def _clean_storybook_title(raw: str) -> str:
     title = re.sub(r"\s+", " ", title).strip()
     if re.search(r"reading\s+rainbow", title, re.IGNORECASE):
         return ""
+    weak_leads = {"what", "where", "when", "why", "how", "let", "lets", "can"}
+    generic_nouns = {
+        "drawing", "image", "picture", "illustration", "scene", "page", "story", "book", "adventure"
+    }
     words = title.split()
     if len(words) > 8:
         title = " ".join(words[:8])
+        words = title.split()
+    lowered_words = [
+        re.sub(r"[^a-z']", "", word.lower())
+        for word in words
+        if re.sub(r"[^a-z']", "", word.lower())
+    ]
+    content_words = [word for word in lowered_words if word not in {"a", "an", "the", "and", "of"}]
+    if not content_words:
+        return ""
+    if content_words[0] in weak_leads and all(word in generic_nouns or word in weak_leads for word in content_words[1:]):
+        return ""
+    if all(word in generic_nouns or word in weak_leads for word in content_words):
+        return ""
     return title
 
 
@@ -2364,7 +3854,9 @@ def _heuristic_storybook_title(
         "there", "their", "your", "have", "into", "over", "under", "across", "about",
         "story", "book", "books", "child", "little", "gentle", "glowing", "bright",
         "light", "magic", "magical", "soft", "warm", "night", "cloud", "clouds",
-        "reading", "rainbow", "disney", "pixar", "friend",
+        "reading", "rainbow", "disney", "pixar", "friend", "what", "where", "when",
+        "why", "how", "drawing", "image", "picture", "illustration", "scene", "page",
+        "pages", "show", "shows",
     }
     counts = Counter(w.lower() for w in words if w.lower() not in stopwords)
     top = [w.title() for w, _ in counts.most_common(3)]
@@ -2522,6 +4014,10 @@ Ignore:
 
 Use `warnings` for minor observations.
 Use `issues` only for problems that should influence future prompting.
+Return compact JSON only.
+Keep every string under 180 characters.
+Use at most 2 `global_feedback` items, 4 `warnings`, and 4 `issues`.
+Do not include markdown, prose outside JSON, or extra keys.
 
 Return JSON only in this schema:
 {{
@@ -2540,7 +4036,7 @@ Scene cards:
 {json.dumps(review_cards, indent=2)}
 """.strip()
 
-    contents: list[Any] = [prompt]
+    image_contents: list[Any] = []
     for idx, still_path in enumerate(still_paths, start=1):
         try:
             image_bytes = still_path.read_bytes()
@@ -2549,25 +4045,49 @@ Scene cards:
         thumb = _make_thumbnail_b64(image_bytes, max_side=384)
         if thumb:
             image_bytes = base64.b64decode(thumb[0])
-        contents.append(f"Scene image {idx}")
-        contents.append(_make_image_part(image_bytes))
+        image_contents.append(f"Scene image {idx}")
+        image_contents.append(_make_image_part(image_bytes))
 
     try:
         client = _build_google_genai_client()
-        response = client.models.generate_content(
-            model=_post_movie_review_model(),
-            contents=contents,
-            config=google_genai.types.GenerateContentConfig(
-                temperature=0.2,
-                max_output_tokens=2048,
-                response_mime_type="application/json",
-            ),
-        )
     except Exception as exc:
         logger.warning("Post-movie meta review failed: %s", exc)
         return None
-
-    payload = _extract_json_block(_extract_response_text(response))
+    payload: dict[str, Any] | None = None
+    for attempt in range(1, 3):
+        retry_suffix = ""
+        if attempt > 1:
+            retry_suffix = (
+                "\n\nRetry requirements: the previous response was rejected because it was not valid JSON for "
+                "the required schema. Return compact JSON only, with no markdown, no commentary, and no extra keys."
+            )
+        contents: list[Any] = [f"{prompt}{retry_suffix}", *image_contents]
+        try:
+            response = client.models.generate_content(
+                model=_post_movie_review_model(),
+                contents=contents,
+                config=google_genai.types.GenerateContentConfig(
+                    temperature=0.0,
+                    max_output_tokens=2048,
+                    thinking_config=google_genai.types.ThinkingConfig(thinking_budget=0),
+                    response_mime_type="application/json",
+                    response_json_schema=PostMovieMetaReview.model_json_schema(),
+                ),
+            )
+        except Exception as exc:
+            logger.warning("Post-movie meta review attempt %d failed: %s", attempt, exc)
+            continue
+        payload = _require_typed_model_response(
+            response,
+            PostMovieMetaReview,
+            label="Post-movie meta review",
+        )
+        if isinstance(payload, dict):
+            break
+        logger.warning(
+            "Post-movie meta review attempt %d returned no typed schema payload; retrying.",
+            attempt,
+        )
     if not isinstance(payload, dict):
         return None
 
@@ -2876,7 +4396,7 @@ async def generate_trading_card(
         allowed_to_finish, current_turn, max_turns, _ = _story_end_progress(tool_context)
         if not allowed_to_finish:
             logger.info(
-                "generate_trading_card blocked early for %s at turn %s/%s",
+                "generate_trading_card blocked early for %s at page %s/%s",
                 session_id,
                 current_turn,
                 max_turns,
@@ -2889,15 +4409,15 @@ async def generate_trading_card(
 
 
 def _split_sentences(text: str) -> list[str]:
-    parts = re.split(r"(?<=[.!?])\s+", text.strip())
-    return [p.strip() for p in parts if p.strip()]
+    return shared_split_story_sentences(text)
 
 
 def _clean_story_text(text: str) -> str:
-    if not text:
+    cleaned = shared_clean_story_text(text)
+    if not cleaned:
         return ""
-    cleaned = _CTRL_TOKEN_RE.sub("", text)
     cleaned = re.sub(r"🌟\s*What should we do\?.*?(\n|$)", " ", cleaned)
+    cleaned = re.sub(r"(?:Should we|Do you want to|Or maybe)\b.*$", " ", cleaned, flags=re.IGNORECASE)
     cleaned = re.sub(r"\s+", " ", cleaned)
     return cleaned.strip()
 
@@ -2920,18 +4440,11 @@ def _simplify_for_readalong(text: str, max_words: int = 8) -> str:
     cleaned = _clean_story_text(text)
     if not cleaned:
         return ""
-    sentences = _split_sentences(cleaned)
-    if not sentences:
-        return ""
-    first = sentences[0]
-    first = re.split(r",|;|\\b(and|but|so)\\b", first, maxsplit=1, flags=re.IGNORECASE)[0].strip()
+    first = shared_truncate_story_sentence(cleaned, max_words=max_words)
+    first = re.sub(r"^(look|see|wow|hey|oh|oh wow)\b[!,.:\s]*", "", first, flags=re.IGNORECASE).strip()
     if not first:
         return ""
-    words = first.split()
-    if len(words) > max_words:
-        first = " ".join(words[:max_words]).rstrip(".,!?") + "."
-    else:
-        first = first.rstrip(".,!?") + "."
+    first = first.rstrip(".,!?") + "."
     return first
 
 
@@ -3269,6 +4782,72 @@ def _wrap_caption(text: str, width: int = 26, max_lines: int = 2) -> str:
     return "\n".join(lines[:max_lines])
 
 
+_STORYBOOK_CAPTION_FONT_CANDIDATES: tuple[Path, ...] = (
+    Path(__file__).resolve().parent.parent / "shared" / "assets" / "fonts" / "Fredoka.ttf",
+    Path("/app/shared/assets/fonts/Fredoka.ttf"),
+)
+
+
+def _storybook_caption_font_option() -> str:
+    for candidate in _STORYBOOK_CAPTION_FONT_CANDIDATES:
+        if candidate.exists():
+            return f"fontfile={candidate}"
+    return "font=Sans"
+
+
+def _storybook_burned_caption_segments(
+    scene_durations: list[float],
+    fallback_lines: list[str],
+    story_pages: list[dict[str, Any]] | None = None,
+    child_age: int | str | None = None,
+    storybook_movie_pacing: str | None = None,
+    cover_offset: int = 0,
+) -> list[tuple[float, float, str, int]]:
+    segments: list[tuple[float, float, str, int]] = []
+    cursor = 0.0
+    pages = list(story_pages or [])
+    for idx, duration in enumerate(scene_durations):
+        page_idx = idx - cover_offset
+        text = ""
+        page_number = page_idx + 1
+        if page_idx < 0:
+            cursor += float(duration)
+            continue
+        primary_text = ""
+        if page_idx < len(pages):
+            primary_text = str(pages[page_idx].get("storybeat_text", "") or "").strip()
+        fallback_text = str(fallback_lines[idx] or "").strip() if idx < len(fallback_lines) else ""
+        text = choose_readalong_text(primary_text, fallback_text, child_age, storybook_movie_pacing)
+        if text:
+            segments.append((cursor, cursor + float(duration), text, page_number))
+        cursor += float(duration)
+    return segments
+
+
+def _storybook_burned_caption_filtergraph(
+    segments: list[tuple[float, float, str, int]],
+) -> list[str]:
+    filters: list[str] = []
+    font_option = _storybook_caption_font_option()
+    for start_s, end_s, text, page_number in segments:
+        wrapped = _wrap_caption(text, width=52)
+        if not wrapped:
+            continue
+        escaped_text = _ffmpeg_escape(wrapped.replace("'", "’"))
+        escaped_page = _ffmpeg_escape(f"Page {page_number}")
+        enable_expr = f"between(t\\,{start_s:.3f}\\,{end_s:.3f})"
+        filters.extend([
+            f"drawbox=x=26:y=ih-156:w=iw-52:h=138:color=0xF8EEDC@0.97:t=fill:enable='{enable_expr}'",
+            f"drawbox=x=26:y=ih-156:w=iw-52:h=138:color=0xC5AA79@0.30:t=2:enable='{enable_expr}'",
+            f"drawbox=x=44:y=ih-110:w=iw-88:h=1:color=0xC5AA79@0.42:t=fill:enable='{enable_expr}'",
+            f"drawbox=x=44:y=ih-142:w=94:h=32:color=0xEBDDC6@0.98:t=fill:enable='{enable_expr}'",
+            f"drawbox=x=44:y=ih-142:w=94:h=32:color=0xC5AA79@0.36:t=2:enable='{enable_expr}'",
+            f"drawtext=text='{escaped_page}':fontcolor=0x8A6233:fontsize=18:x=57:y=h-136:{font_option}:enable='{enable_expr}'",
+            f"drawtext=text='{escaped_text}':fontcolor=0x2A1842:fontsize=34:x=52:y=h-114:{font_option}:line_spacing=8:enable='{enable_expr}'",
+        ])
+    return filters
+
+
 def _format_srt(entries: list[tuple[float, float, str]]) -> str:
     def _ts(seconds: float) -> str:
         ms = int(max(0.0, seconds) * 1000)
@@ -3336,7 +4915,148 @@ def _ffprobe_has_audio_stream(path: Path) -> bool:
         return False
 
 
-def _synthesize_tts_elevenlabs(text: str) -> bytes | None:
+def _slow_storybook_tts_audio(
+    audio_bytes: bytes | None,
+    *,
+    child_age: int | str | None,
+    storybook_movie_pacing: str | None,
+) -> bytes | None:
+    if not audio_bytes:
+        return audio_bytes
+    tempo = storybook_tts_tempo_factor(child_age, storybook_movie_pacing)
+    if abs(tempo - 1.0) < 0.01:
+        return audio_bytes
+
+    def _convert(source_path: Path) -> bytes | None:
+        ffmpeg = shutil.which("ffmpeg")
+        if not ffmpeg:
+            return audio_bytes
+        output_path = source_path.with_name("tts_output.mp3")
+        try:
+            subprocess.run(
+                [
+                    ffmpeg,
+                    "-y",
+                    "-i",
+                    str(source_path),
+                    "-filter:a",
+                    f"atempo={tempo:.3f}",
+                    "-codec:a",
+                    "libmp3lame",
+                    "-q:a",
+                    "3",
+                    str(output_path),
+                ],
+                check=True,
+                capture_output=True,
+            )
+            return output_path.read_bytes()
+        except Exception:
+            return audio_bytes
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp_path = Path(tmpdir)
+        input_suffix = ".wav" if audio_bytes.startswith(b"RIFF") else ".mp3"
+        input_path = tmp_path / f"tts_input{input_suffix}"
+        input_path.write_bytes(audio_bytes)
+        return _convert(input_path)
+
+
+def _wrap_pcm_as_wav(pcm_bytes: bytes, *, sample_rate_hz: int = 24000) -> bytes:
+    if not pcm_bytes or pcm_bytes.startswith(b"RIFF"):
+        return pcm_bytes
+    buffer = io.BytesIO()
+    with wave.open(buffer, "wb") as wav_file:
+        wav_file.setnchannels(1)
+        wav_file.setsampwidth(2)
+        wav_file.setframerate(sample_rate_hz)
+        wav_file.writeframes(pcm_bytes)
+    return buffer.getvalue()
+
+
+def _convert_audio_bytes_to_mp3(audio_bytes: bytes | None, *, source_suffix: str = ".wav") -> bytes | None:
+    if not audio_bytes:
+        return None
+    ffmpeg = shutil.which("ffmpeg")
+    if not ffmpeg:
+        return audio_bytes
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp_path = Path(tmpdir)
+        input_path = tmp_path / f"tts_input{source_suffix}"
+        output_path = tmp_path / "tts_output.mp3"
+        input_path.write_bytes(audio_bytes)
+        try:
+            subprocess.run(
+                [
+                    ffmpeg,
+                    "-y",
+                    "-i",
+                    str(input_path),
+                    "-codec:a",
+                    "libmp3lame",
+                    "-q:a",
+                    "3",
+                    str(output_path),
+                ],
+                check=True,
+                capture_output=True,
+            )
+            return output_path.read_bytes()
+        except Exception:
+            return audio_bytes
+
+
+def _extract_inline_audio_data(response: Any) -> tuple[bytes | None, str | None]:
+    candidates = getattr(response, "candidates", None) or []
+    for candidate in candidates:
+        content = getattr(candidate, "content", None)
+        parts = getattr(content, "parts", None) or []
+        for part in parts:
+            inline = getattr(part, "inline_data", None)
+            if not inline:
+                continue
+            data = getattr(inline, "data", None)
+            if not data:
+                continue
+            mime_type = getattr(inline, "mime_type", None)
+            return bytes(data), str(mime_type or "").strip() or None
+    return None, None
+
+
+def _storybook_gemini_tts_model() -> str:
+    return os.environ.get("STORYBOOK_GEMINI_TTS_MODEL", "gemini-2.5-flash-preview-tts").strip()
+
+
+def _storybook_gemini_tts_voice() -> str:
+    return os.environ.get("STORYBOOK_GEMINI_TTS_VOICE", "Kore").strip()
+
+
+def _build_gemini_tts_prompt(
+    text: str,
+    *,
+    child_age: int | str | None = None,
+    storybook_movie_pacing: str | None = None,
+) -> str:
+    age_band = child_age_band(child_age)
+    pacing = normalize_storybook_movie_pacing(storybook_movie_pacing)
+    pacing_note = {
+        "read_to_me": "Read it clearly and a little more narratively, with gentle warmth.",
+        "fast_movie": "Read it clearly with a touch more momentum, but stay calm and child-friendly.",
+    }.get(pacing, "Read it clearly, warmly, and at an easy read-along pace for a child.")
+    return (
+        f"Read this one-sentence storybook page aloud for a child age band {age_band}. "
+        f"{pacing_note} Keep the delivery expressive, cozy, and easy to follow. "
+        "Do not add extra words. Read exactly this line: "
+        f"{text}"
+    )
+
+
+def _synthesize_tts_elevenlabs(
+    text: str,
+    *,
+    child_age: int | str | None = None,
+    storybook_movie_pacing: str | None = None,
+) -> bytes | None:
     api_key = os.environ.get("ELEVENLABS_API_KEY", "").strip()
     voice_id = os.environ.get("ELEVENLABS_VOICE_ID", "").strip() or _DEFAULT_ELEVENLABS_VOICE_ID
     if not api_key or not voice_id or not text:
@@ -3367,13 +5087,69 @@ def _synthesize_tts_elevenlabs(text: str) -> bytes | None:
         with httpx.Client(timeout=30.0) as client:
             resp = client.post(endpoint, headers=headers, json=payload)
             if resp.status_code < 300 and resp.headers.get("content-type", "").startswith("audio"):
-                return resp.content
+                return _slow_storybook_tts_audio(
+                    resp.content,
+                    child_age=child_age,
+                    storybook_movie_pacing=storybook_movie_pacing,
+                )
     except Exception:
         return None
     return None
 
 
-def _synthesize_tts_local(text: str) -> bytes | None:
+def _synthesize_tts_gemini_only(
+    text: str,
+    *,
+    child_age: int | str | None = None,
+    storybook_movie_pacing: str | None = None,
+) -> bytes | None:
+    api_key = os.environ.get("GOOGLE_API_KEY", "").strip()
+    if not text or not api_key:
+        return None
+    try:
+        client = google_genai.Client(api_key=api_key)
+        response = client.models.generate_content(
+            model=_storybook_gemini_tts_model(),
+            contents=_build_gemini_tts_prompt(
+                text,
+                child_age=child_age,
+                storybook_movie_pacing=storybook_movie_pacing,
+            ),
+            config=google_genai.types.GenerateContentConfig(
+                response_modalities=[google_genai.types.Modality.AUDIO],
+                speech_config=google_genai.types.SpeechConfig(
+                    voice_config=google_genai.types.VoiceConfig(
+                        prebuilt_voice_config=google_genai.types.PrebuiltVoiceConfig(
+                            voice_name=_storybook_gemini_tts_voice(),
+                        )
+                    )
+                ),
+            ),
+        )
+        audio_bytes, mime_type = _extract_inline_audio_data(response)
+        if not audio_bytes:
+            return None
+        mime_lower = str(mime_type or "").lower()
+        if "l16" in mime_lower or "pcm" in mime_lower:
+            audio_bytes = _wrap_pcm_as_wav(audio_bytes)
+            audio_bytes = _convert_audio_bytes_to_mp3(audio_bytes, source_suffix=".wav") or audio_bytes
+        elif audio_bytes.startswith(b"RIFF"):
+            audio_bytes = _convert_audio_bytes_to_mp3(audio_bytes, source_suffix=".wav") or audio_bytes
+        return _slow_storybook_tts_audio(
+            audio_bytes,
+            child_age=child_age,
+            storybook_movie_pacing=storybook_movie_pacing,
+        )
+    except Exception:
+        return None
+
+
+def _synthesize_tts_local(
+    text: str,
+    *,
+    child_age: int | str | None = None,
+    storybook_movie_pacing: str | None = None,
+) -> bytes | None:
     """Best-effort local TTS fallback for dev (macOS say / Linux espeak)."""
     if not text:
         return None
@@ -3429,7 +5205,11 @@ def _synthesize_tts_local(text: str) -> bytes | None:
                 )
             except Exception:
                 return None
-            return _to_mp3(aiff_path)
+            return _slow_storybook_tts_audio(
+                _to_mp3(aiff_path),
+                child_age=child_age,
+                storybook_movie_pacing=storybook_movie_pacing,
+            )
 
         if sys.platform.startswith("linux"):
             espeak = shutil.which("espeak") or shutil.which("espeak-ng")
@@ -3444,22 +5224,46 @@ def _synthesize_tts_local(text: str) -> bytes | None:
                 )
             except Exception:
                 return None
-            return _to_mp3(wav_path)
+            return _slow_storybook_tts_audio(
+                _to_mp3(wav_path),
+                child_age=child_age,
+                storybook_movie_pacing=storybook_movie_pacing,
+            )
 
     return None
 
 
-def _synthesize_tts_google(text: str) -> bytes | None:
+def _synthesize_tts_google(
+    text: str,
+    *,
+    child_age: int | str | None = None,
+    storybook_movie_pacing: str | None = None,
+) -> bytes | None:
     if not text:
         return None
     # Prefer ElevenLabs when available; fall back to Google TTS and local TTS.
-    audio = _synthesize_tts_elevenlabs(text)
+    audio = _synthesize_tts_elevenlabs(
+        text,
+        child_age=child_age,
+        storybook_movie_pacing=storybook_movie_pacing,
+    )
+    if audio:
+        return audio
+    audio = _synthesize_tts_gemini_only(
+        text,
+        child_age=child_age,
+        storybook_movie_pacing=storybook_movie_pacing,
+    )
     if audio:
         return audio
     try:
         from google.cloud import texttospeech
     except Exception:
-        return _synthesize_tts_local(text)
+        return _synthesize_tts_local(
+            text,
+            child_age=child_age,
+            storybook_movie_pacing=storybook_movie_pacing,
+        )
     try:
         client = texttospeech.TextToSpeechClient()
         language_code = os.environ.get("STORYBOOK_TTS_LANG", "en-US")
@@ -3468,6 +5272,7 @@ def _synthesize_tts_google(text: str) -> bytes | None:
             speaking_rate = float(os.environ.get("STORYBOOK_TTS_RATE", "0.9"))
         except Exception:
             speaking_rate = 0.9
+        speaking_rate = storybook_tts_speaking_rate(speaking_rate, child_age, storybook_movie_pacing)
         try:
             pitch = float(os.environ.get("STORYBOOK_TTS_PITCH", "0.0"))
         except Exception:
@@ -3489,7 +5294,11 @@ def _synthesize_tts_google(text: str) -> bytes | None:
         )
         return response.audio_content
     except Exception:
-        return _synthesize_tts_local(text)
+        return _synthesize_tts_local(
+            text,
+            child_age=child_age,
+            storybook_movie_pacing=storybook_movie_pacing,
+        )
 
 
 def _storybook_music_provider() -> str:
@@ -3808,20 +5617,30 @@ def _merge_storybook_state(session_id: str, tool_context: ToolContext | None) ->
     if tool_state:
         merged.update(tool_state)
         cache_storybook_state(session_id, tool_state)
+    ensure_story_continuity_state(merged)
+    _ensure_visual_memory_state(merged)
     return merged
 
 
 def _storybook_scene_sources(state: dict[str, Any]) -> list[str]:
     story_pages = _story_pages_from_state(state)
     if story_pages:
+        raw_scene_urls = list(state.get("scene_asset_urls", []) or [])
+        raw_scene_gcs_uris = list(state.get("scene_asset_gcs_uris", []) or [])
         scene_sources: list[str] = []
-        for page in story_pages:
+        for idx, page in enumerate(story_pages):
             gcs_uri = str(page.get("gcs_uri", "") or "").strip()
             image_url = str(page.get("image_url", "") or "").strip()
+            if gcs_uri.startswith("data:image/svg+xml"):
+                gcs_uri = ""
+            if image_url.startswith("data:image/svg+xml"):
+                image_url = ""
+            if not gcs_uri and idx < len(raw_scene_gcs_uris):
+                gcs_uri = str(raw_scene_gcs_uris[idx] or "").strip()
+            if not image_url and idx < len(raw_scene_urls):
+                image_url = str(raw_scene_urls[idx] or "").strip()
             chosen = gcs_uri or image_url
-            if chosen.startswith("data:image/svg+xml"):
-                chosen = ""
-            if chosen:
+            if chosen and not chosen.startswith("data:image/svg+xml"):
                 scene_sources.append(chosen)
         if scene_sources:
             return scene_sources
@@ -3860,6 +5679,7 @@ def _run_fast_storybook_sync(session_id: str, state: dict[str, Any]) -> None:
     scene_descriptions = list(state.get("scene_descriptions", []) or [])
     child_name = str(state.get("child_name", "")).strip()
     child_age = state.get("child_age")
+    storybook_movie_pacing = _storybook_movie_pacing_from_state(state)
     title = _resolve_storybook_title(state)
     try:
         page_seconds = clamp_page_seconds(os.environ.get("STORYBOOK_PAGE_SECONDS", "4"))
@@ -3871,6 +5691,7 @@ def _run_fast_storybook_sync(session_id: str, state: dict[str, Any]) -> None:
         {
             "assembly_status": "reviewing_storyboard" if _env_enabled("ENABLE_STORYBOOK_DIRECTOR_WORKFLOW", default=True) else "assembling",
             "story_title": title,
+            "storybook_movie_pacing": storybook_movie_pacing,
             "storyboard_review": {
                 "status": "pending_director_workflow" if _env_enabled("ENABLE_STORYBOOK_DIRECTOR_WORKFLOW", default=True) else "skipped_fast_path",
                 "reason": "backend_fast_path_director_workflow" if _env_enabled("ENABLE_STORYBOOK_DIRECTOR_WORKFLOW", default=True) else "backend_still_only_fast_path",
@@ -4092,8 +5913,9 @@ def _run_fast_storybook_sync(session_id: str, state: dict[str, Any]) -> None:
         except Exception:
             sfx_max = clamp_sfx_max(None)
 
+        narration_source_texts = _storybook_narration_source_texts(state)
         default_narration_lines = _build_narration_segments(
-            scene_descriptions=scene_descriptions,
+            scene_descriptions=narration_source_texts or scene_descriptions,
             story_summary=story_summary,
             scene_count=len(frames),
             child_age=child_age,
@@ -4134,7 +5956,7 @@ def _run_fast_storybook_sync(session_id: str, state: dict[str, Any]) -> None:
 
         narration_lines = _normalize_storybook_narration_lines(
             list(studio_plan.get("narration_lines", []) or default_narration_lines),
-            scene_descriptions=scene_descriptions,
+            scene_descriptions=narration_source_texts or scene_descriptions,
             child_age=child_age,
         )
         expected_narration_count = sum(1 for line in narration_lines if str(line or "").strip())
@@ -4176,13 +5998,19 @@ def _run_fast_storybook_sync(session_id: str, state: dict[str, Any]) -> None:
             sfx_max=SFX_VOLUME_MAX,
         )
 
+        story_pages = _story_pages_from_state(state)
         narration_audio: list[Path | None] = [None] * len(narration_lines)
-        scene_durations: list[float] = [float(page_seconds)] * len(narration_lines)
+        narration_audio_seconds: list[float] = [0.0] * len(narration_lines)
         if enable_tts and narration_lines:
             max_tts_workers = max(1, min(len(narration_lines), 4))
             with ThreadPoolExecutor(max_workers=max_tts_workers) as executor:
                 future_map = {
-                    executor.submit(_synthesize_tts_google, line): idx
+                    executor.submit(
+                        _synthesize_tts_google,
+                        line,
+                        child_age=child_age,
+                        storybook_movie_pacing=storybook_movie_pacing,
+                    ): idx
                     for idx, line in enumerate(narration_lines)
                     if line
                 }
@@ -4200,7 +6028,25 @@ def _run_fast_storybook_sync(session_id: str, state: dict[str, Any]) -> None:
                     narration_audio[idx] = audio_path
                     audio_seconds = _ffprobe_duration(audio_path)
                     if audio_seconds > 0:
-                        scene_durations[idx] = max(page_seconds, audio_seconds + PAGE_SECONDS_NARRATION_BUFFER)
+                        narration_audio_seconds[idx] = audio_seconds
+        scene_durations: list[float] = []
+        for idx, line in enumerate(narration_lines):
+            primary_text = str(story_pages[idx].get("storybeat_text", "") or "").strip() if idx < len(story_pages) else ""
+            readalong_text = choose_readalong_text(
+                primary_text,
+                str(line or "").strip(),
+                child_age,
+                storybook_movie_pacing,
+            )
+            scene_durations.append(
+                storybook_page_duration_seconds(
+                    child_age=child_age,
+                    base_page_seconds=page_seconds,
+                    narration_seconds=narration_audio_seconds[idx] if idx < len(narration_audio_seconds) else 0.0,
+                    readalong_text=readalong_text,
+                    movie_pacing=storybook_movie_pacing,
+                )
+            )
         rendered_narration_count = (
             expected_narration_count if not enable_tts else sum(1 for path in narration_audio if path is not None)
         )
@@ -4602,20 +6448,16 @@ def _run_fast_storybook_sync(session_id: str, state: dict[str, Any]) -> None:
             )
             output_path = merged_path
 
-        if enable_captions and any(narration_lines):
-            drawtext_parts: list[str] = []
-            cursor = 0.0
-            for duration, line in zip(scene_durations, narration_lines):
-                if not line:
-                    cursor += duration
-                    continue
-                wrapped = _wrap_caption(line, width=30)
-                escaped = _ffmpeg_escape(wrapped)
-                drawtext_parts.append(
-                    f"drawtext=text='{escaped}':fontcolor=white:fontsize=46:x=(w-text_w)/2:y=h*0.10:box=1:boxcolor=0x00000099:boxborderw=18:font=Sans:shadowcolor=black:shadowx=2:shadowy=2:line_spacing=8:enable='between(t,{cursor:.3f},{cursor + duration:.3f})'"
-                )
-                cursor += duration
-            if drawtext_parts:
+        if enable_captions and scene_durations:
+            caption_segments = _storybook_burned_caption_segments(
+                scene_durations=scene_durations,
+                fallback_lines=narration_lines,
+                story_pages=_story_pages_from_state(state),
+                child_age=child_age,
+                storybook_movie_pacing=storybook_movie_pacing,
+            )
+            caption_filters = _storybook_burned_caption_filtergraph(caption_segments)
+            if caption_filters:
                 captioned_path = tmp_path / "storybook_captioned.mp4"
                 subprocess.run(
                     [
@@ -4624,7 +6466,7 @@ def _run_fast_storybook_sync(session_id: str, state: dict[str, Any]) -> None:
                         "-i",
                         str(output_path),
                         "-vf",
-                        ",".join(drawtext_parts),
+                        ",".join(caption_filters),
                         "-c:a",
                         "copy",
                         "-movflags",
@@ -4674,6 +6516,7 @@ def _run_fast_storybook_sync(session_id: str, state: dict[str, Any]) -> None:
                 "assembly_status": "complete",
                 "final_video_url": final_url,
                 "final_video_gcs_uri": final_gcs_uri,
+                "storybook_movie_pacing": storybook_movie_pacing,
                 "story_title": title,
                 "narration_lines": [line for line in narration_lines if line],
                 "audio_expected": audio_expected,
@@ -4701,6 +6544,7 @@ def _run_fast_storybook_sync(session_id: str, state: dict[str, Any]) -> None:
                 "assembly_status": "complete",
                 "final_video_url": final_url,
                 "final_video_gcs_uri": final_gcs_uri,
+                "storybook_movie_pacing": storybook_movie_pacing,
                 "story_title": title,
                 "narration_lines": [line for line in narration_lines if line],
                 "audio_expected": audio_expected,
@@ -4729,12 +6573,18 @@ def _run_fast_storybook_sync(session_id: str, state: dict[str, Any]) -> None:
         }
         schedule_background_task(asyncio.to_thread(_run_post_movie_meta_review_sync, session_id, review_state))
         async def _publish_theater_ready() -> None:
+            lighting_cues = [
+                dict(item)
+                for item in list(state.get("theater_lighting_cues", []) or [])
+                if isinstance(item, dict)
+            ]
             publish_session_event(
                 session_id,
                 theater_mode_event(
                     mp4_url=final_url,
                     trading_card_url=str(state.get("trading_card_url", "")).strip() or None,
                     narration_lines=[line for line in narration_lines if line],
+                    lighting_cues=lighting_cues or None,
                     audio_available=audio_available,
                     story_title=title,
                     child_name=str(state.get("child_name", "")).strip() or None,
@@ -4816,6 +6666,7 @@ async def _run_local_storybook(session_id: str, tool_context: ToolContext | None
         scene_descriptions = _storybook_scene_descriptions(state)
         child_name = str(state.get("child_name", "")).strip()
         child_age = state.get("child_age")
+        storybook_movie_pacing = _storybook_movie_pacing_from_state(state)
         title = _resolve_storybook_title(state)
         try:
             page_seconds = clamp_page_seconds(os.environ.get("STORYBOOK_PAGE_SECONDS", "4"))
@@ -4842,8 +6693,9 @@ async def _run_local_storybook(session_id: str, tool_context: ToolContext | None
                     )
                 )
 
+            narration_source_texts = _storybook_narration_source_texts(state)
             default_narration_lines = _build_narration_segments(
-                scene_descriptions=scene_descriptions,
+                scene_descriptions=narration_source_texts or scene_descriptions,
                 story_summary=story_summary,
                 scene_count=len(frames),
                 child_age=child_age,
@@ -4906,7 +6758,7 @@ async def _run_local_storybook(session_id: str, tool_context: ToolContext | None
                 logger.warning("Local storybook studio workflow failed for %s: %s", session_id, exc, exc_info=True)
             narration_lines = _normalize_storybook_narration_lines(
                 list(studio_plan.get("narration_lines", []) or default_narration_lines),
-                scene_descriptions=scene_descriptions,
+                scene_descriptions=narration_source_texts or scene_descriptions,
                 child_age=child_age,
             )
             expected_narration_count = sum(1 for line in narration_lines if str(line or "").strip())
@@ -4935,8 +6787,9 @@ async def _run_local_storybook(session_id: str, tool_context: ToolContext | None
                 sfx_max=SFX_VOLUME_MAX,
             )
 
+            story_pages = _story_pages_from_state(state)
             narration_audio: list[Path | None] = [None] * len(narration_lines)
-            scene_durations: list[float] = [float(page_seconds)] * len(narration_lines)
+            narration_audio_seconds: list[float] = [0.0] * len(narration_lines)
             if enable_tts and narration_lines:
                 try:
                     local_tts_concurrency = int(os.environ.get("LOCAL_STORYBOOK_TTS_CONCURRENCY", "4"))
@@ -4948,7 +6801,12 @@ async def _run_local_storybook(session_id: str, tool_context: ToolContext | None
                     if not line:
                         return idx, None, 0.0
                     async with tts_semaphore:
-                        audio_bytes = await asyncio.to_thread(_synthesize_tts_google, line)
+                        audio_bytes = await asyncio.to_thread(
+                            _synthesize_tts_google,
+                            line,
+                            child_age=child_age,
+                            storybook_movie_pacing=storybook_movie_pacing,
+                        )
                     if not audio_bytes:
                         return idx, None, 0.0
                     audio_path = tmp_path / f"narration_{idx:03d}.mp3"
@@ -4967,7 +6825,25 @@ async def _run_local_storybook(session_id: str, tool_context: ToolContext | None
                     idx, audio_path, duration = result
                     narration_audio[idx] = audio_path
                     if duration > 0:
-                        scene_durations[idx] = max(page_seconds, duration + PAGE_SECONDS_NARRATION_BUFFER)
+                        narration_audio_seconds[idx] = duration
+            scene_durations: list[float] = []
+            for idx, line in enumerate(narration_lines):
+                primary_text = str(story_pages[idx].get("storybeat_text", "") or "").strip() if idx < len(story_pages) else ""
+                readalong_text = choose_readalong_text(
+                    primary_text,
+                    str(line or "").strip(),
+                    child_age,
+                    storybook_movie_pacing,
+                )
+                scene_durations.append(
+                    storybook_page_duration_seconds(
+                        child_age=child_age,
+                        base_page_seconds=page_seconds,
+                        narration_seconds=narration_audio_seconds[idx] if idx < len(narration_audio_seconds) else 0.0,
+                        readalong_text=readalong_text,
+                        movie_pacing=storybook_movie_pacing,
+                    )
+                )
             rendered_narration_count = (
                 expected_narration_count if not enable_tts else sum(1 for path in narration_audio if path is not None)
             )
@@ -5376,33 +7252,16 @@ async def _run_local_storybook(session_id: str, tool_context: ToolContext | None
                 video_with_audio = merged_path
 
             final_path = video_with_audio
-            if enable_captions and any(narration_lines):
-                # Build upper-frame book-style drawtext (per-page, time-gated).
-                drawtext_parts: list[str] = []
-                t = 0.0
-                for duration, line in zip(scene_durations, narration_lines):
-                    if not line:
-                        t += duration
-                        continue
-                    wrapped = _wrap_caption(line, width=30)
-                    escaped = _ffmpeg_escape(wrapped)
-                    draw = (
-                        f"drawtext=text='{escaped}'"
-                        f":fontcolor=white"
-                        f":fontsize=46"
-                        f":x=(w-text_w)/2"
-                        f":y=h*0.10"
-                        f":box=1"
-                        f":boxcolor=0x00000099"
-                        f":boxborderw=18"
-                        f":font=Sans"
-                        f":shadowcolor=black:shadowx=2:shadowy=2"
-                        f":line_spacing=8"
-                        f":enable='between(t,{t:.3f},{t+duration:.3f})'"
-                    )
-                    drawtext_parts.append(draw)
-                    t += duration
-                if drawtext_parts:
+            if enable_captions and scene_durations:
+                caption_segments = _storybook_burned_caption_segments(
+                    scene_durations=scene_durations,
+                    fallback_lines=narration_lines,
+                    story_pages=_story_pages_from_state(state),
+                    child_age=child_age,
+                    storybook_movie_pacing=storybook_movie_pacing,
+                )
+                caption_filters = _storybook_burned_caption_filtergraph(caption_segments)
+                if caption_filters:
                     captioned_path = tmp_path / "storybook_captioned.mp4"
                     try:
                         subprocess.run(
@@ -5412,7 +7271,7 @@ async def _run_local_storybook(session_id: str, tool_context: ToolContext | None
                                 "-i",
                                 str(video_with_audio),
                                 "-vf",
-                                ",".join(drawtext_parts),
+                                ",".join(caption_filters),
                                 "-c:a",
                                 "copy",
                                 "-movflags",
@@ -5453,12 +7312,18 @@ async def _run_local_storybook(session_id: str, tool_context: ToolContext | None
             media_id = store_media(video_bytes, "video/mp4")
             video_url = f"{backend_base}/api/scene/{media_id}"
             trading_card_url = str(state.get("trading_card_url", "")).strip() or None
+            lighting_cues = [
+                dict(item)
+                for item in list(state.get("theater_lighting_cues", []) or [])
+                if isinstance(item, dict)
+            ]
             publish_session_event(
                 session_id,
                 theater_mode_event(
                     mp4_url=video_url,
                     trading_card_url=trading_card_url,
                     narration_lines=[line for line in narration_lines if line],
+                    lighting_cues=lighting_cues or None,
                     audio_available=audio_available,
                     story_title=title,
                     child_name=str(state.get("child_name", "")).strip() or None,
@@ -5533,6 +7398,20 @@ async def sync_room_lights(
     if last_active_hex == normalized_hex.upper():
         return f"System: Room lights already match {normalized_hex}."
 
+    r, g, b = _rgb_from_hex(normalized_hex)
+    brightness = 200
+    transition = 2
+    if session_id:
+        _remember_scene_lighting_command(
+            tool_context,
+            session_id,
+            hex_color=normalized_hex,
+            rgb_color=[r, g, b],
+            brightness=brightness,
+            transition=transition,
+            scene_description=args.scene_description,
+        )
+
     cfg = get_session_iot_config(session_id) if session_id else {}
     session_ha_url = str(cfg.get("ha_url", "")).strip()
     ha_url = session_ha_url or os.environ.get("HOME_ASSISTANT_URL", "")
@@ -5549,10 +7428,6 @@ async def sync_room_lights(
         remaining = _LIGHT_COOLDOWN_SECONDS - (now - last_call)
         return f"System: Lighting cooldown active. Next change available in {remaining:.1f}s."
     _last_light_call_by_session[cooldown_key] = now
-
-    r, g, b = _rgb_from_hex(normalized_hex)
-    brightness = 200
-    transition = 2
     payload = {
         "entity_id": ha_entity,
         "rgb_color": [r, g, b],

@@ -1,8 +1,8 @@
 import Link from 'next/link';
 
 export const metadata = {
-    title: 'Privacy Policy — Back to Some-ping, back to Dody Land!',
-    description: 'Privacy policy for the Back to Some-ping, back to Dody Land! app. We do not store audio or collect personal information.',
+    title: 'Privacy Policy — StorySpark',
+    description: 'Privacy policy for StorySpark. We do not store audio or collect personal information.',
 };
 
 export default function PrivacyPage() {
@@ -10,12 +10,12 @@ export default function PrivacyPage() {
         <main className="privacy-page">
             <div className="privacy-content">
                 <h1>Privacy Policy</h1>
-                <p className="privacy-updated">Last updated: March 2025</p>
+                <p className="privacy-updated">Last updated: March 2026</p>
 
                 <section>
                     <h2>Overview</h2>
                     <p>
-                        Back to Some-ping, back to Dody Land! (&quot;the app&quot;) is designed with children and families in mind.
+                        StorySpark (&quot;the app&quot;) is designed with children and families in mind.
                         We take privacy seriously and collect as little as possible.
                     </p>
                 </section>
@@ -45,7 +45,7 @@ export default function PrivacyPage() {
                 </section>
 
                 <p className="privacy-back">
-                    <Link href="/">← Back to Some-ping, back to Dody Land!</Link>
+                    <Link href="/">← Back to StorySpark</Link>
                 </p>
             </div>
         </main>
