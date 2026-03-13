@@ -13,7 +13,7 @@ export default function HowItWorksModal({ onClose }: HowItWorksModalProps) {
                 <button className="how-it-works-close-btn" onClick={onClose} aria-label="Close information">×</button>
 
                 <header className="how-it-works-header">
-                    <h2 id="how-it-works-title" className="how-it-works-title">StorySpark <span>✨</span></h2>
+                    <h2 id="how-it-works-title" className="how-it-works-title">Voxitale <span>✨</span></h2>
                     <p className="how-it-works-tagline">Imagine • Create • Tell</p>
                 </header>
 
@@ -21,7 +21,7 @@ export default function HowItWorksModal({ onClose }: HowItWorksModalProps) {
                     <section className="how-it-works-section">
                         <h3>Concept</h3>
                         <p>
-                            StorySpark is an AI-powered storytelling tool that allows children ages 4 to 10 to transform
+                            Voxitale is an AI-powered storytelling tool that allows children ages 4 to 10 to transform
                             their imagination into illustrated picture stories, helping them learn the art of
                             storytelling before they can read or write.
                         </p>
@@ -84,7 +84,7 @@ export default function HowItWorksModal({ onClose }: HowItWorksModalProps) {
                         <h3>A Day in the Life</h3>
                         <div className="story-example">
                             <p>
-                                <em>&quot;Maya opens StorySpark. The program asks, &lsquo;What story would you like to create today?&rsquo;
+                                <em>&quot;Maya opens Voxitale. The program asks, &lsquo;What story would you like to create today?&rsquo;
                                     Maya replies, &lsquo;A pink dragon flying over a castle.&rsquo; Within seconds the AI generates an illustration.
                                     Maya continues adding characters and adventures, each idea creating another illustrated page until
                                     she has built her own storybook.&quot;</em>
@@ -94,7 +94,7 @@ export default function HowItWorksModal({ onClose }: HowItWorksModalProps) {
 
                     <footer className="how-it-works-footer-note">
                         <p>
-                            By combining children&apos;s imagination with artificial intelligence, StorySpark helps young learners
+                            By combining children&apos;s imagination with artificial intelligence, Voxitale helps young learners
                             become creative thinkers, storytellers, and lifelong learners.
                         </p>
                     </footer>

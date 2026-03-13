@@ -81,6 +81,11 @@ from shared.storybook_movie_quality import (
     storybook_page_duration_seconds,
     storybook_release_gate,
 )
+from shared.storybook_lighting import (
+    heuristic_storybook_lighting_command,
+    lighting_cue_from_story_page,
+    normalize_storybook_lighting_cues,
+)
 from shared.storybook_pages import story_pages_from_state_data
 from shared.story_text import (
     clean_story_text as shared_clean_story_text,
@@ -468,137 +473,6 @@ def _clamp_float(value: str, default: float, minimum: float, maximum: float) -> 
     return max(minimum, min(parsed, maximum))
 
 
-_STORYBOOK_LIGHTING_PALETTES: dict[str, dict[str, Any]] = {
-    "dreamy_lavender": {
-        "hex_color": "#B89CFF",
-        "rgb_color": [184, 156, 255],
-        "brightness": 166,
-    },
-    "moonlit_blue": {
-        "hex_color": "#6FA8FF",
-        "rgb_color": [111, 168, 255],
-        "brightness": 154,
-    },
-    "forest_green": {
-        "hex_color": "#55C26A",
-        "rgb_color": [85, 194, 106],
-        "brightness": 176,
-    },
-    "warm_gold": {
-        "hex_color": "#FFB347",
-        "rgb_color": [255, 179, 71],
-        "brightness": 188,
-    },
-}
-
-_STORYBOOK_LIGHTING_KEYWORDS: dict[str, set[str]] = {
-    "dreamy_lavender": {
-        "bubble", "bubbles", "dream", "dreamy", "fairy", "glitter", "magic", "magical",
-        "pastel", "princess", "rainbow", "sparkle", "sparkly", "twinkle", "whimsical",
-    },
-    "moonlit_blue": {
-        "blue", "castle", "ghost", "moon", "moonlit", "night", "secret", "sky", "spooky",
-        "star", "stars", "water", "window", "wizard",
-    },
-    "forest_green": {
-        "dragon", "forest", "garden", "grass", "green", "hill", "leaf", "leafy", "meadow",
-        "mountain", "path", "tree", "trees", "woods",
-    },
-    "warm_gold": {
-        "candle", "cozy", "fire", "firelight", "fireplace", "gift", "gold", "golden", "lantern",
-        "morning", "santa", "sun", "sunny", "sunrise", "sunset", "warm",
-    },
-}
-
-
-def _storybook_rgb_from_hex(hex_color: str) -> list[int]:
-    clean = str(hex_color or "").strip().lstrip("#")
-    if not re.fullmatch(r"[0-9a-fA-F]{6}", clean):
-        return []
-    return [
-        int(clean[0:2], 16),
-        int(clean[2:4], 16),
-        int(clean[4:6], 16),
-    ]
-
-
-def _normalize_storybook_scene_lighting_cues(raw_cues: Any) -> list[dict[str, Any]]:
-    if not isinstance(raw_cues, list):
-        return []
-    normalized: list[dict[str, Any]] = []
-    for item in raw_cues:
-        if not isinstance(item, dict):
-            continue
-        hex_color = str(item.get("hex_color") or "").strip().upper()
-        rgb_color = item.get("rgb_color")
-        if isinstance(rgb_color, list) and len(rgb_color) == 3:
-            try:
-                rgb_triplet = [int(rgb_color[0]), int(rgb_color[1]), int(rgb_color[2])]
-            except Exception:
-                rgb_triplet = []
-        else:
-            rgb_triplet = _storybook_rgb_from_hex(hex_color)
-        if len(rgb_triplet) != 3:
-            continue
-        try:
-            scene_number = int(item.get("scene_number") or 0)
-        except Exception:
-            scene_number = 0
-        normalized.append(
-            {
-                "scene_number": max(0, scene_number),
-                "request_id": str(item.get("request_id") or "").strip(),
-                "hex_color": hex_color or f"#{rgb_triplet[0]:02X}{rgb_triplet[1]:02X}{rgb_triplet[2]:02X}",
-                "rgb_color": rgb_triplet,
-                "brightness": _clamp_int(str(item.get("brightness") or 180), 180, 25, 255),
-                "transition": _clamp_float(str(item.get("transition") or 1.2), 1.2, 0.4, 3.0),
-                "scene_description": str(item.get("scene_description") or "").strip(),
-                "storybeat_text": str(item.get("storybeat_text") or "").strip(),
-            }
-        )
-    return normalized
-
-
-def _heuristic_storybook_lighting_command(
-    scene_text: str,
-    *,
-    is_cover: bool = False,
-    is_end_card: bool = False,
-    duration_seconds: float = 4.0,
-) -> dict[str, Any]:
-    if is_end_card:
-        palette = _STORYBOOK_LIGHTING_PALETTES["warm_gold"]
-        return {
-            **palette,
-            "transition": _clamp_float(str(min(duration_seconds * 0.3, 1.4)), 1.2, 0.6, 1.6),
-            "cue_source": "heuristic_end_card",
-        }
-
-    tokens = set(re.findall(r"[a-z]+", str(scene_text or "").lower()))
-    scores: Counter[str] = Counter()
-    for palette_name, keywords in _STORYBOOK_LIGHTING_KEYWORDS.items():
-        scores[palette_name] = sum(1 for keyword in keywords if keyword in tokens)
-
-    if is_cover and not any(scores.values()):
-        palette_name = "dreamy_lavender"
-    elif scores:
-        palette_name = max(
-            scores.items(),
-            key=lambda item: (item[1], item[0] == "dreamy_lavender", item[0] == "moonlit_blue"),
-        )[0]
-        if scores[palette_name] <= 0:
-            palette_name = "moonlit_blue" if not is_cover else "dreamy_lavender"
-    else:
-        palette_name = "moonlit_blue"
-
-    palette = _STORYBOOK_LIGHTING_PALETTES[palette_name]
-    return {
-        **palette,
-        "transition": _clamp_float(str(min(duration_seconds * 0.28, 1.5)), 1.1, 0.6, 1.8),
-        "cue_source": "heuristic_scene",
-    }
-
-
 def _build_storybook_theater_lighting_cues(
     *,
     scene_durations: list[float],
@@ -613,7 +487,7 @@ def _build_storybook_theater_lighting_cues(
     if not scene_durations:
         return []
 
-    live_cues = _normalize_storybook_scene_lighting_cues(scene_lighting_cues)
+    live_cues = normalize_storybook_lighting_cues(scene_lighting_cues)
     cues_by_request_id = {
         str(item.get("request_id") or "").strip(): item
         for item in live_cues
@@ -662,8 +536,11 @@ def _build_storybook_theater_lighting_cues(
             cue = cues_by_request_id.get(request_id)
         if cue is None and scene_number > 0:
             cue = cues_by_scene_number.get(scene_number)
+        page_cue = None if is_cover or is_end_card else lighting_cue_from_story_page(page, duration_seconds=duration)
+        if page_cue is not None:
+            cue = dict(page_cue)
         if cue is None:
-            cue = _heuristic_storybook_lighting_command(
+            cue = heuristic_storybook_lighting_command(
                 scene_text,
                 is_cover=is_cover,
                 is_end_card=is_end_card,
@@ -671,7 +548,8 @@ def _build_storybook_theater_lighting_cues(
             )
         else:
             cue = dict(cue)
-            cue["cue_source"] = "live_story_scene"
+            if page_cue is None:
+                cue["cue_source"] = str(cue.get("cue_source") or "").strip() or "live_story_scene"
             cue["transition"] = _clamp_float(
                 str(cue.get("transition") or min(duration * 0.28, 1.5)),
                 1.1,

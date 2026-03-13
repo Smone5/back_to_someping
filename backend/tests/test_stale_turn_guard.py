@@ -164,9 +164,10 @@ class StaleTurnGuardTests(unittest.TestCase):
         self.assertTrue(str(tool_context.state.get("active_scene_request_id", "")).strip())
         cached_state = tools.load_storybook_resume_state("session-a")
         self.assertEqual(
-            cached_state.get("current_scene_base_description"),
+            cached_state.get("pending_scene_base_description"),
             "A sunny adventure path with smiling trees.",
         )
+        self.assertFalse(str(cached_state.get("current_scene_base_description", "") or "").strip())
 
 
 if __name__ == "__main__":

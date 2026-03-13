@@ -285,6 +285,8 @@ _SESSION_STATE_DEFAULTS: dict[str, Any] = {
     "story_page_limit_reached": False,
     "state_snapshots": [],
     "current_scene_description": _INITIAL_SCENE_PLACEHOLDER,
+    "pending_scene_description": "",
+    "pending_scene_base_description": "",
     "current_scene_storybeat_text": "",
     "pending_response": False,
     "pending_response_interrupted": False,
@@ -1822,6 +1824,85 @@ def _storybook_scene_state_payload(state: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _clear_pending_scene_request_metadata(state: dict[str, Any]) -> None:
+    state["pending_scene_description"] = ""
+    state["pending_scene_base_description"] = ""
+
+
+def _scene_request_matches_active_request(
+    state: dict[str, Any],
+    *,
+    request_id: str | None,
+) -> bool:
+    normalized_request_id = str(request_id or "").strip()
+    active_request_id = str(state.get("active_scene_request_id", "") or "").strip()
+    return (
+        not normalized_request_id
+        or not active_request_id
+        or normalized_request_id == active_request_id
+    )
+
+
+def _promote_pending_scene_request_to_current(
+    state: dict[str, Any],
+    *,
+    request_id: str | None,
+    description: str = "",
+    storybeat_text: str = "",
+) -> bool:
+    if not _scene_request_matches_active_request(state, request_id=request_id):
+        return False
+
+    if description:
+        state["current_scene_description"] = description
+        if not str(state.get("canonical_scene_description", "") or "").strip():
+            state["canonical_scene_description"] = description
+
+    pending_base_description = str(state.get("pending_scene_base_description", "") or "").strip()
+    if pending_base_description:
+        state["current_scene_base_description"] = pending_base_description
+    elif description and not str(state.get("current_scene_base_description", "") or "").strip():
+        state["current_scene_base_description"] = description
+
+    if storybeat_text:
+        state["current_scene_storybeat_text"] = storybeat_text
+        if not str(state.get("canonical_scene_storybeat_text", "") or "").strip():
+            state["canonical_scene_storybeat_text"] = storybeat_text
+
+    _clear_pending_scene_request_metadata(state)
+    return True
+
+
+def _apply_nonpersistent_scene_ready_to_state(
+    state: dict[str, Any],
+    *,
+    request_id: str | None,
+    looks_like_image: bool,
+    is_fallback: bool,
+    description: str = "",
+    storybeat_text: str = "",
+) -> None:
+    if looks_like_image:
+        if not _scene_request_matches_active_request(state, request_id=request_id):
+            state["scene_render_pending"] = bool(
+                str(state.get("pending_scene_description", "") or "").strip()
+                or str(state.get("pending_scene_base_description", "") or "").strip()
+            )
+            return
+        if is_fallback:
+            _clear_pending_scene_request_metadata(state)
+        else:
+            _promote_pending_scene_request_to_current(
+                state,
+                request_id=request_id,
+                description=description,
+                storybeat_text=storybeat_text,
+            )
+    else:
+        _clear_pending_scene_request_metadata(state)
+    state["scene_render_pending"] = False
+
+
 def _apply_scene_asset_to_story_state(
     state: dict[str, Any],
     *,
@@ -1948,20 +2029,16 @@ def _apply_scene_asset_to_story_state(
     state["scene_descriptions"] = page_descriptions[-40:]
     state["scene_storybeat_texts"] = page_storybeats[-40:]
 
-    active_request_id = str(state.get("active_scene_request_id", "") or "").strip()
-    is_current_scene_request = (
-        not normalized_request_id
-        or not active_request_id
-        or normalized_request_id == active_request_id
+    is_current_scene_request = _promote_pending_scene_request_to_current(
+        state,
+        request_id=normalized_request_id,
+        description=description,
+        storybeat_text=storybeat_text,
     )
-    if description and is_current_scene_request:
-        state["current_scene_description"] = description
-        if not str(state.get("canonical_scene_description", "") or "").strip():
-            state["canonical_scene_description"] = description
-    if storybeat_text and is_current_scene_request:
-        state["current_scene_storybeat_text"] = storybeat_text
-        if not str(state.get("canonical_scene_storybeat_text", "") or "").strip():
-            state["canonical_scene_storybeat_text"] = storybeat_text
+    if description and is_current_scene_request and not str(state.get("canonical_scene_description", "") or "").strip():
+        state["canonical_scene_description"] = description
+    if storybeat_text and is_current_scene_request and not str(state.get("canonical_scene_storybeat_text", "") or "").strip():
+        state["canonical_scene_storybeat_text"] = storybeat_text
     _sync_story_page_progress_fields(state)
     record_continuity_scene(
         state,
@@ -2541,7 +2618,11 @@ def _record_scene_branch_point(
         scene_number = max(max(int(point.get("scene_number", 0) or 0) for point in points) + 1, 1)
     else:
         scene_number = 1
-    scene_description = str(snapshot_state.get("current_scene_description", "") or "").strip()
+    scene_description = str(
+        snapshot_state.get("pending_scene_description")
+        or snapshot_state.get("current_scene_description")
+        or ""
+    ).strip()
     storybeat_text = str(snapshot_state.get("current_scene_storybeat_text", "") or "").strip()
     image_url = str((matching_page or {}).get("image_url", "") or "").strip()
     gcs_uri = str((matching_page or {}).get("gcs_uri", "") or "").strip()
@@ -2617,6 +2698,7 @@ def _restore_branch_scene_lists(state: dict[str, Any], points: list[dict[str, An
         state["current_scene_storybeat_text"] = ""
     if scene_descriptions:
         state["current_scene_description"] = scene_descriptions[-1]
+        state["current_scene_base_description"] = scene_descriptions[-1]
 
 
 def _prepare_branch_state(
@@ -2634,6 +2716,8 @@ def _prepare_branch_state(
     restored["assembly_kind"] = "initial"
     restored["theater_release_ready"] = False
     restored["active_scene_request_id"] = str(target_point.get("request_id", "") or "").strip()
+    restored["pending_scene_description"] = ""
+    restored["pending_scene_base_description"] = ""
     restored["scene_branch_points"] = copy.deepcopy(kept_points)
     restored["story_pages"] = story_pages_from_state_data({"scene_branch_points": kept_points})
     restored["state_snapshots"] = []
@@ -2664,6 +2748,7 @@ def _reset_storybook_progress_after_branch(session_id: str, state: dict[str, Any
     state["assembly_recent_activities"] = []
     state["assembly_wait_prompt_count"] = 0
     state["scene_render_pending"] = False
+    _clear_pending_scene_request_metadata(state)
     state["theater_release_ready"] = False
     _sync_story_phase(session_id, state)
     state.pop("movie_feedback_latest", None)
@@ -2928,6 +3013,7 @@ async def _trigger_story_end(
         state["assembly_recent_activities"] = []
         state["assembly_wait_prompt_count"] = 0
         state["scene_render_pending"] = False
+        _clear_pending_scene_request_metadata(state)
         state["theater_release_ready"] = False
         _finish_toy_share_state(state)
         _sync_story_phase(session_id, state)
@@ -4972,9 +5058,11 @@ async def _run_agent(
                                         toy_share_finished_now = True
                                     state["story_turn_limit_reached"] = False
                                     state["scene_render_pending"] = False
+                                    _clear_pending_scene_request_metadata(state)
                                 elif not story_page_turn:
                                     state["story_turn_limit_reached"] = False
                                     state["scene_render_pending"] = False
+                                    _clear_pending_scene_request_metadata(state)
                                 else:
                                     state["story_started"] = True
                                     state["awaiting_story_choice"] = False
@@ -6998,6 +7086,7 @@ async def _forward_session_events(
                 url = str(payload.get("url", ""))
                 if url:
                     is_placeholder = bool(payload.get("is_placeholder"))
+                    is_fallback = bool(payload.get("is_fallback"))
                     persist_asset = payload.get("persist_asset", True) is not False
                     queued_follow_up_text = ""
                     # Mark that this session has received at least one real image.
@@ -7092,7 +7181,14 @@ async def _forward_session_events(
                         )
                     else:
                         def _clear_scene_render_pending(state: dict[str, Any]) -> None:
-                            state["scene_render_pending"] = False
+                            _apply_nonpersistent_scene_ready_to_state(
+                                state,
+                                request_id=str(payload.get("request_id", "") or "").strip(),
+                                looks_like_image=looks_like_image,
+                                is_fallback=is_fallback,
+                                description=str(payload.get("description", "") or "").strip(),
+                                storybeat_text=str(payload.get("storybeat_text", "") or "").strip(),
+                            )
                             _sync_story_phase(session_id, state)
 
                         await _mutate_state(
@@ -7171,6 +7267,7 @@ async def _forward_session_events(
                     def _mark_theater_ready(state: dict[str, Any]) -> None:
                         state["assembly_status"] = "complete"
                         state["scene_render_pending"] = False
+                        _clear_pending_scene_request_metadata(state)
                         if final_video_url:
                             state["final_video_url"] = final_video_url
                         if trading_card_url:

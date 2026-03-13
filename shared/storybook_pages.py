@@ -28,6 +28,15 @@ def _clean_int(value: Any, default: int) -> int:
     return max(1, numeric)
 
 
+def _clean_rgb(value: Any) -> list[int]:
+    if not isinstance(value, list) or len(value) != 3:
+        return []
+    try:
+        return [int(value[0]), int(value[1]), int(value[2])]
+    except Exception:
+        return []
+
+
 def _normalize_story_page(item: Mapping[str, Any], fallback_scene_number: int) -> dict[str, Any] | None:
     scene_description = clean_story_text(
         item.get("scene_description")
@@ -42,11 +51,22 @@ def _normalize_story_page(item: Mapping[str, Any], fallback_scene_number: int) -
     gcs_uri = _clean_str(item.get("gcs_uri") or item.get("image_gcs_uri"))
     request_id = _clean_str(item.get("request_id"))
     scene_number = _clean_int(item.get("scene_number"), fallback_scene_number)
+    hex_color = _clean_str(item.get("hex_color")).upper()
+    rgb_color = _clean_rgb(item.get("rgb_color"))
+    cue_source = _clean_str(item.get("cue_source"))
+    try:
+        brightness = int(item.get("brightness")) if item.get("brightness") is not None else None
+    except Exception:
+        brightness = None
+    try:
+        transition = float(item.get("transition")) if item.get("transition") is not None else None
+    except Exception:
+        transition = None
 
     if not (scene_description or storybeat_text or image_url or gcs_uri or request_id):
         return None
 
-    return {
+    page = {
         "scene_number": scene_number,
         "request_id": request_id,
         "scene_description": scene_description,
@@ -54,6 +74,17 @@ def _normalize_story_page(item: Mapping[str, Any], fallback_scene_number: int) -
         "image_url": image_url,
         "gcs_uri": gcs_uri,
     }
+    if hex_color:
+        page["hex_color"] = hex_color
+    if rgb_color:
+        page["rgb_color"] = rgb_color
+    if brightness is not None:
+        page["brightness"] = brightness
+    if transition is not None:
+        page["transition"] = transition
+    if cue_source:
+        page["cue_source"] = cue_source
+    return page
 
 
 def story_pages_from_raw(raw_pages: Any) -> list[dict[str, Any]]:
@@ -97,10 +128,25 @@ def _merge_story_page_lists(*sources: list[dict[str, Any]]) -> list[dict[str, An
                 merged.append(dict(page))
                 continue
             existing = dict(merged[match_index])
-            for key in ("request_id", "scene_description", "storybeat_text", "image_url", "gcs_uri"):
+            for key in (
+                "request_id",
+                "scene_description",
+                "storybeat_text",
+                "image_url",
+                "gcs_uri",
+                "hex_color",
+                "cue_source",
+            ):
                 candidate_value = _clean_str(page.get(key))
                 if candidate_value and not _clean_str(existing.get(key)):
                     existing[key] = candidate_value
+            candidate_rgb = _clean_rgb(page.get("rgb_color"))
+            if candidate_rgb and not _clean_rgb(existing.get("rgb_color")):
+                existing["rgb_color"] = candidate_rgb
+            if page.get("brightness") is not None and existing.get("brightness") is None:
+                existing["brightness"] = int(page.get("brightness"))
+            if page.get("transition") is not None and existing.get("transition") is None:
+                existing["transition"] = float(page.get("transition"))
             existing["scene_number"] = _clean_int(
                 existing.get("scene_number") or page.get("scene_number"),
                 match_index + 1,

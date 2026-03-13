@@ -1,8 +1,8 @@
 'use client';
 
-import { useState, useEffect, ChangeEvent } from 'react';
+import { useState, useEffect, ChangeEvent, FormEvent } from 'react';
 import {
-    describeHomeAssistantFailure,
+    describeHomeAssistantTestFailure,
     isLikelyLocalHomeAssistantUrl,
     isMixedContentRisk,
     normalizeHomeAssistantConfig,
@@ -67,7 +67,12 @@ export default function IoTSettingsModal({ onClose, onSave }: IoTSettingsModalPr
             return;
         }
 
-        const message = describeHomeAssistantFailure(result.reason);
+        const message = describeHomeAssistantTestFailure(
+            normalizedConfig,
+            result.transport,
+            result.reason,
+            typeof window !== 'undefined' ? window.location.origin : '',
+        );
         setTestState('error');
         setTestMessage(
             result.reason === 'restore_failed'
@@ -87,8 +92,26 @@ export default function IoTSettingsModal({ onClose, onSave }: IoTSettingsModalPr
         onClose();
     };
 
+    const handleSubmit = (event: FormEvent<HTMLFormElement>) => {
+        event.preventDefault();
+        void handleTest();
+    };
+
     const showLocalNetworkHint = Boolean(config.ha_url) && isLikelyLocalHomeAssistantUrl(config.ha_url);
     const showMixedContentHint = Boolean(config.ha_url) && isMixedContentRisk(config.ha_url);
+    const hasParsableUrl = (() => {
+        if (!config.ha_url) {
+            return false;
+        }
+        try {
+            new URL(config.ha_url);
+            return true;
+        } catch {
+            return false;
+        }
+    })();
+    const showPublicUrlHint = hasParsableUrl && !showLocalNetworkHint && !showMixedContentHint;
+    const currentOrigin = typeof window !== 'undefined' ? window.location.origin : 'this site';
 
     return (
         <div className="iot-modal-overlay" role="dialog" aria-modal="true" aria-labelledby="iot-modal-title">
@@ -100,7 +123,7 @@ export default function IoTSettingsModal({ onClose, onSave }: IoTSettingsModalPr
                     If you use Google Home, you can add your lights to Home Assistant (or use a bridge) so Amelia can control them too.
                 </p>
 
-                <div className="iot-form">
+                <form className="iot-form" onSubmit={handleSubmit}>
                     <label className="iot-label">
                         Home Assistant URL
                         <input
@@ -136,46 +159,52 @@ export default function IoTSettingsModal({ onClose, onSave }: IoTSettingsModalPr
                             onChange={handleChange}
                         />
                     </label>
-                </div>
 
-                {showLocalNetworkHint && (
+                    {showLocalNetworkHint && (
+                        <p className="iot-modal-subtitle">
+                            Local-network Home Assistant detected. Amelia will send light commands through this browser during the story, which is the reliable path when the app backend is running in the cloud.
+                        </p>
+                    )}
+
+                    {showMixedContentHint && (
+                        <p className="iot-modal-subtitle">
+                            This page is running over HTTPS but your Home Assistant URL is HTTP. Most browsers block that direct light-control request, so use an HTTPS Home Assistant URL if possible.
+                        </p>
+                    )}
+
+                    {showPublicUrlHint && (
+                        <p className="iot-modal-subtitle">
+                            Public Home Assistant URL detected. Voxitale will relay light tests and theater cues through the backend, so Home Assistant does not need browser CORS for <code>{currentOrigin}</code>.
+                        </p>
+                    )}
+
+                    {showLocalNetworkHint && (
+                        <p className="iot-modal-subtitle">
+                            Browser control for local Home Assistant still requires Home Assistant to allow this site origin in <code>http.cors_allowed_origins</code>.
+                        </p>
+                    )}
                     <p className="iot-modal-subtitle">
-                        Local-network Home Assistant detected. Amelia will send light commands through this browser during the story, which is the reliable path when the app backend is running in the cloud.
+                        Test Light sends a short purple shimmer, then restores the light so you can confirm the exact browser path Amelia will use during the story and the final movie.
                     </p>
-                )}
 
-                {showMixedContentHint && (
-                    <p className="iot-modal-subtitle">
-                        This page is running over HTTPS but your Home Assistant URL is HTTP. Most browsers block that direct light-control request, so use an HTTPS Home Assistant URL if possible.
-                    </p>
-                )}
+                    {testState !== 'idle' && (
+                        <div className={`iot-test-status iot-test-status-${testState}`} role="status" aria-live="polite">
+                            {testMessage}
+                        </div>
+                    )}
 
-                <p className="iot-modal-subtitle">
-                    Browser control also requires Home Assistant to allow this site origin in <code>http.cors_allowed_origins</code>.
-                </p>
-                <p className="iot-modal-subtitle">
-                    Test Light sends a short purple shimmer, then restores the light so you can confirm the exact browser path Amelia will use during the story and the final movie.
-                </p>
-
-                {testState !== 'idle' && (
-                    <div className={`iot-test-status iot-test-status-${testState}`} role="status" aria-live="polite">
-                        {testMessage}
+                    <div className="iot-actions">
+                        <button type="button" className="iot-btn iot-btn-secondary" onClick={onClose}>Cancel</button>
+                        <button
+                            type="submit"
+                            className="iot-btn iot-btn-test"
+                            disabled={testState === 'running'}
+                        >
+                            {testState === 'running' ? 'Testing…' : 'Test Light'}
+                        </button>
+                        <button type="button" className="iot-btn iot-btn-primary" onClick={handleSave}>Save Magic</button>
                     </div>
-                )}
-
-                <div className="iot-actions">
-                    <button className="iot-btn iot-btn-secondary" onClick={onClose}>Cancel</button>
-                    <button
-                        className="iot-btn iot-btn-test"
-                        onClick={() => {
-                            void handleTest();
-                        }}
-                        disabled={testState === 'running'}
-                    >
-                        {testState === 'running' ? 'Testing…' : 'Test Light'}
-                    </button>
-                    <button className="iot-btn iot-btn-primary" onClick={handleSave}>Save Magic</button>
-                </div>
+                </form>
             </div>
         </div>
     );

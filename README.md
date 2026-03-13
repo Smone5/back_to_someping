@@ -1,6 +1,6 @@
-# StorySpark
+# Voxitale
 
-StorySpark is a voice-first storytelling app for young children. A child talks to Amelia in the browser, the backend runs a Google ADK + Gemini live agent, scene illustrations are generated during the session, and the session ends as a storybook-style video with narration, music, and optional smart-home effects.
+Voxitale is a voice-first storytelling app for young children. A child talks to Amelia in the browser, the backend runs a Google ADK + Gemini live agent, scene illustrations are generated during the session, and the session ends as a storybook-style video with narration, music, and optional smart-home effects.
 
 This repo contains the app code, Docker build definitions, and Google Cloud Terraform needed to reproduce the project.
 
@@ -29,18 +29,9 @@ This repo contains the app code, Docker build definitions, and Google Cloud Terr
 
 ## Architecture
 
-```mermaid
-flowchart LR
-    B["Browser<br/>Next.js + audio worklets"] -->|PCM + JSON over WebSocket| API["FastAPI backend<br/>Cloud Run or local"]
-    API --> GEM["Gemini native-audio storyteller"]
-    API --> TOOLS["ADK tools"]
-    TOOLS --> IMG["Gemini image generation"]
-    TOOLS --> GCS["Cloud Storage"]
-    TOOLS --> FS["Firestore"]
-    TOOLS --> JOB["FFmpeg Cloud Run Job"]
-    JOB --> GCS
-    API -->|storybook events| B
-```
+The README uses the exported architecture image so it stays visually aligned with the authored source diagram. Production traffic still sits behind the HTTPS load balancer defined in Terraform.
+
+![Voxitale architecture diagram](frontend/public/voxitale_arch.png)
 
 ## Repository Layout
 
@@ -124,10 +115,14 @@ Health check:
 curl http://localhost:8000/health
 ```
 
-Expected response:
+Expected shape:
 
 ```json
-{"status":"ok","active_sessions":0}
+{
+  "status": "ok",
+  "active_sessions": 0,
+  "live_telemetry": {}
+}
 ```
 
 Start the frontend in a second terminal:
@@ -148,50 +143,45 @@ Notes:
 
 This repo ships Dockerfiles, not a committed `docker-compose.yml`. The supported Docker path is to run the backend and frontend containers separately.
 
-Create a Docker network once:
-
-```bash
-docker network create storyspark
-```
-
 If you authenticated with `gcloud auth application-default login`, your ADC file is usually:
 
 ```bash
 export GCP_CREDS_JSON="$HOME/.config/gcloud/application_default_credentials.json"
 ```
 
+If you are using a service-account JSON instead, point `GCP_CREDS_JSON` at that file path instead.
+
 Build and run the backend:
 
 ```bash
-docker build --platform linux/amd64 -t storyspark-backend -f backend/Dockerfile .
+docker build --platform linux/amd64 -t voxitale-backend -f backend/Dockerfile .
 docker run --rm \
-  --name storyspark-backend \
-  --network storyspark \
+  --name voxitale-backend \
   --env-file .env \
   -e GOOGLE_APPLICATION_CREDENTIALS=/var/secrets/google/application_default_credentials.json \
   -v "$GCP_CREDS_JSON:/var/secrets/google/application_default_credentials.json:ro" \
   -p 8000:8080 \
-  storyspark-backend
+  voxitale-backend
 ```
 
-Build and run the frontend:
+Build and run the frontend. These build args point the browser-facing URLs at the backend container published on `localhost:8000`, so local Docker does not depend on Next.js WebSocket proxy behavior:
 
 ```bash
 docker build \
   --platform linux/amd64 \
   --build-arg NEXT_PUBLIC_REQUIRE_MATH=false \
-  -t storyspark-frontend \
+  --build-arg NEXT_PUBLIC_SITE_URL=http://localhost:3000 \
+  --build-arg NEXT_PUBLIC_BACKEND_URL=http://localhost:8000 \
+  --build-arg NEXT_PUBLIC_UPLOAD_URL=http://localhost:8000/api/upload \
+  --build-arg NEXT_PUBLIC_WS_URL=ws://localhost:8000/ws/story \
+  -t voxitale-frontend \
   -f frontend/Dockerfile \
   frontend/
 
 docker run --rm \
-  --name storyspark-frontend \
-  --network storyspark \
-  -e BACKEND_URL=http://storyspark-backend:8080 \
-  -e NEXT_PUBLIC_WS_URL=/ws/story \
-  -e NEXT_PUBLIC_UPLOAD_URL=/api/upload \
+  --name voxitale-frontend \
   -p 3000:8080 \
-  storyspark-frontend
+  voxitale-frontend
 ```
 
 Then open `http://localhost:3000`.
@@ -217,7 +207,8 @@ The checked-in Terraform provisions:
 Important constraint:
 
 - The current Terraform requires `domain_name` and creates a managed SSL certificate and HTTPS load balancer
-- If you do not have a real domain/subdomain yet, use direct Cloud Run URLs or change the Terraform before applying it
+- The current Terraform also bakes that domain into backend allowed origins and bucket CORS, so browser-based use of direct `run.app` URLs is not the intended production path
+- If you do not have a real domain/subdomain yet, change the Terraform before applying it or treat direct Cloud Run URLs as backend/service verification only
 
 ### First-Time Cloud Bootstrap
 
@@ -328,8 +319,6 @@ BACKEND_URL="$(gcloud run services describe storyteller-backend --region="$GOOGL
 curl "$BACKEND_URL/health"
 ```
 
-## Extra Docs
+## Home Assistant Lighting
 
-- [Deployment guide](docs/deployment_guide.md)
-- [Room light testing guide](docs/testing_room_lights.md)
-- [Docs index](docs/README.md)
+For the lighting path, see the [room light testing guide](ROOM_LIGHT_TESTING.md). It now documents the Raspberry Pi + Home Assistant + Matter Server setup, public HTTPS access through Cloudflare Tunnel or Nabu Casa, the required `configuration.yaml` proxy/CORS settings, and the mock-server workflow for fast local testing.

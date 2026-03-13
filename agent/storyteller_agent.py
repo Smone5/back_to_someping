@@ -37,7 +37,6 @@ from .tools import (
     generate_trading_card,
     save_character_fact,
     save_child_name,
-    sync_room_lights,
 )
 
 def _env_enabled(name: str, default: bool = False) -> bool:
@@ -84,7 +83,6 @@ _native_tools = [
     FunctionTool(save_child_name),
     FunctionTool(generate_trading_card),
     FunctionTool(assemble_story_video),
-    FunctionTool(sync_room_lights),
 ]
 
 # ── ElevenLabs MCP Toolset (optional — requires ELEVENLABS_API_KEY) ───────────

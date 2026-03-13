@@ -1,7 +1,7 @@
 {
-    "name": "StorySpark",
-    "short_name": "StorySpark",
-    "description": "Turn imagination into magical AI picture stories with StorySpark.",
+    "name": "Voxitale",
+    "short_name": "Voxitale",
+    "description": "Turn imagination into magical AI picture stories with Voxitale.",
     "start_url": "/",
     "display": "fullscreen",
     "orientation": "portrait",
@@ -9,16 +9,10 @@
     "theme_color": "#1a0533",
     "icons": [
         {
-            "src": "/icon-192.png",
-            "sizes": "192x192",
+            "src": "/voxitale_arch.png",
+            "sizes": "1701x1032",
             "type": "image/png",
-            "purpose": "maskable"
-        },
-        {
-            "src": "/icon-512.png",
-            "sizes": "512x512",
-            "type": "image/png",
-            "purpose": "maskable"
+            "purpose": "any"
         }
     ]
 }

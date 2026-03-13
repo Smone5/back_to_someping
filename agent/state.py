@@ -165,6 +165,8 @@ class StorySession(BaseModel):
     current_scene_visual_summary: str = Field(default="")
     previous_scene_visual_summary: str = Field(default="")
     canonical_scene_visual_summary: str = Field(default="")
+    pending_scene_description: str = Field(default="")
+    pending_scene_base_description: str = Field(default="")
     character_facts: list[CharacterFact] = Field(default_factory=list)
     turn_number: int = Field(default=0)
     response_turn_number: int = Field(default=0)
@@ -267,6 +269,10 @@ class StorySession(BaseModel):
                 data["previous_scene_visual_summary"] = ""
             if "canonical_scene_visual_summary" not in data:
                 data["canonical_scene_visual_summary"] = ""
+            if "pending_scene_description" not in data:
+                data["pending_scene_description"] = ""
+            if "pending_scene_base_description" not in data:
+                data["pending_scene_base_description"] = ""
             if "response_turn_number" not in data:
                 data["response_turn_number"] = data.get("turn_number", 0)
         return data

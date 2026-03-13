@@ -1,12 +1,71 @@
 from __future__ import annotations
 
+import asyncio
+import os
 import sys
+import types
 import unittest
 from pathlib import Path
+from unittest.mock import AsyncMock, patch
 
 _PROJECT_ROOT = Path(__file__).resolve().parents[2]
 if str(_PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(_PROJECT_ROOT))
+
+try:
+    import google  # type: ignore
+except Exception:  # pragma: no cover - only for stripped local test envs
+    google = types.ModuleType("google")
+    sys.modules["google"] = google
+
+try:
+    import google.cloud as google_cloud  # type: ignore
+except Exception:  # pragma: no cover - only for stripped local test envs
+    google_cloud = types.ModuleType("google.cloud")
+    sys.modules["google.cloud"] = google_cloud
+    setattr(google, "cloud", google_cloud)
+
+try:
+    import google.adk as google_adk  # type: ignore
+except Exception:  # pragma: no cover - only for stripped local test envs
+    google_adk = None
+
+if "google.cloud.firestore" not in sys.modules:
+    firestore_stub = types.ModuleType("google.cloud.firestore")
+    firestore_stub.Client = object
+    firestore_stub.AsyncClient = object
+    sys.modules["google.cloud.firestore"] = firestore_stub
+    setattr(google_cloud, "firestore", firestore_stub)
+
+if "google.cloud.storage" not in sys.modules:
+    storage_stub = types.ModuleType("google.cloud.storage")
+
+    class _StorageBucket:
+        pass
+
+    class _StorageBlob:
+        pass
+
+    class _StorageClient:
+        def __init__(self, *args, **kwargs) -> None:
+            pass
+
+        def bucket(self, *args, **kwargs):
+            return _StorageBucket()
+
+    storage_stub.Bucket = _StorageBucket
+    storage_stub.Blob = _StorageBlob
+    storage_stub.Client = _StorageClient
+    sys.modules["google.cloud.storage"] = storage_stub
+    setattr(google_cloud, "storage", storage_stub)
+
+if google_adk is not None and "google.adk.utils" not in sys.modules:
+    adk_utils_stub = types.ModuleType("google.adk.utils")
+    instructions_utils_stub = types.ModuleType("google.adk.utils.instructions_utils")
+    adk_utils_stub.instructions_utils = instructions_utils_stub
+    sys.modules["google.adk.utils"] = adk_utils_stub
+    sys.modules["google.adk.utils.instructions_utils"] = instructions_utils_stub
+    setattr(google_adk, "utils", adk_utils_stub)
 
 from agent import tools
 from backend import ws_router
@@ -15,9 +74,15 @@ from backend import ws_router
 class LiveImageQueueTests(unittest.TestCase):
     def setUp(self) -> None:
         tools._session_pending.clear()
+        tools._session_generating.clear()
+        tools._session_cancel_current.clear()
+        tools._session_image_backoff_until.clear()
 
     def tearDown(self) -> None:
         tools._session_pending.clear()
+        tools._session_generating.clear()
+        tools._session_cancel_current.clear()
+        tools._session_image_backoff_until.clear()
 
     def test_detects_newer_pending_scene_request(self) -> None:
         tools._session_pending["session-a"] = tools.VisualArgs(
@@ -86,6 +151,204 @@ class LiveImageQueueTests(unittest.TestCase):
 
         self.assertEqual(queued, "")
         self.assertEqual(state["queued_scene_child_utterance"], "Let's climb up to the dragon.")
+
+    def test_promote_pending_scene_request_to_current_updates_visible_scene(self) -> None:
+        state = {
+            "active_scene_request_id": "req-2",
+            "current_scene_description": "At the top of the stairs by a glowing wooden door.",
+            "current_scene_base_description": "At the top of the stairs by a glowing wooden door.",
+            "pending_scene_description": "A cozy castle library with towering bookshelves.",
+            "pending_scene_base_description": "A cozy castle library with towering bookshelves.",
+            "current_scene_storybeat_text": "",
+        }
+
+        promoted = ws_router._promote_pending_scene_request_to_current(
+            state,
+            request_id="req-2",
+            description="A cozy castle library with towering bookshelves.",
+            storybeat_text="A cozy castle library appears.",
+        )
+
+        self.assertTrue(promoted)
+        self.assertEqual(state["current_scene_description"], "A cozy castle library with towering bookshelves.")
+        self.assertEqual(state["current_scene_base_description"], "A cozy castle library with towering bookshelves.")
+        self.assertEqual(state["current_scene_storybeat_text"], "A cozy castle library appears.")
+        self.assertEqual(state["pending_scene_description"], "")
+        self.assertEqual(state["pending_scene_base_description"], "")
+
+    def test_apply_scene_asset_uses_pending_scene_base_description(self) -> None:
+        state = {
+            "active_scene_request_id": "req-2",
+            "current_scene_description": "At the top of the stairs by a glowing wooden door.",
+            "current_scene_base_description": "At the top of the stairs by a glowing wooden door.",
+            "pending_scene_description": "A cozy castle library with towering bookshelves.",
+            "pending_scene_base_description": "A cozy castle library with towering bookshelves.",
+            "story_pages": [],
+            "scene_branch_points": [],
+            "continuity_entity_registry": {"characters": {}, "locations": {}, "props": {}},
+            "continuity_world_state": {
+                "scene_index": 0,
+                "current_location_key": "",
+                "current_location_label": "",
+                "previous_location_key": "",
+                "previous_location_label": "",
+                "active_character_keys": [],
+                "active_prop_keys": [],
+                "goal": "",
+                "last_transition": "",
+                "pending_request": "",
+                "pending_location_key": "",
+                "pending_location_label": "",
+                "pending_transition": "",
+                "pending_character_keys": [],
+                "pending_prop_keys": [],
+            },
+            "continuity_scene_history": [],
+        }
+
+        ws_router._apply_scene_asset_to_story_state(
+            state,
+            request_id="req-2",
+            image_url="https://example.com/library.png",
+            description="A cozy castle library with towering bookshelves.",
+            storybeat_text="A cozy castle library appears.",
+            gcs_uri="gs://storybook/library.png",
+        )
+
+        self.assertEqual(state["current_scene_description"], "A cozy castle library with towering bookshelves.")
+        self.assertEqual(state["current_scene_base_description"], "A cozy castle library with towering bookshelves.")
+        self.assertEqual(state["pending_scene_description"], "")
+        self.assertEqual(state["pending_scene_base_description"], "")
+        self.assertEqual(state["scene_asset_urls"], ["https://example.com/library.png"])
+
+    def test_apply_nonpersistent_scene_ready_preserves_newer_pending_request(self) -> None:
+        state = {
+            "active_scene_request_id": "req-new",
+            "current_scene_description": "Candy Land with lollipop trees.",
+            "current_scene_base_description": "Candy Land with lollipop trees.",
+            "pending_scene_description": "A child flying toward the moon.",
+            "pending_scene_base_description": "A child flying toward the moon.",
+            "scene_render_pending": True,
+        }
+
+        ws_router._apply_nonpersistent_scene_ready_to_state(
+            state,
+            request_id="req-old",
+            looks_like_image=True,
+            is_fallback=False,
+            description="An older stale scene finishes late.",
+            storybeat_text="The stale scene should be ignored.",
+        )
+
+        self.assertEqual(state["current_scene_description"], "Candy Land with lollipop trees.")
+        self.assertEqual(state["pending_scene_description"], "A child flying toward the moon.")
+        self.assertTrue(state["scene_render_pending"])
+
+    def test_apply_nonpersistent_scene_ready_fallback_keeps_current_scene(self) -> None:
+        state = {
+            "active_scene_request_id": "req-moon",
+            "current_scene_description": "Candy Land with lollipop trees.",
+            "current_scene_base_description": "Candy Land with lollipop trees.",
+            "pending_scene_description": "A child flying toward the moon.",
+            "pending_scene_base_description": "A child flying toward the moon.",
+            "scene_render_pending": True,
+        }
+
+        ws_router._apply_nonpersistent_scene_ready_to_state(
+            state,
+            request_id="req-moon",
+            looks_like_image=True,
+            is_fallback=True,
+            description="A fallback moon scene that never rendered.",
+            storybeat_text="The fallback should not replace the visible page.",
+        )
+
+        self.assertEqual(state["current_scene_description"], "Candy Land with lollipop trees.")
+        self.assertEqual(state["current_scene_base_description"], "Candy Land with lollipop trees.")
+        self.assertEqual(state["pending_scene_description"], "")
+        self.assertEqual(state["pending_scene_base_description"], "")
+        self.assertFalse(state["scene_render_pending"])
+
+    def test_public_scene_description_prefers_base_description(self) -> None:
+        args = tools.VisualArgs(
+            description=(
+                "Moon. A glowing moon scene. Story continuity target: keep this page in or directly connected "
+                "to moon. Tone: brave preschool fantasy adventure."
+            ),
+            base_description="Moon. A glowing moon scene.",
+        )
+
+        self.assertEqual(tools._public_scene_description(args), "Moon. A glowing moon scene.")
+
+    def test_run_visual_pipeline_keeps_successful_first_still_when_repair_retry_fails(self) -> None:
+        published_events: list[dict[str, object]] = []
+
+        render_outputs: list[object] = [
+            (b"good-image", "image/jpeg", "Aaron stands on the moon."),
+            RuntimeError("429 RESOURCE_EXHAUSTED"),
+            RuntimeError("429 RESOURCE_EXHAUSTED"),
+        ]
+
+        def _fake_generate_scene_still(*args, **kwargs):
+            outcome = render_outputs.pop(0)
+            if isinstance(outcome, Exception):
+                raise outcome
+            return outcome
+
+        def _schedule_background_task(coro):
+            try:
+                coro.close()
+            except Exception:
+                pass
+
+        async def _fast_sleep(*args, **kwargs) -> None:
+            return None
+
+        with (
+            patch.dict(os.environ, {"GOOGLE_CLOUD_PROJECT": "test-project"}, clear=False),
+            patch.object(tools, "_generate_scene_still", side_effect=_fake_generate_scene_still),
+            patch.object(
+                tools,
+                "_audit_scene_visual_continuity",
+                new=AsyncMock(
+                    return_value={
+                        "should_retry": True,
+                        "repair_prompt_suffix": "Show more moon surface and craters.",
+                    }
+                ),
+            ),
+            patch.object(tools, "_encode_transport_image", return_value=(b"encoded-image", "image/jpeg")),
+            patch.object(tools, "_describe_scene_image_for_continuity", new=AsyncMock(return_value="Moon surface with craters.")),
+            patch.object(tools, "_detect_character_reference_crops", new=AsyncMock(return_value=[])),
+            patch.object(tools, "_upload_scene_still", return_value=("https://example.com/moon.jpg", "gs://storybook/moon.jpg")),
+            patch.object(tools, "_persist_uploaded_scene_asset"),
+            patch.object(tools, "_make_thumbnail_b64", return_value=None),
+            patch.object(tools, "build_scene_visual_audit_feedback_signal", return_value=None),
+            patch.object(tools, "record_prompt_feedback"),
+            patch.object(tools, "publish_session_event", side_effect=lambda session_id, event: published_events.append(event)),
+            patch.object(tools, "schedule_background_task", side_effect=_schedule_background_task),
+            patch.object(tools, "_veo_enabled", return_value=False),
+            patch.object(tools.asyncio, "sleep", new=AsyncMock(side_effect=_fast_sleep)),
+        ):
+            asyncio.run(
+                tools._run_visual_pipeline(
+                    args=tools.VisualArgs(
+                        description=(
+                            "Moon. Aaron stands on a glowing sugar-cookie moon. Story continuity target: "
+                            "keep this page in or directly connected to moon."
+                        ),
+                        base_description="Moon. Aaron stands on a glowing sugar-cookie moon.",
+                        request_id="req-moon",
+                    ),
+                    session_id="session-a",
+                )
+            )
+
+        self.assertTrue(published_events)
+        self.assertEqual(published_events[0]["type"], "video_ready")
+        payload = published_events[0]["payload"]
+        self.assertEqual(payload["description"], "Moon. Aaron stands on a glowing sugar-cookie moon.")
+        self.assertFalse(bool(payload.get("is_fallback")))
 
 
 if __name__ == "__main__":

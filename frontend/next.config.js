@@ -1,4 +1,5 @@
-const backendUrl = process.env.BACKEND_URL?.trim() || '';
+const backendUrl =
+    process.env.BACKEND_URL?.trim() || process.env.NEXT_PUBLIC_BACKEND_URL?.trim() || '';
 const shouldProxyToBackend =
     process.env.NODE_ENV !== 'production' || backendUrl.length > 0;
 const backendTarget = backendUrl || 'http://localhost:8000';
@@ -12,6 +13,8 @@ const nextConfig = {
     // Environment variables available in the browser
     env: {
         // Use relative defaults so production never hardcodes localhost in client bundles.
+        NEXT_PUBLIC_BACKEND_URL:
+            process.env.NEXT_PUBLIC_BACKEND_URL ?? process.env.BACKEND_URL ?? '',
         NEXT_PUBLIC_WS_URL: process.env.NEXT_PUBLIC_WS_URL ?? '/ws/story',
         NEXT_PUBLIC_UPLOAD_URL: process.env.NEXT_PUBLIC_UPLOAD_URL ?? '/api/upload',
     },

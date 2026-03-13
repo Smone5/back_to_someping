@@ -13,6 +13,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import hashlib
+import ipaddress
 import io
 import json
 import logging
@@ -25,6 +26,7 @@ import wave
 from collections import OrderedDict
 from html import escape as html_escape
 from typing import Any
+from urllib.parse import urlparse
 
 import uvicorn
 import google.auth
@@ -38,6 +40,7 @@ from google.adk.sessions import InMemorySessionService
 from google import genai as google_genai
 from google.auth.transport.requests import Request as GoogleAuthRequest
 from google.genai import types as genai_types
+from pydantic import BaseModel, ConfigDict
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 # Ensure the project root (google-prog/) is on sys.path so `agent` package resolves
@@ -243,7 +246,7 @@ def _create_runner() -> Runner:
 
 # ── FastAPI App ────────────────────────────────────────────────────────────────
 app = FastAPI(
-    title="StorySpark API",
+    title="Voxitale API",
     description="Real-time Bidi-streaming picture-storytelling agent for young children.",
     version="1.0.0",
 )
@@ -251,6 +254,7 @@ app = FastAPI(
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[origin for origin in [settings.frontend_origin, settings.prod_frontend_origin] if origin],
+    allow_origin_regex=r"^https://storyteller-frontend-[a-z0-9-]+\.(?:[a-z0-9-]+\.)?run\.app$",
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -264,8 +268,45 @@ _SESSION_TTL_SECONDS = 24 * 60 * 60
 _CLEANUP_INTERVAL_SECONDS = 300
 _PAGE_READ_ALOUD_CACHE_MAX_ITEMS = 24
 _PAGE_READ_ALOUD_WORD_TIMESTAMPS_HEADER = "X-StorySpark-Word-Starts-Ms"
+_HOME_ASSISTANT_RELAY_TIMEOUT_SECONDS = 5.0
+_HOME_ASSISTANT_RESTORE_DELAY_SECONDS = 0.9
+_FRONTEND_RUN_APP_ORIGIN_RE = re.compile(
+    r"^https://storyteller-frontend-[a-z0-9-]+\.(?:[a-z0-9-]+\.)?run\.app$"
+)
 _page_read_aloud_cache: OrderedDict[str, tuple[bytes, str, tuple[int, ...], str, str]] = OrderedDict()
 _page_read_aloud_cache_lock = threading.Lock()
+
+
+class HomeAssistantRelayConfig(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    ha_url: str = ""
+    ha_token: str = ""
+    ha_entity: str = "light.living_room"
+
+
+class HomeAssistantRelayCommand(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    hex_color: str | None = None
+    rgb_color: list[int | float] | None = None
+    entity: str | None = None
+    brightness: int | float | None = None
+    transition: int | float | None = None
+    scene_description: str | None = None
+
+
+class HomeAssistantApplyRequest(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    config: HomeAssistantRelayConfig
+    command: HomeAssistantRelayCommand
+
+
+class HomeAssistantTestRequest(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    config: HomeAssistantRelayConfig
 
 
 def _allowed_frontend_origins() -> set[str]:
@@ -274,6 +315,310 @@ def _allowed_frontend_origins() -> set[str]:
         for origin in [settings.frontend_origin, settings.prod_frontend_origin]
         if origin and origin.strip()
     }
+
+
+def _is_allowed_frontend_origin(origin: str) -> bool:
+    normalized = origin.strip()
+    if not normalized:
+        return False
+    if normalized in _allowed_frontend_origins():
+        return True
+    return bool(_FRONTEND_RUN_APP_ORIGIN_RE.fullmatch(normalized))
+
+
+def _normalize_home_assistant_url(raw_url: str) -> str:
+    return str(raw_url or "").strip().rstrip("/")
+
+
+def _normalize_home_assistant_entity(raw_entity: str) -> str:
+    return str(raw_entity or "").strip()
+
+
+def _ha_url_is_private_or_local(ha_url: str) -> bool:
+    parsed = urlparse(ha_url.strip())
+    host = (parsed.hostname or "").strip().lower()
+    if not host:
+        return False
+
+    if (
+        host == "localhost"
+        or host == "127.0.0.1"
+        or host == "::1"
+        or host.endswith(".local")
+        or host.endswith(".lan")
+        or host.endswith(".home")
+        or host.endswith(".internal")
+        or "." not in host
+    ):
+        return True
+
+    try:
+        ip = ipaddress.ip_address(host)
+    except ValueError:
+        return False
+
+    return ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved
+
+
+def _map_home_assistant_http_reason(status_code: int) -> str:
+    if status_code == 400:
+        return "invalid_request"
+    if status_code == 401:
+        return "unauthorized"
+    if status_code == 403:
+        return "forbidden"
+    if status_code == 404:
+        return "entity_not_found"
+    return "http_error"
+
+
+def _coerce_home_assistant_rgb_color(value: Any) -> list[int] | None:
+    if not isinstance(value, list) or len(value) != 3:
+        return None
+
+    rgb: list[int] = []
+    for item in value:
+        try:
+            number = float(item)
+        except Exception:
+            return None
+        if number < 0 or number > 255:
+            return None
+        rgb.append(int(round(number)))
+    return rgb
+
+
+def _rgb_from_hex(hex_color: str | None) -> list[int] | None:
+    normalized = str(hex_color or "").strip().lstrip("#")
+    if not re.fullmatch(r"[0-9a-fA-F]{6}", normalized):
+        return None
+    return [
+        int(normalized[0:2], 16),
+        int(normalized[2:4], 16),
+        int(normalized[4:6], 16),
+    ]
+
+
+def _home_assistant_failure_response(
+    reason: str,
+    *,
+    status_code: int = 200,
+    message: str | None = None,
+) -> JSONResponse:
+    payload: dict[str, Any] = {"ok": False, "reason": reason, "transport": "backend"}
+    if message:
+        payload["message"] = message
+    return JSONResponse(payload, status_code=status_code)
+
+
+def _validate_backend_home_assistant_config(
+    config: HomeAssistantRelayConfig,
+) -> tuple[dict[str, str], None] | tuple[None, str]:
+    ha_url = _normalize_home_assistant_url(config.ha_url)
+    ha_token = str(config.ha_token or "").strip()
+    ha_entity = _normalize_home_assistant_entity(config.ha_entity) or "light.living_room"
+
+    if not ha_url:
+        return None, "missing_url"
+    if not ha_token:
+        return None, "missing_token"
+    if not ha_entity:
+        return None, "missing_entity"
+
+    parsed = urlparse(ha_url)
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        return None, "invalid_url"
+    if _ha_url_is_private_or_local(ha_url):
+        return None, "private_url"
+    if parsed.scheme != "https":
+        return None, "insecure_url"
+
+    return {
+        "ha_url": ha_url,
+        "ha_token": ha_token,
+        "ha_entity": ha_entity,
+    }, None
+
+
+def _normalize_home_assistant_state_rgb(value: Any) -> list[int] | None:
+    if not isinstance(value, list) or len(value) != 3:
+        return None
+
+    rgb: list[int] = []
+    for item in value:
+        try:
+            number = int(item)
+        except Exception:
+            return None
+        rgb.append(number)
+    return rgb
+
+
+async def _home_assistant_request(
+    client: httpx.AsyncClient,
+    config: dict[str, str],
+    path: str,
+    *,
+    method: str,
+    json_body: dict[str, Any] | None = None,
+) -> httpx.Response:
+    headers = {
+        "Authorization": f"Bearer {config['ha_token']}",
+        "Content-Type": "application/json",
+    }
+    return await client.request(
+        method,
+        f"{config['ha_url']}{path}",
+        headers=headers,
+        json=json_body,
+    )
+
+
+async def _load_home_assistant_state(
+    client: httpx.AsyncClient,
+    config: dict[str, str],
+) -> dict[str, Any]:
+    entity_id = _normalize_home_assistant_entity(config.get("ha_entity", "")) or "light.living_room"
+    try:
+        response = await _home_assistant_request(
+            client,
+            config,
+            f"/api/states/{entity_id}",
+            method="GET",
+        )
+    except httpx.HTTPError:
+        return {"reason": "network"}
+
+    if not response.is_success:
+        return {"reason": _map_home_assistant_http_reason(response.status_code)}
+
+    try:
+        payload = response.json()
+    except Exception:
+        return {"reason": "invalid_response"}
+
+    if not isinstance(payload, dict):
+        return {"reason": "invalid_response"}
+
+    attributes = payload.get("attributes")
+    if not isinstance(attributes, dict):
+        attributes = {}
+
+    brightness: int | None = None
+    raw_brightness = attributes.get("brightness")
+    try:
+        parsed_brightness = int(raw_brightness)
+    except Exception:
+        parsed_brightness = None
+    if parsed_brightness is not None:
+        brightness = parsed_brightness
+
+    return {
+        "entity_id": entity_id,
+        "friendly_name": (
+            str(attributes.get("friendly_name")).strip()
+            if isinstance(attributes.get("friendly_name"), str)
+            else entity_id
+        ),
+        "was_on": str(payload.get("state") or "").strip().lower() == "on",
+        "brightness": brightness,
+        "rgb_color": _normalize_home_assistant_state_rgb(attributes.get("rgb_color")),
+    }
+
+
+async def _apply_home_assistant_turn_on(
+    client: httpx.AsyncClient,
+    config: dict[str, str],
+    command: HomeAssistantRelayCommand,
+) -> dict[str, Any]:
+    rgb_color = _coerce_home_assistant_rgb_color(command.rgb_color)
+    if rgb_color is None:
+        rgb_color = _rgb_from_hex(command.hex_color)
+    if rgb_color is None:
+        return {"ok": False, "reason": "invalid_color", "transport": "backend"}
+
+    brightness = 200
+    if command.brightness is not None:
+        try:
+            brightness = int(round(float(command.brightness)))
+        except Exception:
+            brightness = 200
+
+    transition = 2.0
+    if command.transition is not None:
+        try:
+            transition = float(command.transition)
+        except Exception:
+            transition = 2.0
+
+    payload = {
+        "entity_id": _normalize_home_assistant_entity(command.entity or config.get("ha_entity", "")) or "light.living_room",
+        "rgb_color": rgb_color,
+        "brightness": brightness,
+        "transition": transition,
+    }
+
+    try:
+        response = await _home_assistant_request(
+            client,
+            config,
+            "/api/services/light/turn_on",
+            method="POST",
+            json_body=payload,
+        )
+    except httpx.HTTPError:
+        return {"ok": False, "reason": "network", "transport": "backend"}
+
+    if not response.is_success:
+        return {
+            "ok": False,
+            "reason": _map_home_assistant_http_reason(response.status_code),
+            "transport": "backend",
+        }
+    return {"ok": True, "transport": "backend"}
+
+
+async def _restore_home_assistant_state(
+    client: httpx.AsyncClient,
+    config: dict[str, str],
+    snapshot: dict[str, Any],
+) -> bool:
+    entity_id = _normalize_home_assistant_entity(str(snapshot.get("entity_id") or "")) or config["ha_entity"]
+    try:
+        if not bool(snapshot.get("was_on")):
+            response = await _home_assistant_request(
+                client,
+                config,
+                "/api/services/light/turn_off",
+                method="POST",
+                json_body={
+                    "entity_id": entity_id,
+                    "transition": 0.6,
+                },
+            )
+            return response.is_success
+
+        payload: dict[str, Any] = {
+            "entity_id": entity_id,
+            "transition": 0.6,
+        }
+        brightness = snapshot.get("brightness")
+        if isinstance(brightness, int):
+            payload["brightness"] = brightness
+        rgb_color = _normalize_home_assistant_state_rgb(snapshot.get("rgb_color"))
+        if rgb_color is not None:
+            payload["rgb_color"] = rgb_color
+
+        response = await _home_assistant_request(
+            client,
+            config,
+            "/api/services/light/turn_on",
+            method="POST",
+            json_body=payload,
+        )
+        return response.is_success
+    except httpx.HTTPError:
+        return False
 
 
 def _coerce_child_age(value: Any) -> int | None:
@@ -1076,9 +1421,8 @@ async def create_live_ephemeral_token(request: Request) -> JSONResponse:
             status_code=503,
         )
 
-    allowed_origins = _allowed_frontend_origins()
     request_origin = (request.headers.get("origin") or "").strip()
-    if not request_origin or request_origin not in allowed_origins:
+    if not _is_allowed_frontend_origin(request_origin):
         return JSONResponse(
             {
                 "error": "origin_not_allowed",
@@ -1134,9 +1478,8 @@ async def create_live_ephemeral_token(request: Request) -> JSONResponse:
 
 @app.post("/api/page-read-aloud")
 async def create_page_read_aloud(request: Request) -> Response:
-    allowed_origins = _allowed_frontend_origins()
     request_origin = (request.headers.get("origin") or "").strip()
-    if request_origin and allowed_origins and request_origin not in allowed_origins:
+    if request_origin and not _is_allowed_frontend_origin(request_origin):
         return JSONResponse(
             {
                 "error": "origin_not_allowed",
@@ -1196,7 +1539,7 @@ async def create_page_read_aloud(request: Request) -> Response:
         return JSONResponse(
             {
                 "error": "page_read_aloud_failed",
-                "message": "StorySpark could not create page audio right now.",
+                "message": "Voxitale could not create page audio right now.",
             },
             status_code=502,
         )
@@ -1208,7 +1551,7 @@ async def create_page_read_aloud(request: Request) -> Response:
         return JSONResponse(
             {
                 "error": "page_read_aloud_unavailable",
-                "message": "StorySpark could not create page audio right now.",
+                "message": "Voxitale could not create page audio right now.",
             },
             status_code=502,
         )
@@ -1220,7 +1563,7 @@ async def create_page_read_aloud(request: Request) -> Response:
         return JSONResponse(
             {
                 "error": "page_read_aloud_unavailable",
-                "message": "StorySpark could not create page audio right now.",
+                "message": "Voxitale could not create page audio right now.",
             },
             status_code=502,
         )
@@ -1236,7 +1579,7 @@ async def create_page_read_aloud(request: Request) -> Response:
         return JSONResponse(
             {
                 "error": "page_read_aloud_unavailable",
-                "message": "StorySpark could not create page audio right now.",
+                "message": "Voxitale could not create page audio right now.",
             },
             status_code=502,
         )
@@ -1257,6 +1600,94 @@ async def create_page_read_aloud(request: Request) -> Response:
             _PAGE_READ_ALOUD_WORD_TIMESTAMPS_HEADER: ",".join(str(value) for value in word_starts_ms),
         },
     )
+
+
+@app.post("/api/home-assistant/apply-lighting")
+async def apply_home_assistant_lighting_endpoint(
+    request: Request,
+    body: HomeAssistantApplyRequest,
+) -> JSONResponse:
+    request_origin = (request.headers.get("origin") or "").strip()
+    if request_origin and not _is_allowed_frontend_origin(request_origin):
+        return JSONResponse(
+            {
+                "error": "origin_not_allowed",
+                "message": "This endpoint only serves configured frontend origins.",
+            },
+            status_code=403,
+        )
+
+    config, reason = _validate_backend_home_assistant_config(body.config)
+    if reason:
+        return _home_assistant_failure_response(reason, status_code=400)
+
+    async with httpx.AsyncClient(timeout=_HOME_ASSISTANT_RELAY_TIMEOUT_SECONDS) as client:
+        result = await _apply_home_assistant_turn_on(client, config, body.command)
+    return JSONResponse(result)
+
+
+@app.post("/api/home-assistant/test-light")
+async def test_home_assistant_lighting_endpoint(
+    request: Request,
+    body: HomeAssistantTestRequest,
+) -> JSONResponse:
+    request_origin = (request.headers.get("origin") or "").strip()
+    if request_origin and not _is_allowed_frontend_origin(request_origin):
+        return JSONResponse(
+            {
+                "error": "origin_not_allowed",
+                "message": "This endpoint only serves configured frontend origins.",
+            },
+            status_code=403,
+        )
+
+    config, reason = _validate_backend_home_assistant_config(body.config)
+    if reason:
+        return _home_assistant_failure_response(reason, status_code=400)
+
+    async with httpx.AsyncClient(timeout=_HOME_ASSISTANT_RELAY_TIMEOUT_SECONDS) as client:
+        snapshot = await _load_home_assistant_state(client, config)
+        if snapshot.get("reason"):
+            return JSONResponse(
+                {
+                    "ok": False,
+                    "reason": snapshot["reason"],
+                    "entityName": snapshot.get("friendly_name"),
+                    "transport": "backend",
+                }
+            )
+
+        test_result = await _apply_home_assistant_turn_on(
+            client,
+            config,
+            HomeAssistantRelayCommand(
+                entity=str(snapshot.get("entity_id") or config["ha_entity"]),
+                rgb_color=[124, 92, 255],
+                brightness=190,
+                transition=0.6,
+            ),
+        )
+        if not test_result.get("ok"):
+            return JSONResponse(
+                {
+                    "ok": False,
+                    "reason": test_result.get("reason"),
+                    "entityName": snapshot.get("friendly_name"),
+                    "transport": "backend",
+                }
+            )
+
+        await asyncio.sleep(_HOME_ASSISTANT_RESTORE_DELAY_SECONDS)
+        restored = await _restore_home_assistant_state(client, config, snapshot)
+        return JSONResponse(
+            {
+                "ok": restored,
+                "reason": None if restored else "restore_failed",
+                "entityName": snapshot.get("friendly_name"),
+                "restored": restored,
+                "transport": "backend",
+            }
+        )
 
 
 @app.get("/api/scene/{media_id}")

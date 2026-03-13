@@ -10,6 +10,31 @@ function deriveBackendRunAppHost(host: string): string | null {
     return `storyteller-backend-${match[1]}`;
 }
 
+function deriveBackendHttpOriginFromConfiguredUrls(): string | null {
+    const candidates = [
+        process.env.NEXT_PUBLIC_BACKEND_URL ?? '',
+        process.env.NEXT_PUBLIC_PAGE_READ_ALOUD_URL ?? '',
+        process.env.NEXT_PUBLIC_UPLOAD_URL ?? '',
+        process.env.NEXT_PUBLIC_WS_URL ?? '',
+    ];
+    for (const raw of candidates) {
+        const normalized = raw.trim();
+        if (!normalized || normalized.startsWith('/')) continue;
+        try {
+            const parsed = new URL(normalized);
+            if (parsed.protocol === 'http:' || parsed.protocol === 'https:') {
+                return parsed.origin;
+            }
+            if (parsed.protocol === 'ws:' || parsed.protocol === 'wss:') {
+                return parsed.origin.replace(/^ws/i, 'http');
+            }
+        } catch {
+            // Ignore malformed configured URLs and keep searching.
+        }
+    }
+    return null;
+}
+
 function resolvePageReadAloudUrl(): string {
     const configured = process.env.NEXT_PUBLIC_PAGE_READ_ALOUD_URL ?? '';
     if (typeof window === 'undefined') {
@@ -17,14 +42,26 @@ function resolvePageReadAloudUrl(): string {
     }
     const protocol = window.location.protocol;
     const host = window.location.host;
+    const backendOrigin = deriveBackendHttpOriginFromConfiguredUrls();
+    const backendRunAppHost = deriveBackendRunAppHost(host);
     const normalized = configured.trim();
     if (!normalized) {
+        if (backendOrigin) return `${backendOrigin}/api/page-read-aloud`;
+        if (backendRunAppHost) return `${protocol}//${backendRunAppHost}/api/page-read-aloud`;
         return `${protocol}//${host}/api/page-read-aloud`;
     }
     if (normalized.includes('localhost:8000') || normalized.includes('storyteller.example.com')) {
+        if (backendOrigin) return `${backendOrigin}/api/page-read-aloud`;
+        if (backendRunAppHost) return `${protocol}//${backendRunAppHost}/api/page-read-aloud`;
         return `${protocol}//${host}/api/page-read-aloud`;
     }
     if (normalized.startsWith('/')) {
+        if (backendOrigin && normalized.startsWith('/api/')) {
+            return `${backendOrigin}${normalized}`;
+        }
+        if (backendRunAppHost && normalized.startsWith('/api/')) {
+            return `${protocol}//${backendRunAppHost}${normalized}`;
+        }
         return `${protocol}//${host}${normalized}`;
     }
     return normalized;

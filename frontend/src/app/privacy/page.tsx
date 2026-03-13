@@ -1,8 +1,8 @@
 import Link from 'next/link';
 
 export const metadata = {
-    title: 'Privacy Policy — StorySpark',
-    description: 'Privacy policy for StorySpark. We do not store audio or collect personal information.',
+    title: 'Privacy Policy — Voxitale',
+    description: 'Privacy policy for Voxitale. We do not store audio or collect personal information.',
 };
 
 export default function PrivacyPage() {
@@ -15,7 +15,7 @@ export default function PrivacyPage() {
                 <section>
                     <h2>Overview</h2>
                     <p>
-                        StorySpark (&quot;the app&quot;) is designed with children and families in mind.
+                        Voxitale (&quot;the app&quot;) is designed with children and families in mind.
                         We take privacy seriously and collect as little as possible.
                     </p>
                 </section>
@@ -32,7 +32,7 @@ export default function PrivacyPage() {
                 <section>
                     <h2>Optional features</h2>
                     <ul>
-                        <li><strong>Room lights (Home Assistant):</strong> If you connect smart lights, configuration is stored only on your device (e.g. in browser local storage). We do not receive or store your home setup.</li>
+                        <li><strong>Room lights (Home Assistant):</strong> If you connect smart lights, configuration is stored on your device. For publicly reachable Home Assistant URLs, Voxitale may relay light commands through the backend during the active session, but we do not persist your Home Assistant token or home setup after the request completes.</li>
                     </ul>
                 </section>
 
@@ -45,7 +45,7 @@ export default function PrivacyPage() {
                 </section>
 
                 <p className="privacy-back">
-                    <Link href="/">← Back to StorySpark</Link>
+                    <Link href="/">← Back to Voxitale</Link>
                 </p>
             </div>
         </main>

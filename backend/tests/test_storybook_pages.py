@@ -116,6 +116,31 @@ class StorybookPagesTests(unittest.TestCase):
         self.assertEqual(pages[0]["storybeat_text"], "")
         self.assertEqual(pages[0]["scene_description"], "A cozy treehouse glows at the end of the path.")
 
+    def test_story_page_lighting_metadata_is_preserved(self) -> None:
+        pages = story_pages_from_state_data(
+            {
+                "story_pages": [
+                    {
+                        "scene_number": 1,
+                        "request_id": "req-a",
+                        "scene_description": "A moonlit castle hallway sparkles with bubbles.",
+                        "hex_color": "#6FA8FF",
+                        "rgb_color": [111, 168, 255],
+                        "brightness": 154,
+                        "transition": 1.1,
+                        "cue_source": "heuristic_scene",
+                    }
+                ]
+            }
+        )
+
+        self.assertEqual(len(pages), 1)
+        self.assertEqual(pages[0]["hex_color"], "#6FA8FF")
+        self.assertEqual(pages[0]["rgb_color"], [111, 168, 255])
+        self.assertEqual(pages[0]["brightness"], 154)
+        self.assertEqual(pages[0]["transition"], 1.1)
+        self.assertEqual(pages[0]["cue_source"], "heuristic_scene")
+
 
 if __name__ == "__main__":
     unittest.main()

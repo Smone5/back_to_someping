@@ -89,6 +89,7 @@ from shared.story_text import (
     split_story_sentences as shared_split_story_sentences,
     truncate_story_sentence as shared_truncate_story_sentence,
 )
+from shared.storybook_lighting import heuristic_storybook_lighting_command
 from shared.storybook_pages import count_rendered_story_pages, story_pages_from_state_data
 from shared.storybook_studio_workflow import (
     build_storybook_studio_plan_from_workflow_state,
@@ -545,6 +546,48 @@ def _resolve_story_page_for_lighting(tool_state: dict[str, Any]) -> dict[str, An
     }
 
 
+def _promote_pending_scene_request_to_current(
+    state: dict[str, Any],
+    *,
+    request_id: str | None,
+    description: str = "",
+    storybeat_text: str = "",
+    scene_visual_summary: str = "",
+) -> bool:
+    normalized_request_id = str(request_id or "").strip()
+    active_request_id = str(state.get("active_scene_request_id", "") or "").strip()
+    is_current_scene_request = (
+        not normalized_request_id
+        or not active_request_id
+        or normalized_request_id == active_request_id
+    )
+    if not is_current_scene_request:
+        return False
+
+    if description:
+        state["current_scene_description"] = description
+        if not str(state.get("canonical_scene_description", "") or "").strip():
+            state["canonical_scene_description"] = description
+
+    pending_base_description = str(state.get("pending_scene_base_description", "") or "").strip()
+    if pending_base_description:
+        state["current_scene_base_description"] = pending_base_description
+    elif description and not str(state.get("current_scene_base_description", "") or "").strip():
+        state["current_scene_base_description"] = description
+
+    if storybeat_text:
+        state["current_scene_storybeat_text"] = storybeat_text
+        if not str(state.get("canonical_scene_storybeat_text", "") or "").strip():
+            state["canonical_scene_storybeat_text"] = storybeat_text
+
+    if scene_visual_summary:
+        state["current_scene_visual_summary"] = scene_visual_summary
+
+    state["pending_scene_description"] = ""
+    state["pending_scene_base_description"] = ""
+    return True
+
+
 def _remember_scene_lighting_command(
     tool_context: ToolContext | None,
     session_id: str | None,
@@ -554,6 +597,7 @@ def _remember_scene_lighting_command(
     brightness: int,
     transition: float,
     scene_description: str,
+    cue_source: str = "",
 ) -> None:
     tool_state = _load_tool_state(tool_context)
     page = _resolve_story_page_for_lighting(tool_state)
@@ -577,6 +621,9 @@ def _remember_scene_lighting_command(
         "scene_description": merged_scene_description,
         "storybeat_text": str(page.get("storybeat_text", "") or "").strip(),
     }
+    normalized_cue_source = str(cue_source or "").strip()
+    if normalized_cue_source:
+        cue_entry["cue_source"] = normalized_cue_source
     cues = [
         dict(item)
         for item in list(tool_state.get("scene_lighting_cues", []) or [])
@@ -601,18 +648,122 @@ def _remember_scene_lighting_command(
         cues.append(cue_entry)
     cues = cues[-40:]
 
+    def _upsert_story_page_lighting_metadata(state: dict[str, Any]) -> None:
+        pages = [dict(item) for item in _story_pages_from_state(state)]
+        target_index = -1
+        if request_id:
+            for idx, existing_page in enumerate(pages):
+                existing_request_id = str(existing_page.get("request_id", "") or "").strip()
+                if existing_request_id == request_id:
+                    target_index = idx
+                    break
+        if target_index < 0:
+            for idx, existing_page in enumerate(pages):
+                try:
+                    existing_scene_number = int(existing_page.get("scene_number") or 0)
+                except Exception:
+                    existing_scene_number = 0
+                if existing_scene_number == scene_number:
+                    target_index = idx
+                    break
+
+        page_update = {
+            "scene_number": scene_number,
+            "request_id": request_id,
+            "scene_description": str(page.get("scene_description", "") or "").strip() or merged_scene_description,
+            "storybeat_text": str(page.get("storybeat_text", "") or "").strip(),
+            "hex_color": hex_color,
+            "rgb_color": list(rgb_color),
+            "brightness": int(brightness),
+            "transition": float(transition),
+        }
+        if normalized_cue_source:
+            page_update["cue_source"] = normalized_cue_source
+
+        if target_index < 0:
+            pages.append(page_update)
+        else:
+            merged_page = dict(pages[target_index])
+            if request_id:
+                merged_page["request_id"] = request_id
+            merged_page["scene_number"] = scene_number
+            if page_update["scene_description"] and not str(merged_page.get("scene_description", "") or "").strip():
+                merged_page["scene_description"] = page_update["scene_description"]
+            if page_update["storybeat_text"] and not str(merged_page.get("storybeat_text", "") or "").strip():
+                merged_page["storybeat_text"] = page_update["storybeat_text"]
+            merged_page["hex_color"] = page_update["hex_color"]
+            merged_page["rgb_color"] = page_update["rgb_color"]
+            merged_page["brightness"] = page_update["brightness"]
+            merged_page["transition"] = page_update["transition"]
+            if normalized_cue_source:
+                merged_page["cue_source"] = normalized_cue_source
+            pages[target_index] = merged_page
+        pages.sort(key=lambda item: int(item.get("scene_number", 0) or 0))
+        state["story_pages"] = pages[-40:]
+
+        branch_points = [
+            dict(item)
+            for item in list(state.get("scene_branch_points", []) or [])
+            if isinstance(item, dict)
+        ]
+        branch_target_index = -1
+        if request_id:
+            for idx, existing_point in enumerate(branch_points):
+                existing_request_id = str(existing_point.get("request_id", "") or "").strip()
+                if existing_request_id == request_id:
+                    branch_target_index = idx
+                    break
+        if branch_target_index < 0:
+            for idx, existing_point in enumerate(branch_points):
+                try:
+                    existing_scene_number = int(existing_point.get("scene_number") or 0)
+                except Exception:
+                    existing_scene_number = 0
+                if existing_scene_number == scene_number:
+                    branch_target_index = idx
+                    break
+
+        if branch_target_index >= 0:
+            branch_point = dict(branch_points[branch_target_index])
+            if request_id:
+                branch_point["request_id"] = request_id
+            branch_point["scene_number"] = scene_number
+            branch_point["hex_color"] = hex_color
+            branch_point["rgb_color"] = list(rgb_color)
+            branch_point["brightness"] = int(brightness)
+            branch_point["transition"] = float(transition)
+            if normalized_cue_source:
+                branch_point["cue_source"] = normalized_cue_source
+            branch_points[branch_target_index] = branch_point
+            state["scene_branch_points"] = branch_points[-20:]
+
+        _sync_story_pages_in_state(state)
+
     if tool_context is not None:
         try:
             tool_context.state["scene_lighting_cues"] = cues
+            _upsert_story_page_lighting_metadata(tool_context.state)
         except Exception:
             pass
 
     if session_id:
         cached = dict(_storybook_state_cache.get(session_id) or {})
         cached["scene_lighting_cues"] = cues
+        _upsert_story_page_lighting_metadata(cached)
         cache_storybook_state(session_id, cached)
         try:
-            _update_storybook_firestore(session_id, {"scene_lighting_cues": cues})
+            _update_storybook_firestore(
+                session_id,
+                {
+                    "scene_lighting_cues": cues,
+                    "story_pages": list(cached.get("story_pages", []) or []),
+                    "scene_branch_points": list(cached.get("scene_branch_points", []) or []),
+                    "scene_asset_urls": list(cached.get("scene_asset_urls", []) or []),
+                    "scene_asset_gcs_uris": list(cached.get("scene_asset_gcs_uris", []) or []),
+                    "scene_descriptions": list(cached.get("scene_descriptions", []) or []),
+                    "scene_storybeat_texts": list(cached.get("scene_storybeat_texts", []) or []),
+                },
+            )
         except Exception:
             logger.debug("Could not persist scene lighting cues for %s", session_id, exc_info=True)
 
@@ -678,6 +829,9 @@ def _stable_visual_key(label: str) -> str:
 def _ensure_visual_memory_state(state: dict[str, Any] | None) -> dict[str, Any]:
     if not isinstance(state, dict):
         return {}
+
+    state["pending_scene_description"] = str(state.get("pending_scene_description", "") or "").strip()
+    state["pending_scene_base_description"] = str(state.get("pending_scene_base_description", "") or "").strip()
 
     raw_bible = state.get("character_bible", {})
     cleaned_bible: dict[str, Any] = {}
@@ -2131,18 +2285,13 @@ def _persist_uploaded_scene_asset(
     }
     _sync_story_pages_in_state(updated_state)
 
-    active_request_id = str(updated_state.get("active_scene_request_id", "") or "").strip()
-    is_current_scene_request = not normalized_request_id or not active_request_id or normalized_request_id == active_request_id
-    if description and is_current_scene_request:
-        updated_state["current_scene_description"] = description
-        if not str(updated_state.get("canonical_scene_description", "") or "").strip():
-            updated_state["canonical_scene_description"] = description
-    if storybeat_text and is_current_scene_request:
-        updated_state["current_scene_storybeat_text"] = storybeat_text
-        if not str(updated_state.get("canonical_scene_storybeat_text", "") or "").strip():
-            updated_state["canonical_scene_storybeat_text"] = storybeat_text
-    if scene_visual_summary and is_current_scene_request:
-        updated_state["current_scene_visual_summary"] = scene_visual_summary
+    is_current_scene_request = _promote_pending_scene_request_to_current(
+        updated_state,
+        request_id=normalized_request_id,
+        description=description,
+        storybeat_text=storybeat_text,
+        scene_visual_summary=scene_visual_summary,
+    )
     if scene_visual_summary:
         updated_state["previous_scene_visual_summary"] = scene_visual_summary
         if not str(updated_state.get("canonical_scene_visual_summary", "") or "").strip():
@@ -2264,6 +2413,10 @@ def _fallback_storybeat_text(description: str) -> str:
     if not text:
         return "A magical new page appears in the storybook."
     return text
+
+
+def _public_scene_description(args: VisualArgs) -> str:
+    return str(args.base_description or args.description or "").strip()
 
 
 def _extract_first_uri(obj: Any) -> str | None:
@@ -2923,25 +3076,59 @@ async def generate_scene_visuals(
             # The skip logic used to be here, but was removed because it relied on
             # stale `tool_context.state` snapshots which incorrectly blocked
             # valid shortcircuited story generations on Turn 1.
-        # Persist scene description in state so the model knows what's displayed on screen
+        # Keep the requested next page separate from the currently visible page
+        # until an actual preview image lands.
         if tool_context:
             tool_context.state["previous_scene_description"] = tool_context.state.get(
                 "current_scene_description", ""
             )
-            tool_context.state["current_visual_continuity_plan"] = dict(continuity_plan or {})
-            tool_context.state["character_bible"] = dict(state.get("character_bible", {}) or {})
             tool_context.state["previous_scene_base_description"] = tool_context.state.get(
                 "current_scene_base_description", ""
             )
-            tool_context.state["current_scene_description"] = visual_description
-            tool_context.state["current_scene_base_description"] = base_description
+            tool_context.state["pending_scene_description"] = visual_description
+            tool_context.state["pending_scene_base_description"] = base_description
+            tool_context.state["current_visual_continuity_plan"] = dict(continuity_plan or {})
+            tool_context.state["character_bible"] = dict(state.get("character_bible", {}) or {})
             tool_context.state["active_scene_request_id"] = request_id
             ensure_story_continuity_state(tool_context.state)
             _ensure_visual_memory_state(tool_context.state)
+            heuristic_lighting = heuristic_storybook_lighting_command(base_description)
+            try:
+                heuristic_result = await _sync_room_lights_impl(
+                    hex_color=str(heuristic_lighting.get("hex_color") or ""),
+                    scene_description=base_description,
+                    tool_context=tool_context,
+                    enforce_cooldown=False,
+                    remember_last_color=True,
+                    brightness=heuristic_lighting.get("brightness"),
+                    transition=heuristic_lighting.get("transition"),
+                    cue_source=str(heuristic_lighting.get("cue_source") or ""),
+                )
+                logger.info(
+                    "[generate_scene_visuals] heuristic live lighting for %s -> %s | %s",
+                    session_id,
+                    heuristic_lighting.get("hex_color"),
+                    heuristic_result,
+                )
+            except Exception:
+                logger.warning(
+                    "[generate_scene_visuals] heuristic live lighting failed for %s",
+                    session_id,
+                    exc_info=True,
+                )
         if session_id:
             cached_generation_state = _copy_state_mapping(state)
+            cached_generation_state["pending_scene_description"] = visual_description
+            cached_generation_state["pending_scene_base_description"] = base_description
+            cached_generation_state["previous_scene_description"] = cached_generation_state.get(
+                "current_scene_description", ""
+            )
+            cached_generation_state["previous_scene_base_description"] = cached_generation_state.get(
+                "current_scene_base_description", ""
+            )
             cached_generation_state["current_visual_continuity_plan"] = dict(continuity_plan or {})
             cached_generation_state["character_bible"] = dict(state.get("character_bible", {}) or {})
+            cached_generation_state["active_scene_request_id"] = request_id
             cache_storybook_state(session_id, cached_generation_state)
 
         _elapsed = int((time.monotonic() - _tool_entry_t) * 1000)
@@ -3009,11 +3196,13 @@ async def _run_visual_pipeline(
     image_mime = "image/jpeg"
     gcs_uri: str | None = None
     storybeat_text = _fallback_storybeat_text(args.base_description or args.description)
+    public_scene_description = _public_scene_description(args)
     superseded_render = False
     audit_payload: dict[str, Any] | None = None
     audit_history: list[dict[str, Any]] = []
     audit_learning_prompt_text = args.base_description or args.description
     focused_character_references: list[dict[str, Any]] = []
+    accepted_render: dict[str, Any] | None = None
 
     # Track timing and description for the session.
     if session_id:
@@ -3038,95 +3227,139 @@ async def _run_visual_pipeline(
             logger.info(f"⏱️ TIMING [pipeline] SEMAPHORE ACQUIRED | elapsed={_sem_elapsed}ms | session={session_id}")
             render_args = args
             for repair_attempt in range(2):
-                base_desc = render_args.base_description or render_args.description
-                simple_desc = re.sub(r"\s+", " ", base_desc).strip()
-                simple_desc = simple_desc[:220] if simple_desc else (base_desc[:220] or base_desc)
-                prefixed_simple = f"A whimsical children's storybook illustration of: {simple_desc}"
-                retry_plans = [
-                    (prefixed_simple, render_args.negative_prompt),
-                    (base_desc, render_args.negative_prompt),
-                ]
-                image_bytes = None
-                for attempt, (desc, neg) in enumerate(retry_plans, start=1):
-                    _attempt_t0 = time.monotonic()
-                    effective_size = render_args.image_size
-                    try:
-                        image_bytes, image_mime, storybeat_text = await asyncio.wait_for(
-                            asyncio.to_thread(
-                                _generate_scene_still,
-                                desc,
-                                neg,
-                                render_args.aspect_ratio,
-                                effective_size,
-                                render_args.image_model,
-                                render_args.reference_images,
-                                render_args.illustration_style,
-                                render_args.continuity_plan,
-                                render_args.active_character_bible,
-                            ),
-                            timeout=45.0,
-                        )
-                        if image_bytes:
-                            _attempt_elapsed = int((time.monotonic() - _attempt_t0) * 1000)
-                            _total_elapsed = int((time.monotonic() - _pipeline_t0) * 1000)
-                            logger.info(
-                                "⏱️ TIMING [pipeline] IMAGE GEN attempt %d SUCCESS | attempt_ms=%d | total_ms=%d | bytes=%d | session=%s",
-                                attempt,
-                                _attempt_elapsed,
-                                _total_elapsed,
-                                len(image_bytes),
-                                session_id,
+                try:
+                    base_desc = render_args.base_description or render_args.description
+                    simple_desc = re.sub(r"\s+", " ", base_desc).strip()
+                    simple_desc = simple_desc[:220] if simple_desc else (base_desc[:220] or base_desc)
+                    prefixed_simple = f"A whimsical children's storybook illustration of: {simple_desc}"
+                    retry_plans = [
+                        (prefixed_simple, render_args.negative_prompt),
+                        (base_desc, render_args.negative_prompt),
+                    ]
+                    image_bytes = None
+                    for attempt, (desc, neg) in enumerate(retry_plans, start=1):
+                        _attempt_t0 = time.monotonic()
+                        effective_size = render_args.image_size
+                        try:
+                            image_bytes, image_mime, storybeat_text = await asyncio.wait_for(
+                                asyncio.to_thread(
+                                    _generate_scene_still,
+                                    desc,
+                                    neg,
+                                    render_args.aspect_ratio,
+                                    effective_size,
+                                    render_args.image_model,
+                                    render_args.reference_images,
+                                    render_args.illustration_style,
+                                    render_args.continuity_plan,
+                                    render_args.active_character_bible,
+                                ),
+                                timeout=45.0,
                             )
-                            render_args.image_size = effective_size
+                            if image_bytes:
+                                _attempt_elapsed = int((time.monotonic() - _attempt_t0) * 1000)
+                                _total_elapsed = int((time.monotonic() - _pipeline_t0) * 1000)
+                                logger.info(
+                                    "⏱️ TIMING [pipeline] IMAGE GEN attempt %d SUCCESS | attempt_ms=%d | total_ms=%d | bytes=%d | session=%s",
+                                    attempt,
+                                    _attempt_elapsed,
+                                    _total_elapsed,
+                                    len(image_bytes),
+                                    session_id,
+                                )
+                                render_args.image_size = effective_size
+                                if session_id and session_id in _session_cancel_current:
+                                    superseded_render = True
+                                break
+                        except Exception as exc:
                             if session_id and session_id in _session_cancel_current:
-                                superseded_render = True
-                            break
-                    except Exception as exc:
-                        if session_id and session_id in _session_cancel_current:
-                            logger.info(
-                                "Abandoning superseded scene render for session %s after attempt %d failure: %s",
-                                session_id,
-                                attempt,
-                                exc,
-                            )
-                            raise _SupersededSceneRequest("newer scene queued during retry window") from exc
-                        if attempt < len(retry_plans):
-                            wait = 0.4 if attempt == 1 else 0.6
-                            logger.warning(
-                                "Image generation attempt %d/%d failed (size=%s): %s — "
-                                "waiting %.1fs before retry.",
-                                attempt,
-                                len(retry_plans),
-                                effective_size,
-                                exc,
-                                wait,
-                            )
-                            await asyncio.sleep(wait)
-                        else:
-                            raise
-                if not image_bytes:
-                    raise RuntimeError("Image generation completed without bytes.")
-                audit_payload = await _audit_scene_visual_continuity(
-                    image_bytes=image_bytes,
-                    image_mime=image_mime,
-                    args=render_args,
-                )
-                args = render_args
-                if session_id and audit_payload:
-                    cached_state = load_storybook_resume_state(session_id)
-                    cached_state["last_scene_visual_audit"] = dict(audit_payload or {})
-                    cache_storybook_state(session_id, cached_state)
-                if isinstance(audit_payload, Mapping):
-                    audit_history.append(dict(audit_payload))
-                repaired_args = _repair_visual_args_from_audit(render_args, audit_payload)
-                if repaired_args is None or repair_attempt >= 1:
-                    break
-                logger.info(
-                    "Scene visual audit requested one repair retry for session %s: %s",
-                    session_id,
-                    _normalize_text_fragment(audit_payload.get("repair_prompt_suffix", "") if isinstance(audit_payload, Mapping) else "", limit=180),
-                )
-                render_args = repaired_args
+                                logger.info(
+                                    "Abandoning superseded scene render for session %s after attempt %d failure: %s",
+                                    session_id,
+                                    attempt,
+                                    exc,
+                                )
+                                raise _SupersededSceneRequest("newer scene queued during retry window") from exc
+                            if attempt < len(retry_plans):
+                                wait = 0.4 if attempt == 1 else 0.6
+                                logger.warning(
+                                    "Image generation attempt %d/%d failed (size=%s): %s — "
+                                    "waiting %.1fs before retry.",
+                                    attempt,
+                                    len(retry_plans),
+                                    effective_size,
+                                    exc,
+                                    wait,
+                                )
+                                await asyncio.sleep(wait)
+                            else:
+                                raise
+                    if not image_bytes:
+                        raise RuntimeError("Image generation completed without bytes.")
+
+                    accepted_render = {
+                        "image_bytes": image_bytes,
+                        "image_mime": image_mime,
+                        "storybeat_text": storybeat_text,
+                        "render_args": render_args,
+                        "audit_payload": audit_payload,
+                        "audit_history": [dict(item) for item in audit_history],
+                    }
+                    audit_payload = await _audit_scene_visual_continuity(
+                        image_bytes=image_bytes,
+                        image_mime=image_mime,
+                        args=render_args,
+                    )
+                    args = render_args
+                    if session_id and audit_payload:
+                        cached_state = load_storybook_resume_state(session_id)
+                        cached_state["last_scene_visual_audit"] = dict(audit_payload or {})
+                        cache_storybook_state(session_id, cached_state)
+                    if isinstance(audit_payload, Mapping):
+                        audit_history.append(dict(audit_payload))
+                    if accepted_render is not None:
+                        accepted_render["audit_payload"] = dict(audit_payload) if isinstance(audit_payload, Mapping) else audit_payload
+                        accepted_render["audit_history"] = [dict(item) for item in audit_history]
+                    repaired_args = _repair_visual_args_from_audit(render_args, audit_payload)
+                    if repaired_args is None or repair_attempt >= 1:
+                        break
+                    logger.info(
+                        "Scene visual audit requested one repair retry for session %s: %s",
+                        session_id,
+                        _normalize_text_fragment(audit_payload.get("repair_prompt_suffix", "") if isinstance(audit_payload, Mapping) else "", limit=180),
+                    )
+                    render_args = repaired_args
+                except Exception as exc:
+                    can_fallback_to_accepted_render = (
+                        accepted_render is not None
+                        and not (session_id and session_id in _session_cancel_current)
+                    )
+                    if can_fallback_to_accepted_render:
+                        image_bytes = accepted_render["image_bytes"]
+                        image_mime = str(accepted_render.get("image_mime") or image_mime or "image/jpeg")
+                        storybeat_text = str(accepted_render.get("storybeat_text") or storybeat_text or "").strip() or storybeat_text
+                        render_args = accepted_render["render_args"]
+                        args = render_args
+                        restored_audit_payload = accepted_render.get("audit_payload")
+                        audit_payload = (
+                            dict(restored_audit_payload)
+                            if isinstance(restored_audit_payload, Mapping)
+                            else restored_audit_payload
+                        )
+                        restored_history = accepted_render.get("audit_history")
+                        audit_history = [
+                            dict(item)
+                            for item in list(restored_history or [])
+                            if isinstance(item, Mapping)
+                        ]
+                        logger.warning(
+                            "Scene repair retry failed for session %s; using the last successful still instead: %s",
+                            session_id,
+                            exc,
+                        )
+                        break
+                    raise
+            public_scene_description = _public_scene_description(render_args)
         _gen_total = int((time.monotonic() - _pipeline_t0) * 1000)
         logger.info(f"⏱️ TIMING [pipeline] IMAGE GEN COMPLETE | total_ms={_gen_total} | raw_bytes={len(image_bytes)} | session={session_id}")
         if session_id:
@@ -3193,7 +3426,7 @@ async def _run_visual_pipeline(
                             "payload": {
                                 "url": still_url,
                                 "media_type": "image",
-                                "description": args.description,
+                                "description": public_scene_description,
                                 "storybeat_text": storybeat_text,
                                 "is_placeholder": False,
                                 # The inline preview is for immediate paint only. Persist the
@@ -3263,7 +3496,7 @@ async def _run_visual_pipeline(
             if session_id and (cloud_still_url or gcs_uri):
                 _persist_uploaded_scene_asset(
                     session_id=session_id,
-                    description=args.description,
+                    description=public_scene_description,
                     storybeat_text=storybeat_text,
                     scene_visual_summary=scene_visual_summary,
                     cloud_still_url=cloud_still_url,
@@ -3282,7 +3515,7 @@ async def _run_visual_pipeline(
             if session_id and still_url:
                 _persist_uploaded_scene_asset(
                     session_id=session_id,
-                    description=args.description,
+                    description=public_scene_description,
                     storybeat_text=storybeat_text,
                     scene_visual_summary=scene_visual_summary,
                     cloud_still_url=None,
@@ -3357,8 +3590,8 @@ async def _run_visual_pipeline(
         )
         if session_id and session_id not in _session_cancel_current and not retry_scheduled:
             payload = {
-                "url": _build_fallback_scene_svg_data_url(args.description),
-                "description": args.description,
+                "url": _build_fallback_scene_svg_data_url(public_scene_description or args.description),
+                "description": public_scene_description,
                 "storybeat_text": storybeat_text,
                 "media_type": "image",
                 "is_placeholder": False,
@@ -7385,6 +7618,27 @@ async def sync_room_lights(
     tool_context: ToolContext | None = None,
 ) -> str:
     """Syncs smart-home lights with a per-session cooldown and client fallback."""
+    return await _sync_room_lights_impl(
+        hex_color=hex_color,
+        scene_description=scene_description,
+        tool_context=tool_context,
+        enforce_cooldown=True,
+        remember_last_color=True,
+    )
+
+
+async def _sync_room_lights_impl(
+    *,
+    hex_color: str,
+    scene_description: str = "",
+    tool_context: ToolContext | None = None,
+    enforce_cooldown: bool,
+    remember_last_color: bool,
+    brightness: Any | None = None,
+    transition: Any | None = None,
+    cue_source: str = "tool_sync",
+) -> str:
+    """Internal light-sync helper so heuristic scene cues can bypass cooldown."""
     args = LightArgs(hex_color=hex_color.strip(), scene_description=scene_description.strip())
     session_id = _session_id_from_context(tool_context)
     tool_state = _load_tool_state(tool_context)
@@ -7395,22 +7649,37 @@ async def sync_room_lights(
         return f"System: {exc}"
 
     last_active_hex = str(tool_state.get("last_active_hex_color", "")).strip().upper()
-    if last_active_hex == normalized_hex.upper():
-        return f"System: Room lights already match {normalized_hex}."
-
     r, g, b = _rgb_from_hex(normalized_hex)
-    brightness = 200
-    transition = 2
-    if session_id:
+    resolved_brightness = 200
+    if brightness is not None:
+        try:
+            resolved_brightness = int(round(float(brightness)))
+        except Exception:
+            resolved_brightness = 200
+    resolved_brightness = max(25, min(resolved_brightness, 255))
+
+    resolved_transition = 2.0
+    if transition is not None:
+        try:
+            resolved_transition = float(transition)
+        except Exception:
+            resolved_transition = 2.0
+    resolved_transition = max(0.4, min(resolved_transition, 3.0))
+
+    if session_id or tool_context is not None:
         _remember_scene_lighting_command(
             tool_context,
             session_id,
             hex_color=normalized_hex,
             rgb_color=[r, g, b],
-            brightness=brightness,
-            transition=transition,
+            brightness=resolved_brightness,
+            transition=resolved_transition,
             scene_description=args.scene_description,
+            cue_source=cue_source,
         )
+
+    if last_active_hex == normalized_hex.upper():
+        return f"System: Room lights already match {normalized_hex}."
 
     cfg = get_session_iot_config(session_id) if session_id else {}
     session_ha_url = str(cfg.get("ha_url", "")).strip()
@@ -7421,18 +7690,19 @@ async def sync_room_lights(
     if not ha_url or not ha_token:
         return f"System: IoT lights not configured, skipping sync for color {normalized_hex}."
 
-    now = time.monotonic()
-    cooldown_key = _session_light_cooldown_key(session_id)
-    last_call = _last_light_call_by_session.get(cooldown_key, 0.0)
-    if now - last_call < _LIGHT_COOLDOWN_SECONDS:
-        remaining = _LIGHT_COOLDOWN_SECONDS - (now - last_call)
-        return f"System: Lighting cooldown active. Next change available in {remaining:.1f}s."
-    _last_light_call_by_session[cooldown_key] = now
+    if enforce_cooldown:
+        now = time.monotonic()
+        cooldown_key = _session_light_cooldown_key(session_id)
+        last_call = _last_light_call_by_session.get(cooldown_key, 0.0)
+        if now - last_call < _LIGHT_COOLDOWN_SECONDS:
+            remaining = _LIGHT_COOLDOWN_SECONDS - (now - last_call)
+            return f"System: Lighting cooldown active. Next change available in {remaining:.1f}s."
+        _last_light_call_by_session[cooldown_key] = now
     payload = {
         "entity_id": ha_entity,
         "rgb_color": [r, g, b],
-        "brightness": brightness,
-        "transition": transition,
+        "brightness": resolved_brightness,
+        "transition": resolved_transition,
     }
     headers = {
         "Authorization": f"Bearer {ha_token}",
@@ -7442,8 +7712,8 @@ async def sync_room_lights(
         "hex_color": normalized_hex,
         "rgb_color": [r, g, b],
         "entity": ha_entity,
-        "brightness": brightness,
-        "transition": transition,
+        "brightness": resolved_brightness,
+        "transition": resolved_transition,
         "scene_description": args.scene_description,
         "backend_applied": False,
         "client_should_apply": False,
@@ -7468,7 +7738,8 @@ async def sync_room_lights(
             event_payload["backend_applied"] = True
             _publish_lighting_command(session_id, event_payload)
 
-        _remember_last_light_color(tool_context, session_id, normalized_hex)
+        if remember_last_color:
+            _remember_last_light_color(tool_context, session_id, normalized_hex)
         return f"System: Room lights synced to {normalized_hex}."
     except Exception as exc:
         logger.warning("IoT light sync failed gracefully: %s", exc)

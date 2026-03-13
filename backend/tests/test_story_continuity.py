@@ -284,6 +284,42 @@ class StoryContinuityTests(unittest.TestCase):
         self.assertEqual(decision.reason, "pending_location_change")
         self.assertIn("moving onward to the next stretch of the journey", result.prompt_suffix)
 
+    def test_moon_destination_request_forces_new_scene_from_castle(self) -> None:
+        state: dict[str, object] = {}
+        ensure_story_continuity_state(state)
+        record_continuity_scene(
+            state,
+            description=(
+                "Scary castle. A large, spooky castle silhouetted against a dark, cloudy sky "
+                "with a crescent moon and a heavy wooden drawbridge over a deep moat."
+            ),
+            storybeat_text="A spooky castle stands tall with crooked spires against the dark, cloudy sky.",
+            scene_number=1,
+        )
+
+        update_continuity_from_child_utterance(
+            state,
+            "You know what? Instead, let's go fly up to the moon.",
+        )
+        world = state["continuity_world_state"]
+
+        self.assertEqual(world["pending_location_label"], "moon")
+
+        result = validate_live_scene_request(
+            state,
+            "A child flying gently toward a large, glowing moon in a dark but friendly starry sky.",
+        )
+        decision = should_render_new_scene_page(
+            state,
+            result.resolved_description,
+            target_location_label=result.location_label,
+        )
+
+        self.assertEqual(result.location_label, "moon")
+        self.assertTrue(decision.should_render)
+        self.assertEqual(decision.reason, "pending_location_change")
+        self.assertIn("moon surface", result.prompt_suffix.lower())
+
     def test_hidden_door_request_keeps_next_scene_adjacent_to_current_world(self) -> None:
         state: dict[str, object] = {}
         ensure_story_continuity_state(state)

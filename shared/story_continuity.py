@@ -52,6 +52,7 @@ _LOCATION_TERMS = [
     "throne room",
     "workshop",
     "castle",
+    "space",
     "library",
     "forest",
     "garden",
@@ -74,6 +75,7 @@ _LOCATION_TERMS = [
     "treehouse",
     "village",
     "beach",
+    "moon",
 ]
 
 _ANIMATE_TERMS = [
@@ -133,11 +135,13 @@ _TRANSITION_PATTERNS: list[tuple[str, re.Pattern[str]]] = [
 _LOCATION_SIGNATURE_HINTS = {
     "workshop": "show worktables, toy parts, wrapped gifts, shelves, and warm workshop light",
     "castle": "show unmistakable towers, halls, banners, doors, or stonework",
+    "space": "show stars, planets, nebula colors, and a clear zero-gravity or outer-space setting",
     "library": "show bookshelves, reading chairs, lamps, and books",
     "forest": "show trees, paths, leaves, and clear woodland depth",
     "garden": "show flowers, winding paths, plants, and cozy outdoor details",
     "kitchen": "show counters, cooking tools, warm lights, and food details",
     "window": "show the view clearly framed by the window and the room it belongs to",
+    "moon": "show the moon surface, craters, soft stardust, and a clear view of outer space or Earth",
 }
 
 _INSIDE_HINTS = (
@@ -254,13 +258,13 @@ def _canonical_label(text: str) -> str:
         flags=re.IGNORECASE,
     )
     cleaned = re.sub(
-        r"^(?:go|walk|run|head|travel|venture|explore|follow|see|look|step|enter)\s+",
+        r"^(?:go|walk|run|head|travel|venture|explore|follow|see|look|step|enter|fly)\s+",
         "",
         cleaned,
         flags=re.IGNORECASE,
     )
     cleaned = re.sub(
-        r"^(?:inside|outside|at|in|into|through|from|to|toward|towards|along|down|up)\s+",
+        r"^(?:(?:inside|outside|at|in|into|through|from|to|toward|towards|along|down|up)\s+)+",
         "",
         cleaned,
         flags=re.IGNORECASE,

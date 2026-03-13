@@ -455,6 +455,40 @@ class StorybookAssembleSourceTests(unittest.TestCase):
         self.assertEqual(cues[1]["end_seconds"], 5.5)
         self.assertEqual(cues[1]["hex_color"], "#6FA8FF")
 
+    def test_theater_lighting_cues_prefer_page_metadata_when_available(self) -> None:
+        cues = _build_storybook_theater_lighting_cues(
+            scene_durations=[3.0],
+            story_pages=[
+                {
+                    "scene_number": 1,
+                    "request_id": "scene-1",
+                    "scene_description": "A dreamy bubble garden twinkles at dusk.",
+                    "hex_color": "#B89CFF",
+                    "rgb_color": [184, 156, 255],
+                    "brightness": 166,
+                    "transition": 0.9,
+                    "cue_source": "heuristic_scene",
+                }
+            ],
+            scene_descriptions=["A dreamy bubble garden twinkles at dusk."],
+            scene_lighting_cues=[
+                {
+                    "scene_number": 1,
+                    "request_id": "scene-1",
+                    "hex_color": "#55C26A",
+                    "rgb_color": [85, 194, 106],
+                    "brightness": 176,
+                    "transition": 1.3,
+                    "cue_source": "live_story_scene",
+                }
+            ],
+        )
+
+        self.assertEqual(len(cues), 1)
+        self.assertEqual(cues[0]["hex_color"], "#B89CFF")
+        self.assertEqual(cues[0]["rgb_color"], [184, 156, 255])
+        self.assertEqual(cues[0]["cue_source"], "heuristic_scene")
+
     def test_narration_segments_do_not_ship_duplicate_words_or_dangling_but(self) -> None:
         lines = _build_narration_segments(
             [

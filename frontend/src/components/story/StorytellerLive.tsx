@@ -122,6 +122,7 @@ const MIC_OK_KEY = 'storyteller_mic_setup_v2';
 const MIC_DEVICE_KEY = 'storyteller_mic_device_id_v1';
 const STORYBOOK_ASSEMBLY_STORAGE_PREFIX = 'storyteller_assembly_ui:';
 const STORYBOOK_ASSEMBLY_STORAGE_TTL_MS = 15 * 60 * 1000;
+const STORYBOOK_ASSEMBLY_REHYDRATION_GRACE_MS = 90 * 1000;
 const QUICK_ACK_AUDIO_URL = '/audio/got-it-lets-go.mp3';
 
 type PersistedStorybookAssemblyState = {
@@ -247,10 +248,39 @@ function normalizeStoryFlowPhase(raw: unknown): StoryFlowPhase {
     }
 }
 
+function isAssemblyStoryPhase(phase: StoryFlowPhase): boolean {
+    return phase === 'assembling_movie' || phase === 'remake';
+}
+
 function deriveBackendRunAppHost(host: string): string | null {
     const match = host.match(/^storyteller-frontend-(.+\.(?:a\.)?run\.app)$/);
     if (!match) return null;
     return `storyteller-backend-${match[1]}`;
+}
+
+function deriveBackendHttpOriginFromConfiguredUrls(): string | null {
+    const candidates = [
+        process.env.NEXT_PUBLIC_BACKEND_URL ?? '',
+        process.env.NEXT_PUBLIC_PAGE_READ_ALOUD_URL ?? '',
+        process.env.NEXT_PUBLIC_UPLOAD_URL ?? '',
+        process.env.NEXT_PUBLIC_WS_URL ?? '',
+    ];
+    for (const raw of candidates) {
+        const normalized = raw.trim();
+        if (!normalized || normalized.startsWith('/')) continue;
+        try {
+            const parsed = new URL(normalized);
+            if (parsed.protocol === 'http:' || parsed.protocol === 'https:') {
+                return parsed.origin;
+            }
+            if (parsed.protocol === 'ws:' || parsed.protocol === 'wss:') {
+                return parsed.origin.replace(/^ws/i, 'http');
+            }
+        } catch {
+            // Ignore malformed configured URLs and keep searching.
+        }
+    }
+    return null;
 }
 
 function resolveFrontendWebSocketUrl(): string {
@@ -322,14 +352,26 @@ function resolvePageReadAloudUrl(): string {
     }
     const protocol = window.location.protocol;
     const host = window.location.host;
+    const backendOrigin = deriveBackendHttpOriginFromConfiguredUrls();
+    const backendRunAppHost = deriveBackendRunAppHost(host);
     const normalized = configured.trim();
     if (!normalized) {
+        if (backendOrigin) return `${backendOrigin}/api/page-read-aloud`;
+        if (backendRunAppHost) return `${protocol}//${backendRunAppHost}/api/page-read-aloud`;
         return `${protocol}//${host}/api/page-read-aloud`;
     }
     if (normalized.includes('localhost:8000') || normalized.includes('storyteller.example.com')) {
+        if (backendOrigin) return `${backendOrigin}/api/page-read-aloud`;
+        if (backendRunAppHost) return `${protocol}//${backendRunAppHost}/api/page-read-aloud`;
         return `${protocol}//${host}/api/page-read-aloud`;
     }
     if (normalized.startsWith('/')) {
+        if (backendOrigin && normalized.startsWith('/api/')) {
+            return `${backendOrigin}${normalized}`;
+        }
+        if (backendRunAppHost && normalized.startsWith('/api/')) {
+            return `${protocol}//${backendRunAppHost}${normalized}`;
+        }
         return `${protocol}//${host}${normalized}`;
     }
     return normalized;
@@ -2036,6 +2078,11 @@ export default function StorytellerLive() {
                             const text = (msg.payload.current_scene_storybeat_text as string).trim();
                             setCurrentSceneStorybeatText(text || null);
                         }
+                        const recentPersistedAssembly =
+                            persistedAssemblyState
+                            && (Date.now() - persistedAssemblyState.savedAtMs) <= STORYBOOK_ASSEMBLY_REHYDRATION_GRACE_MS
+                                ? persistedAssemblyState
+                                : null;
                         const rehydratedAssemblyStatus = typeof msg.payload?.assembly_status === 'string'
                             ? (msg.payload.assembly_status as string).trim().toLowerCase()
                             : '';
@@ -2044,7 +2091,8 @@ export default function StorytellerLive() {
                             : '';
                         const assemblyStillRunning =
                             rehydratedAssemblyStatus === 'assembling'
-                            || rehydratedAssemblyStatus === 'reviewing_storyboard';
+                            || rehydratedAssemblyStatus === 'reviewing_storyboard'
+                            || isAssemblyStoryPhase(rehydratedStoryPhase);
                         if (rehydratedAssemblyStatus === 'failed') {
                             clearPersistedStorybookAssemblyState(sessionIdRef.current);
                             setSceneError(rehydratedAssemblyError || 'Movie assembly failed before the final video was created.');
@@ -2069,11 +2117,11 @@ export default function StorytellerLive() {
                                         startedAtMs: validStartedAtMs ?? current.startedAtMs,
                                     };
                                 }
-                                if (persistedAssemblyState?.status) {
+                                if (recentPersistedAssembly?.status) {
                                     return {
-                                        ...persistedAssemblyState.status,
-                                        etaSeconds: persistedAssemblyState.status.etaSeconds ?? validEtaSeconds,
-                                        startedAtMs: validStartedAtMs ?? persistedAssemblyState.status.startedAtMs,
+                                        ...recentPersistedAssembly.status,
+                                        etaSeconds: recentPersistedAssembly.status.etaSeconds ?? validEtaSeconds,
+                                        startedAtMs: validStartedAtMs ?? recentPersistedAssembly.status.startedAtMs,
                                     };
                                 }
                                 return {
@@ -2092,11 +2140,23 @@ export default function StorytellerLive() {
                                 )
                             );
                         } else if (!shouldStayInTheater) {
-                            if (persistedAssemblyState) {
-                                clearPersistedStorybookAssemblyState(sessionIdRef.current);
+                            if (recentPersistedAssembly) {
+                                setIsEndingStory(true);
+                                setStorybookStatus((current) => current ?? recentPersistedAssembly.status);
+                                setStoryPhase(recentPersistedAssembly.storyPhase);
+                                if (recentPersistedAssembly.storyTitle) {
+                                    setStorybookTitle(recentPersistedAssembly.storyTitle);
+                                }
+                                if (recentPersistedAssembly.childName) {
+                                    setStorybookChildName(recentPersistedAssembly.childName);
+                                }
+                            } else {
+                                if (persistedAssemblyState) {
+                                    clearPersistedStorybookAssemblyState(sessionIdRef.current);
+                                }
+                                setIsEndingStory(false);
+                                setStorybookStatus(null);
                             }
-                            setIsEndingStory(false);
-                            setStorybookStatus(null);
                         }
 
                         if (shouldStayInTheater) {
@@ -2106,10 +2166,10 @@ export default function StorytellerLive() {
                             break;
                         }
 
-                        if (msg.payload?.story_started || msg.payload?.ending_story) {
+                        if (msg.payload?.story_started || msg.payload?.ending_story || recentPersistedAssembly) {
                             setPhase('story');
                             sendClientReadyRef.current();
-                            if (resumeMicOnReconnectRef.current && !isMicMutedRef.current) {
+                            if (!recentPersistedAssembly && resumeMicOnReconnectRef.current && !isMicMutedRef.current) {
                                 void startListeningRef.current();
                             }
                         }

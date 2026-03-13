@@ -9,6 +9,7 @@ locals {
     "compute.googleapis.com",
     "containerregistry.googleapis.com",
     "firestore.googleapis.com",
+    "homegraph.googleapis.com",
     "iam.googleapis.com",
     "run.googleapis.com",
     "secretmanager.googleapis.com",

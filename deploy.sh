@@ -59,10 +59,19 @@ deploy_backend() {
 }
 
 deploy_frontend() {
+  local backend_url
+  local ws_url
+  local upload_url
+  backend_url="$(gcloud run services describe storyteller-backend --region "$REGION" --project "$PROJECT" --format='value(status.url)' 2>/dev/null || true)"
+  ws_url="${backend_url%/}/ws/story"
+  upload_url="${backend_url%/}/api/upload"
   echo "🔨 Building frontend ($TAG)..."
   docker build \
     --platform linux/amd64 \
     --build-arg NEXT_PUBLIC_REQUIRE_MATH="$REQUIRE_MATH" \
+    --build-arg NEXT_PUBLIC_BACKEND_URL="$backend_url" \
+    --build-arg NEXT_PUBLIC_WS_URL="$ws_url" \
+    --build-arg NEXT_PUBLIC_UPLOAD_URL="$upload_url" \
     -t "$FRONTEND_IMAGE" \
     -f frontend/Dockerfile \
     frontend/
