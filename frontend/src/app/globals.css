@@ -843,9 +843,16 @@ h3 {
 
 
 @media (max-width: 600px) {
+    .storybook-loading {
+        justify-content: flex-start;
+        gap: 8px;
+        padding: 12px 10px 14px;
+    }
+
     .storybook-loading-stage {
-        width: min(82%, 360px);
-        height: min(52%, 220px);
+        width: min(76%, 320px);
+        height: min(38%, 160px);
+        min-height: 104px;
         border-radius: 22px;
     }
 
@@ -863,6 +870,30 @@ h3 {
     .loading-orb {
         width: 28px;
         height: 28px;
+    }
+
+    .loading-dots {
+        gap: 8px;
+    }
+
+    .loading-dots span {
+        width: 10px;
+        height: 10px;
+    }
+
+    .storybook-loading-copy {
+        gap: 4px;
+        max-width: min(92%, 310px);
+    }
+
+    .storybook-loading-copy strong {
+        font-size: clamp(0.82rem, 3.9vw, 0.98rem);
+        line-height: 1.15;
+    }
+
+    .storybook-loading-copy span {
+        font-size: clamp(0.68rem, 3.3vw, 0.82rem);
+        line-height: 1.24;
     }
 }
 
@@ -1155,6 +1186,10 @@ h3 {
     padding: env(safe-area-inset-top, 18px) 18px env(safe-area-inset-bottom, 18px);
     height: 100dvh;
     width: 100dvw;
+    overflow-y: auto;
+    overflow-x: hidden;
+    -webkit-overflow-scrolling: touch;
+    touch-action: pan-y pinch-zoom;
 }
 
 .mic-setup-card {
@@ -1226,6 +1261,44 @@ h3 {
     gap: 10px;
     font-size: 14px;
     line-height: 1.45;
+}
+
+.mic-setup-help {
+    margin: 0 0 18px;
+    border-radius: 18px;
+    border: 1px solid rgba(148, 163, 184, 0.22);
+    background: rgba(15, 23, 42, 0.26);
+    overflow: hidden;
+}
+
+.mic-setup-help-summary {
+    list-style: none;
+    cursor: pointer;
+    padding: 12px 14px;
+    font-size: 13px;
+    font-weight: 700;
+    color: rgba(207, 250, 254, 0.92);
+}
+
+.mic-setup-help-summary::-webkit-details-marker {
+    display: none;
+}
+
+.mic-setup-help-summary::after {
+    content: '+';
+    float: right;
+    font-size: 16px;
+    line-height: 1;
+    color: rgba(165, 243, 252, 0.88);
+}
+
+.mic-setup-help[open] .mic-setup-help-summary::after {
+    content: '−';
+}
+
+.mic-setup-steps-compact {
+    margin: 0;
+    padding: 0 14px 14px 32px;
 }
 
 .mic-setup-permission-pill {
@@ -1443,6 +1516,7 @@ h3 {
         gap: 16px;
         padding: 16px;
         border-radius: 24px;
+        width: min(95vw, 560px);
     }
 
     .mic-setup-controls-column {
@@ -1451,17 +1525,24 @@ h3 {
     }
 
     .mic-check-icon {
-        font-size: 40px;
-        margin-bottom: 8px;
+        font-size: 34px;
+        margin-bottom: 6px;
+    }
+
+    .mic-setup-eyebrow {
+        font-size: 10px;
+        margin-bottom: 6px;
     }
 
     .mic-check-title {
-        font-size: 24px;
+        font-size: 20px;
+        margin-bottom: 6px;
     }
 
     .mic-check-subtitle {
-        font-size: 14px;
-        margin-bottom: 14px;
+        font-size: 13px;
+        line-height: 1.45;
+        margin-bottom: 10px;
     }
 
     .mic-setup-steps {
@@ -1472,11 +1553,62 @@ h3 {
 
     .mic-setup-actions {
         flex-direction: column;
+        margin-top: 14px;
     }
 
     .mic-setup-primary,
     .mic-setup-secondary {
+        flex: 0 0 auto;
         width: 100%;
+        min-height: 46px;
+    }
+
+    .mic-setup-permission-pill {
+        padding: 12px 14px;
+        border-radius: 16px;
+    }
+
+    .mic-setup-field select {
+        padding: 12px 14px;
+        font-size: 14px;
+    }
+
+    .mic-setup-meter-card {
+        margin-top: 12px;
+        padding: 14px;
+        border-radius: 18px;
+    }
+
+    .mic-setup-meter-header {
+        margin-bottom: 8px;
+        gap: 8px;
+    }
+
+    .mic-setup-meter-status,
+    .mic-setup-meter-copy,
+    .mic-check-error,
+    .mic-setup-ready-hint,
+    .mic-setup-permission-copy {
+        font-size: 12px;
+        line-height: 1.4;
+    }
+
+    .mic-check-meter {
+        height: 10px;
+        margin-bottom: 10px;
+    }
+
+    .mic-setup-help {
+        margin-bottom: 12px;
+    }
+
+    .mic-setup-help-summary {
+        padding: 10px 12px;
+        font-size: 12px;
+    }
+
+    .mic-setup-steps-compact {
+        padding: 0 12px 12px 28px;
     }
 }
 
@@ -4821,6 +4953,10 @@ h3 {
     justify-content: center;
     padding: var(--space-md);
     backdrop-filter: blur(8px);
+    overflow-y: auto;
+    overflow-x: hidden;
+    -webkit-overflow-scrolling: touch;
+    touch-action: pan-y pinch-zoom;
 }
 
 .iot-modal-card {
@@ -4835,6 +4971,10 @@ h3 {
     flex-direction: column;
     gap: var(--space-md);
     position: relative;
+    max-height: calc(100dvh - (var(--space-md) * 2));
+    overflow-y: auto;
+    overscroll-behavior: contain;
+    -webkit-overflow-scrolling: touch;
 }
 
 .iot-close-btn {
@@ -4990,13 +5130,28 @@ h3 {
 }
 
 @media (max-width: 560px) {
+    .iot-modal-overlay {
+        align-items: flex-start;
+        padding:
+            max(env(safe-area-inset-top, 14px), 14px)
+            12px
+            max(env(safe-area-inset-bottom, 14px), 14px);
+    }
+
     .iot-modal-card {
+        max-height: calc(100dvh - env(safe-area-inset-top, 14px) - env(safe-area-inset-bottom, 14px) - 28px);
         padding: 22px 18px 20px;
+        border-radius: 24px;
     }
 
     .iot-actions {
         flex-direction: column-reverse;
         align-items: stretch;
+        position: sticky;
+        bottom: 0;
+        padding-top: 12px;
+        padding-bottom: max(env(safe-area-inset-bottom, 0px), 2px);
+        background: linear-gradient(180deg, rgba(26, 5, 51, 0), rgba(26, 5, 51, 0.94) 24%);
     }
 
     .iot-actions .iot-btn {

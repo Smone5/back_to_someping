@@ -2690,8 +2690,29 @@ export default function StorytellerLive() {
         theaterLightingStageRef.current = null;
         setStorybookLightingCues([]);
         const skipMicCheck = hasStoredMicOk();
+        const storedDeviceId = getStoredMicDeviceId() || null;
+        const shouldWarmMicOnGateTap =
+            typeof navigator !== 'undefined'
+            && typeof navigator.mediaDevices?.getUserMedia === 'function'
+            && (
+                isCompact
+                || isLandscapePhone
+                || navigator.maxTouchPoints > 0
+                || window.matchMedia?.('(pointer: coarse)').matches === true
+            );
+        let attemptedMicOnGateTap = false;
+        let micReadyFromGateTap = false;
+
+        setPhase('mic-check');
+
+        if (shouldWarmMicOnGateTap) {
+            attemptedMicOnGateTap = true;
+            micReadyFromGateTap = await requestMicSetupTest(storedDeviceId);
+        }
+
         try {
-            // Prime playback so Amelia can speak immediately, then start mic capture asynchronously.
+            // Keep playback ready, but on mobile try to ask for mic access on the
+            // very first approved tap so the browser prompt appears reliably.
             await primeAudio();
             setAgentThinking(false);
         } catch (e) {
@@ -2702,9 +2723,22 @@ export default function StorytellerLive() {
             return;
         }
 
+        if (micReadyFromGateTap) {
+            await refreshMicPermissionState();
+            if (skipMicCheck) {
+                markMicOk();
+                setPhase('story');
+                setAgentThinking(true);
+                sendClientReady();
+            }
+            return;
+        }
+
         if (skipMicCheck) {
             try {
-                const storedDeviceId = getStoredMicDeviceId() || null;
+                if (attemptedMicOnGateTap) {
+                    return;
+                }
                 await startListening({ deviceId: storedDeviceId });
                 await refreshMicPermissionState();
                 await refreshMicDevices(storedDeviceId);
@@ -2723,10 +2757,9 @@ export default function StorytellerLive() {
             }
         }
 
-        setPhase('mic-check');
         await refreshMicPermissionState();
-        await refreshMicDevices(selectedMicDeviceIdRef.current || getStoredMicDeviceId() || null);
-    }, [clearMicOk, clearPageReadAloudCache, getStoredMicDeviceId, hasStoredMicOk, markMicOk, primeAudio, refreshMicDevices, refreshMicPermissionState, sendClientReady, setNarrationMuted, startListening, stopListening]);
+        await refreshMicDevices(selectedMicDeviceIdRef.current || storedDeviceId);
+    }, [clearMicOk, clearPageReadAloudCache, getStoredMicDeviceId, hasStoredMicOk, isCompact, isLandscapePhone, markMicOk, primeAudio, refreshMicDevices, refreshMicPermissionState, requestMicSetupTest, sendClientReady, setNarrationMuted, startListening, stopListening]);
 
     const handleStorybookMoviePacingChange = useCallback((nextMode: StorybookMoviePacing) => {
         storybookMoviePacingRef.current = nextMode;
@@ -3208,6 +3241,7 @@ export default function StorytellerLive() {
     }
 
     if (phase === 'mic-check') {
+        const compactMicSetup = isCompact || isLandscapePhone;
         const micLevel = audioState === 'listening'
             ? Math.min(1, Math.max(0, (voiceRms - 0.002) / 0.02))
             : 0;
@@ -3228,23 +3262,38 @@ export default function StorytellerLive() {
                 : micPermissionState === 'denied'
                     ? 'Your browser blocked microphone access. Reopen the mic prompt or site settings, then try again.'
                     : 'Tap the button below. Your browser will still show the microphone prompt, and you should choose Allow.';
+        const micSetupTitle = compactMicSetup
+            ? 'Check the microphone'
+            : 'Check the microphone like a meeting lobby';
+        const micSetupSubtitle = compactMicSetup
+            ? 'Allow the mic, say “Hi Amelia!”, and then start the story.'
+            : 'We can’t bypass the browser microphone prompt with AI or the model. The browser must ask first, but we can make that step clear and easy.';
         return (
             <main className="storyteller-main mic-check-stage" aria-label="Microphone check">
                 <div className="mic-setup-card" role="status" aria-live="polite">
                     <section className="mic-setup-copy-column">
                         <div className="mic-check-icon" aria-hidden="true">🎙️</div>
                         <div className="mic-setup-eyebrow">Before Amelia joins</div>
-                        <div className="mic-check-title">Check the microphone like a meeting lobby</div>
-                        <div className="mic-check-subtitle">
-                            We can&apos;t bypass the browser microphone prompt with AI or the model.
-                            The browser must ask first, but we can make that step clear and easy.
-                        </div>
-                        <ol className="mic-setup-steps">
-                            <li>Tap <strong>Allow &amp; test microphone</strong>.</li>
-                            <li>Choose <strong>Allow</strong> in the browser popup.</li>
-                            <li>Say <strong>&ldquo;Hi Amelia!&rdquo;</strong> and watch the bar bounce.</li>
-                            <li>Start the story when everything looks good.</li>
-                        </ol>
+                        <div className="mic-check-title">{micSetupTitle}</div>
+                        <div className="mic-check-subtitle">{micSetupSubtitle}</div>
+                        {compactMicSetup ? (
+                            <details className="mic-setup-help">
+                                <summary className="mic-setup-help-summary">Show the full steps</summary>
+                                <ol className="mic-setup-steps mic-setup-steps-compact">
+                                    <li>Tap <strong>Allow &amp; test microphone</strong>.</li>
+                                    <li>Choose <strong>Allow</strong> in the browser popup.</li>
+                                    <li>Say <strong>&ldquo;Hi Amelia!&rdquo;</strong> and watch the bar bounce.</li>
+                                    <li>Start the story when everything looks good.</li>
+                                </ol>
+                            </details>
+                        ) : (
+                            <ol className="mic-setup-steps">
+                                <li>Tap <strong>Allow &amp; test microphone</strong>.</li>
+                                <li>Choose <strong>Allow</strong> in the browser popup.</li>
+                                <li>Say <strong>&ldquo;Hi Amelia!&rdquo;</strong> and watch the bar bounce.</li>
+                                <li>Start the story when everything looks good.</li>
+                            </ol>
+                        )}
                         <div className={`mic-setup-permission-pill is-${micPermissionState}`}>
                             <span className="mic-setup-permission-label">{permissionLabel}</span>
                             <span className="mic-setup-permission-copy">{permissionCopy}</span>
