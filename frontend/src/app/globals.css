@@ -1360,7 +1360,8 @@ h3 {
     font-size: 15px;
     font-weight: 700;
     padding: 0 18px;
-    transition: transform 120ms ease, opacity 120ms ease, box-shadow 120ms ease;
+    cursor: pointer;
+    transition: transform 120ms ease, opacity 120ms ease, box-shadow 120ms ease, background 160ms ease, border-color 160ms ease;
 }
 
 .mic-setup-primary {
@@ -1375,10 +1376,49 @@ h3 {
     border: 1px solid rgba(45, 212, 191, 0.22);
 }
 
+.mic-setup-secondary.is-ready {
+    background: linear-gradient(135deg, rgba(45, 212, 191, 0.92), rgba(14, 165, 233, 0.94));
+    color: #06283d;
+    border-color: rgba(125, 211, 252, 0.7);
+    box-shadow: 0 18px 38px rgba(14, 165, 233, 0.26);
+}
+
+.mic-setup-primary:hover:not(:disabled),
+.mic-setup-secondary:hover:not(:disabled) {
+    transform: translateY(-1px);
+}
+
+.mic-setup-primary:hover:not(:disabled) {
+    box-shadow: 0 20px 40px rgba(139, 92, 246, 0.28);
+}
+
+.mic-setup-secondary:hover:not(:disabled) {
+    box-shadow: 0 18px 36px rgba(94, 234, 212, 0.2);
+}
+
+.mic-setup-primary:focus-visible,
+.mic-setup-secondary:focus-visible {
+    outline: 2px solid rgba(191, 219, 254, 0.92);
+    outline-offset: 3px;
+}
+
 .mic-setup-primary:disabled,
 .mic-setup-secondary:disabled {
     opacity: 0.55;
     cursor: not-allowed;
+}
+
+.mic-setup-ready-hint {
+    margin: 10px 4px 0;
+    min-height: 20px;
+    font-size: 13px;
+    line-height: 1.45;
+    color: rgba(191, 219, 254, 0.78);
+    transition: color 160ms ease;
+}
+
+.mic-setup-ready-hint.is-visible {
+    color: #99f6e4;
 }
 
 @media (max-width: 900px) {

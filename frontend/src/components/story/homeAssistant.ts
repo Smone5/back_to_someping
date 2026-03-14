@@ -20,12 +20,16 @@ export interface HomeAssistantLightCommand {
     scene_description?: string;
 }
 
+export type TheaterLightingEffect = 'steady' | 'pulse' | 'flicker' | 'flash';
+
 export interface TheaterLightingCue extends HomeAssistantLightCommand {
     start_seconds: number;
     end_seconds?: number;
     scene_index?: number;
     scene_number?: number;
     cue_source?: string;
+    effect?: TheaterLightingEffect;
+    effect_interval_ms?: number;
 }
 
 export interface HomeAssistantActionResult {
@@ -291,6 +295,19 @@ function normalizeRgbColor(value: unknown): [number, number, number] | undefined
     return [rgb[0], rgb[1], rgb[2]];
 }
 
+function normalizeTheaterLightingEffect(value: unknown): TheaterLightingEffect | undefined {
+    const normalized = String(value ?? '').trim().toLowerCase();
+    if (
+        normalized === 'steady'
+        || normalized === 'pulse'
+        || normalized === 'flicker'
+        || normalized === 'flash'
+    ) {
+        return normalized;
+    }
+    return undefined;
+}
+
 async function loadHomeAssistantState(
     config: HomeAssistantConfigLike,
 ): Promise<HomeAssistantStateSnapshot | { reason: string }> {
@@ -406,6 +423,8 @@ export function normalizeTheaterLightingCues(raw: unknown): TheaterLightingCue[]
         const transition = Number(candidate.transition ?? NaN);
         const sceneIndex = Number(candidate.scene_index ?? NaN);
         const sceneNumber = Number(candidate.scene_number ?? NaN);
+        const effect = normalizeTheaterLightingEffect(candidate.effect);
+        const effectIntervalMs = Number(candidate.effect_interval_ms ?? NaN);
         cues.push({
             start_seconds: startSeconds,
             end_seconds: endSeconds,
@@ -419,6 +438,10 @@ export function normalizeTheaterLightingCues(raw: unknown): TheaterLightingCue[]
             transition: Number.isFinite(transition) ? transition : undefined,
             scene_description: typeof candidate.scene_description === 'string'
                 ? candidate.scene_description.trim()
+                : undefined,
+            effect,
+            effect_interval_ms: Number.isFinite(effectIntervalMs)
+                ? Math.max(180, Math.min(3600, Math.round(effectIntervalMs)))
                 : undefined,
         });
     }

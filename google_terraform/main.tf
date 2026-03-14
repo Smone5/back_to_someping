@@ -53,6 +53,10 @@ resource "google_cloud_run_v2_service" "backend" {
         value = var.region
       }
       env {
+        name  = "VERTEX_AI_LOCATION"
+        value = var.vertex_ai_location
+      }
+      env {
         name  = "STORYTELLER_LIVE_MODEL"
         value = var.storyteller_live_model
       }
@@ -392,6 +396,10 @@ resource "google_cloud_run_v2_job" "ffmpeg_worker" {
           value = var.region
         }
         env {
+          name  = "VERTEX_AI_LOCATION"
+          value = var.vertex_ai_location
+        }
+        env {
           name  = "GOOGLE_GENAI_USE_VERTEXAI"
           value = var.google_genai_use_vertexai ? "TRUE" : "FALSE"
         }
@@ -470,6 +478,14 @@ resource "google_cloud_run_v2_job" "ffmpeg_worker" {
         env {
           name  = "STORYBOOK_STUDIO_MAX_REVISIONS"
           value = tostring(var.storybook_studio_max_revisions)
+        }
+        env {
+          name  = "STORYBOOK_SCENE_RENDER_CONCURRENCY"
+          value = tostring(var.storybook_scene_render_concurrency)
+        }
+        env {
+          name  = "STORYBOOK_TTS_CONCURRENCY"
+          value = tostring(var.storybook_tts_concurrency)
         }
         env {
           name  = "STORYBOOK_SCENE_IMAGE_MODEL"

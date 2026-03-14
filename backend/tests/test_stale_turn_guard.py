@@ -6,10 +6,52 @@ import unittest
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
+import types
 
 _PROJECT_ROOT = Path(__file__).resolve().parents[2]
 if str(_PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(_PROJECT_ROOT))
+
+try:
+    import google  # type: ignore
+except Exception:  # pragma: no cover - local stripped test env fallback
+    google = types.ModuleType("google")
+    sys.modules["google"] = google
+
+try:
+    import google.cloud as google_cloud  # type: ignore
+except Exception:  # pragma: no cover - local stripped test env fallback
+    google_cloud = types.ModuleType("google.cloud")
+    sys.modules["google.cloud"] = google_cloud
+    setattr(google, "cloud", google_cloud)
+
+try:
+    import google.adk as google_adk  # type: ignore
+except Exception:  # pragma: no cover - local stripped test env fallback
+    google_adk = None
+
+if "google.cloud.firestore" not in sys.modules:
+    firestore_stub = types.ModuleType("google.cloud.firestore")
+    firestore_stub.Client = object
+    firestore_stub.AsyncClient = object
+    sys.modules["google.cloud.firestore"] = firestore_stub
+    setattr(google_cloud, "firestore", firestore_stub)
+
+if "google.cloud.storage" not in sys.modules:
+    storage_stub = types.ModuleType("google.cloud.storage")
+    storage_stub.Client = object
+    storage_stub.Bucket = object
+    storage_stub.Blob = object
+    sys.modules["google.cloud.storage"] = storage_stub
+    setattr(google_cloud, "storage", storage_stub)
+
+if google_adk is not None and "google.adk.utils" not in sys.modules:
+    adk_utils_stub = types.ModuleType("google.adk.utils")
+    instructions_utils_stub = types.ModuleType("google.adk.utils.instructions_utils")
+    adk_utils_stub.instructions_utils = instructions_utils_stub
+    sys.modules["google.adk.utils"] = adk_utils_stub
+    sys.modules["google.adk.utils.instructions_utils"] = instructions_utils_stub
+    setattr(google_adk, "utils", adk_utils_stub)
 
 from agent import tools
 
@@ -72,7 +114,7 @@ class StaleTurnGuardTests(unittest.TestCase):
         )
         self.assertFalse(tools._stale_turn_tool_call("session-a", tool_context))
 
-    def test_rejects_live_tool_call_for_same_closed_turn_token(self) -> None:
+    def test_accepts_late_first_scene_call_for_same_closed_turn_token(self) -> None:
         tools.cache_storybook_state(
             "session-a",
             {
@@ -80,6 +122,28 @@ class StaleTurnGuardTests(unittest.TestCase):
                 "pending_response": False,
                 "pending_response_token": "same-token",
                 "last_child_utterance": "Look at the castle",
+            },
+        )
+        tool_context = _FakeToolContext(
+            {
+                "scene_tool_turn_open": True,
+                "pending_response": True,
+                "pending_response_token": "same-token",
+                "last_child_utterance": "Look at the castle",
+            }
+        )
+        self.assertFalse(tools._stale_turn_tool_call("session-a", tool_context))
+
+    def test_rejects_live_tool_call_for_same_closed_turn_after_render_started(self) -> None:
+        tools.cache_storybook_state(
+            "session-a",
+            {
+                "scene_tool_turn_open": False,
+                "pending_response": False,
+                "pending_response_token": "same-token",
+                "last_child_utterance": "Look at the castle",
+                "scene_render_pending": True,
+                "pending_scene_description": "A glowing castle garden at sunset.",
             },
         )
         tool_context = _FakeToolContext(

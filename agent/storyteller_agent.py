@@ -37,6 +37,7 @@ from .tools import (
     generate_trading_card,
     save_character_fact,
     save_child_name,
+    set_room_lights,
 )
 
 def _env_enabled(name: str, default: bool = False) -> bool:
@@ -57,6 +58,17 @@ def _env_float(name: str, default: float, minimum: float, maximum: float) -> flo
     return max(minimum, min(maximum, value))
 
 
+def _env_int(name: str, default: int, minimum: int, maximum: int) -> int:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    try:
+        value = int(raw)
+    except Exception:
+        return default
+    return max(minimum, min(maximum, value))
+
+
 def _using_vertex_ai_backend() -> bool:
     raw = os.environ.get("GOOGLE_GENAI_USE_VERTEXAI")
     if raw is None:
@@ -70,6 +82,24 @@ def _default_live_model() -> str:
     return "gemini-2.5-flash-native-audio-preview-12-2025"
 
 
+def _start_speech_sensitivity() -> genai_types.StartSensitivity:
+    raw = str(os.environ.get("LIVE_START_OF_SPEECH_SENSITIVITY", "medium") or "").strip().lower()
+    return {
+        "low": genai_types.StartSensitivity.START_SENSITIVITY_LOW,
+        "medium": genai_types.StartSensitivity.START_SENSITIVITY_MEDIUM,
+        "high": genai_types.StartSensitivity.START_SENSITIVITY_HIGH,
+    }.get(raw, genai_types.StartSensitivity.START_SENSITIVITY_MEDIUM)
+
+
+def _end_speech_sensitivity() -> genai_types.EndSensitivity:
+    raw = str(os.environ.get("LIVE_END_OF_SPEECH_SENSITIVITY", "low") or "").strip().lower()
+    return {
+        "low": genai_types.EndSensitivity.END_SENSITIVITY_LOW,
+        "medium": genai_types.EndSensitivity.END_SENSITIVITY_MEDIUM,
+        "high": genai_types.EndSensitivity.END_SENSITIVITY_HIGH,
+    }.get(raw, genai_types.EndSensitivity.END_SENSITIVITY_LOW)
+
+
 async def _storyteller_instruction(context: ReadonlyContext) -> str:
     meta_block = build_principles_injection_text("interactive_story")
     template = SYSTEM_PROMPT_TEMPLATE.replace("<<INTERACTIVE_STORY_META_PRINCIPLES>>", meta_block)
@@ -79,6 +109,7 @@ async def _storyteller_instruction(context: ReadonlyContext) -> str:
 _native_tools = [
     FunctionTool(generate_scene_visuals),
     FunctionTool(generate_background_music),
+    FunctionTool(set_room_lights),
     FunctionTool(save_character_fact),
     FunctionTool(save_child_name),
     FunctionTool(generate_trading_card),
@@ -127,15 +158,16 @@ _run_config_kwargs = dict(
     # Tool execution happens in background threads to keep Event Loop responsive
     # for immediate user interruptions.
     tool_thread_pool_config=ToolThreadPoolConfig(max_workers=5),
-    # Toggle server-side (automatic) VAD via env to avoid 1008 on unsupported models.
+    # Toggle server-side (automatic) VAD via env to avoid 1008 on unsupported
+    # models. Keep the defaults calmer and closer to the stock ADK demo.
     realtime_input_config=genai_types.RealtimeInputConfig(
         automatic_activity_detection=(
             genai_types.AutomaticActivityDetection(
                 disabled=False,
-                start_of_speech_sensitivity=genai_types.StartSensitivity.START_SENSITIVITY_HIGH,
-                end_of_speech_sensitivity=genai_types.EndSensitivity.END_SENSITIVITY_LOW,
-                prefix_padding_ms=200,
-                silence_duration_ms=900,
+                start_of_speech_sensitivity=_start_speech_sensitivity(),
+                end_of_speech_sensitivity=_end_speech_sensitivity(),
+                prefix_padding_ms=_env_int("LIVE_VAD_PREFIX_PADDING_MS", 280, 0, 1200),
+                silence_duration_ms=_env_int("LIVE_VAD_SILENCE_DURATION_MS", 1100, 200, 4000),
             )
             if _env_enabled("ENABLE_SERVER_VAD", default=False)
             else genai_types.AutomaticActivityDetection(disabled=True)

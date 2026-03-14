@@ -40,12 +40,26 @@ class StoryTextTests(unittest.TestCase):
             "",
         )
 
+    def test_normalize_storybeat_text_rejects_you_described_placeholder(self) -> None:
+        self.assertEqual(
+            normalize_storybeat_text("Here is the Candyland you described."),
+            "",
+        )
+
     def test_normalize_storybeat_text_strips_meta_illustration_prefix_with_story_payload(self) -> None:
         self.assertEqual(
             normalize_storybeat_text(
                 "Here is a whimsical children's storybook illustration: Santa Claus relaxes in a cozy secret room by a warm stone fireplace."
             ),
             "Santa Claus relaxes in a cozy secret room by a warm stone fireplace.",
+        )
+
+    def test_normalize_storybeat_text_strips_you_described_prefix_with_story_payload(self) -> None:
+        self.assertEqual(
+            normalize_storybeat_text(
+                "Here is the Candyland you described: A chocolate river curls past lollipop trees toward a candy castle."
+            ),
+            "A chocolate river curls past lollipop trees toward a candy castle.",
         )
 
     def test_normalize_storybeat_text_rejects_conversational_feedback(self) -> None:
@@ -92,6 +106,18 @@ class StoryTextTests(unittest.TestCase):
         self.assertEqual(
             clean_story_text("There are funny ghosts\u25a1 holding lanterns\ufe0f by the chair."),
             "There are funny ghosts holding lanterns by the chair.",
+        )
+
+    def test_clean_story_text_strips_html_tags_and_entities(self) -> None:
+        self.assertEqual(
+            clean_story_text("&lt;p&gt;The friendly toy companion peeks around the candy hall.&lt;/p&gt;"),
+            "The friendly toy companion peeks around the candy hall.",
+        )
+
+    def test_normalize_storybeat_text_strips_html_tags(self) -> None:
+        self.assertEqual(
+            normalize_storybeat_text("<p>The friendly toy companion peeks around the candy hall.</p>"),
+            "The friendly toy companion peeks around the candy hall.",
         )
 
     def test_truncate_story_sentence_drops_dangling_descriptor_endings(self) -> None:

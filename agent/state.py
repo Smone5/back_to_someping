@@ -123,6 +123,7 @@ class StorySession(BaseModel):
     toy_share_active: bool = Field(default=False)
     toy_share_turns_remaining: int = Field(default=0)
     toy_reference_visual_summary: str = Field(default="")
+    toy_reference_name_hint: str = Field(default="")
     story_summary: str = Field(default="The adventure is just beginning...")
     story_tone: str = Field(default="cozy")
     storybook_movie_pacing: str = Field(default="read_with_me")

@@ -62,15 +62,6 @@ interface UseAudioWorkletOptions {
     onFlushComplete?: () => void;
 }
 
-// Slightly stricter onset gating cuts random bumps/background sounds without
-// forcing kids to shout before Amelia listens.
-const SPEECH_START_RMS = 0.0082;
-const SPEECH_END_RMS = 0.0042;
-const SPEECH_MIN_ACTIVE_MS = 160;
-const SPEECH_END_SILENCE_MS = 950;
-const SPEECH_PREROLL_CHUNKS = 15; // ~300ms with 20ms PCM chunks
-const SPEECH_MAX_UTTERANCE_MS = 9000;
-
 function readClientNumber(value: string | undefined, fallback: number): number {
     const parsed = Number(value);
     if (!Number.isFinite(parsed)) {
@@ -79,13 +70,41 @@ function readClientNumber(value: string | undefined, fallback: number): number {
     return Math.max(0, parsed);
 }
 
+// Keep the hands-free mic calmer by default so tiny bumps, room noise, and
+// speaker bleed do not immediately count as child speech.
+const SPEECH_START_RMS = readClientNumber(
+    process.env.NEXT_PUBLIC_SPEECH_START_RMS,
+    0.0105,
+);
+const SPEECH_END_RMS = readClientNumber(
+    process.env.NEXT_PUBLIC_SPEECH_END_RMS,
+    0.0052,
+);
+const SPEECH_MIN_ACTIVE_MS = readClientNumber(
+    process.env.NEXT_PUBLIC_SPEECH_MIN_ACTIVE_MS,
+    240,
+);
+const SPEECH_END_SILENCE_MS = readClientNumber(
+    process.env.NEXT_PUBLIC_SPEECH_END_SILENCE_MS,
+    1200,
+);
+const SPEECH_PREROLL_CHUNKS = 15; // ~300ms with 20ms PCM chunks
+const SPEECH_MAX_UTTERANCE_MS = readClientNumber(
+    process.env.NEXT_PUBLIC_SPEECH_MAX_UTTERANCE_MS,
+    9000,
+);
+const CAPTURE_BOOST_MS = readClientNumber(
+    process.env.NEXT_PUBLIC_CAPTURE_BOOST_MS,
+    6000,
+);
+
 const NORMAL_BARGE_IN_BLOCK_MS = readClientNumber(
     process.env.NEXT_PUBLIC_BARGE_IN_BLOCK_MS,
-    220,
+    420,
 );
 const GREETING_BARGE_IN_BLOCK_MS = readClientNumber(
     process.env.NEXT_PUBLIC_GREETING_BARGE_IN_BLOCK_MS,
-    900,
+    1400,
 );
 const FLUSH_COMPLETE_GRACE_MS = readClientNumber(
     process.env.NEXT_PUBLIC_FLUSH_COMPLETE_GRACE_MS,
@@ -235,7 +254,6 @@ export function useAudioWorklet({
         if (options?.deviceId !== undefined) {
             preferredInputDeviceIdRef.current = options.deviceId ?? null;
         }
-        const ctx = await initAudio();
 
         const buildAudioConstraints = (deviceId: string | null): MediaTrackConstraints => ({
             echoCancellation: true,
@@ -262,110 +280,93 @@ export function useAudioWorklet({
             preferredInputDeviceIdRef.current = null;
         }
 
-        micStreamRef.current = stream;
-        const source = ctx.createMediaStreamSource(stream);
-        micSourceRef.current = source;
-        captureBoostUntilRef.current = performance.now() + 15000;
+        try {
+            const ctx = await initAudio();
+            micStreamRef.current = stream;
+            const source = ctx.createMediaStreamSource(stream);
+            micSourceRef.current = source;
+            captureBoostUntilRef.current = performance.now() + CAPTURE_BOOST_MS;
 
-        // Downsampler: mic -> 16kHz PCM
-        const downsamplerNode = new AudioWorkletNode(ctx, 'downsampler-processor', {
-            processorOptions: { inputSampleRate: ctx.sampleRate },
-        });
-        downsamplerNode.port.onmessage = (e) => {
-            const pcm = (e.data as ArrayBuffer).slice(0);
-            const samples = new Int16Array(pcm);
-            let sum = 0;
-            for (const s of samples) sum += s * s;
-            const rms = Math.sqrt(sum / Math.max(samples.length, 1)) / 32768;
+            // Ask for the mic before this heavier setup so mobile browsers can
+            // show their permission prompt as the direct result of the tap.
+            const downsamplerNode = new AudioWorkletNode(ctx, 'downsampler-processor', {
+                processorOptions: { inputSampleRate: ctx.sampleRate },
+            });
+            downsamplerNode.port.onmessage = (e) => {
+                const pcm = (e.data as ArrayBuffer).slice(0);
+                const samples = new Int16Array(pcm);
+                let sum = 0;
+                for (const s of samples) sum += s * s;
+                const rms = Math.sqrt(sum / Math.max(samples.length, 1)) / 32768;
 
-            // Feed volume to visualizer regardless of speaking/listening phase.
-            onVoiceVolumeRef.current?.(rms);
+                // Feed volume to visualizer regardless of speaking/listening phase.
+                onVoiceVolumeRef.current?.(rms);
 
-            const now = performance.now();
-            const noiseFloor = noiseFloorRef.current;
-            const boostActive = captureBoostUntilRef.current !== null && now < captureBoostUntilRef.current;
-            const startBase = boostActive ? SPEECH_START_RMS * 0.75 : SPEECH_START_RMS;
-            const endBase = boostActive ? SPEECH_END_RMS * 0.8 : SPEECH_END_RMS;
-            const startMultiplier = boostActive ? 1.8 : 2.2;
-            const endMultiplier = boostActive ? 1.3 : 1.5;
-            const dynamicStart = Math.max(startBase, noiseFloor * startMultiplier);
-            const dynamicEnd = Math.max(endBase, noiseFloor * endMultiplier);
-            const bargeInBlocked =
-                isSpeakingRef.current &&
-                bargeInBlockUntilRef.current !== null &&
-                now < bargeInBlockUntilRef.current;
+                const now = performance.now();
+                const noiseFloor = noiseFloorRef.current;
+                const boostActive = captureBoostUntilRef.current !== null && now < captureBoostUntilRef.current;
+                const startBase = boostActive ? SPEECH_START_RMS * 0.9 : SPEECH_START_RMS;
+                const endBase = boostActive ? SPEECH_END_RMS * 0.9 : SPEECH_END_RMS;
+                const startMultiplier = boostActive ? 2.1 : 2.4;
+                const endMultiplier = boostActive ? 1.45 : 1.65;
+                const dynamicStart = Math.max(startBase, noiseFloor * startMultiplier);
+                const dynamicEnd = Math.max(endBase, noiseFloor * endMultiplier);
+                const bargeInBlocked =
+                    isSpeakingRef.current &&
+                    bargeInBlockUntilRef.current !== null &&
+                    now < bargeInBlockUntilRef.current;
 
-            if (!voiceActiveRef.current) {
-                preRollRef.current.push(pcm);
-                if (preRollRef.current.length > SPEECH_PREROLL_CHUNKS) {
-                    preRollRef.current.shift();
-                }
+                if (!voiceActiveRef.current) {
+                    preRollRef.current.push(pcm);
+                    if (preRollRef.current.length > SPEECH_PREROLL_CHUNKS) {
+                        preRollRef.current.shift();
+                    }
 
-                if (rms < dynamicStart) {
-                    // Update noise floor only when we're below the speech threshold.
-                    noiseFloorRef.current = noiseFloor * 0.95 + rms * 0.05;
-                }
+                    if (rms < dynamicStart) {
+                        // Update noise floor only when we're below the speech threshold.
+                        noiseFloorRef.current = noiseFloor * 0.95 + rms * 0.05;
+                    }
 
-                if (bargeInBlocked) {
+                    if (bargeInBlocked) {
+                        return;
+                    }
+
+                    if (rms >= dynamicStart) {
+                        if (voiceRiseStartedAtRef.current === null) {
+                            voiceRiseStartedAtRef.current = now;
+                        }
+                        if (now - voiceRiseStartedAtRef.current >= SPEECH_MIN_ACTIVE_MS) {
+                            voiceActiveRef.current = true;
+                            voiceActiveStartedAtRef.current = now;
+                            silenceStartedAtRef.current = null;
+                            if (isSpeakingRef.current && playbackNodeRef.current) {
+                                playbackNodeRef.current.port.postMessage({ type: 'interrupt' });
+                            }
+                            if (gainNodeRef.current && !duckedForUserRef.current) {
+                                gainNodeRef.current.gain.linearRampToValueAtTime(
+                                    getNarrationDucked(),
+                                    gainNodeRef.current.context.currentTime + 0.1,
+                                );
+                                duckedForUserRef.current = true;
+                            }
+                            onVoiceActivityStartRef.current?.();
+                            for (const chunk of preRollRef.current) {
+                                onPcmChunkRef.current(chunk);
+                            }
+                            preRollRef.current = [];
+                        }
+                    } else {
+                        voiceRiseStartedAtRef.current = null;
+                    }
                     return;
                 }
 
-                if (rms >= dynamicStart) {
-                    if (voiceRiseStartedAtRef.current === null) {
-                        voiceRiseStartedAtRef.current = now;
-                    }
-                    if (now - voiceRiseStartedAtRef.current >= SPEECH_MIN_ACTIVE_MS) {
-                        voiceActiveRef.current = true;
-                        voiceActiveStartedAtRef.current = now;
-                        silenceStartedAtRef.current = null;
-                        if (isSpeakingRef.current && playbackNodeRef.current) {
-                            playbackNodeRef.current.port.postMessage({ type: 'interrupt' });
-                        }
-                        if (gainNodeRef.current && !duckedForUserRef.current) {
-                            gainNodeRef.current.gain.linearRampToValueAtTime(
-                                getNarrationDucked(),
-                                gainNodeRef.current.context.currentTime + 0.1,
-                            );
-                            duckedForUserRef.current = true;
-                        }
-                        onVoiceActivityStartRef.current?.();
-                        for (const chunk of preRollRef.current) {
-                            onPcmChunkRef.current(chunk);
-                        }
-                        preRollRef.current = [];
-                    }
-                } else {
-                    voiceRiseStartedAtRef.current = null;
-                }
-                return;
-            }
-
-            // Voice active: stream chunks continuously until end-of-speech silence.
-            onPcmChunkRef.current(pcm);
-            if (
-                voiceActiveStartedAtRef.current !== null &&
-                now - voiceActiveStartedAtRef.current >= SPEECH_MAX_UTTERANCE_MS
-            ) {
-                voiceActiveRef.current = false;
-                voiceActiveStartedAtRef.current = null;
-                voiceRiseStartedAtRef.current = null;
-                silenceStartedAtRef.current = null;
-                preRollRef.current = [];
-                if (gainNodeRef.current && duckedForUserRef.current) {
-                    gainNodeRef.current.gain.linearRampToValueAtTime(
-                        getNarrationCeiling(),
-                        gainNodeRef.current.context.currentTime + 0.15,
-                    );
-                    duckedForUserRef.current = false;
-                }
-                onVoiceActivityEndRef.current?.();
-                return;
-            }
-            if (rms <= dynamicEnd) {
-                if (silenceStartedAtRef.current === null) {
-                    silenceStartedAtRef.current = now;
-                }
-                if (now - silenceStartedAtRef.current >= SPEECH_END_SILENCE_MS) {
+                // Voice active: stream chunks continuously until end-of-speech silence.
+                onPcmChunkRef.current(pcm);
+                if (
+                    voiceActiveStartedAtRef.current !== null &&
+                    now - voiceActiveStartedAtRef.current >= SPEECH_MAX_UTTERANCE_MS
+                ) {
                     voiceActiveRef.current = false;
                     voiceActiveStartedAtRef.current = null;
                     voiceRiseStartedAtRef.current = null;
@@ -379,16 +380,39 @@ export function useAudioWorklet({
                         duckedForUserRef.current = false;
                     }
                     onVoiceActivityEndRef.current?.();
+                    return;
                 }
-            } else {
-                silenceStartedAtRef.current = null;
-            }
-        };
+                if (rms <= dynamicEnd) {
+                    if (silenceStartedAtRef.current === null) {
+                        silenceStartedAtRef.current = now;
+                    }
+                    if (now - silenceStartedAtRef.current >= SPEECH_END_SILENCE_MS) {
+                        voiceActiveRef.current = false;
+                        voiceActiveStartedAtRef.current = null;
+                        voiceRiseStartedAtRef.current = null;
+                        silenceStartedAtRef.current = null;
+                        preRollRef.current = [];
+                        if (gainNodeRef.current && duckedForUserRef.current) {
+                            gainNodeRef.current.gain.linearRampToValueAtTime(
+                                getNarrationCeiling(),
+                                gainNodeRef.current.context.currentTime + 0.15,
+                            );
+                            duckedForUserRef.current = false;
+                        }
+                        onVoiceActivityEndRef.current?.();
+                    }
+                } else {
+                    silenceStartedAtRef.current = null;
+                }
+            };
 
-        source.connect(downsamplerNode);
-        downsamplerNodeRef.current = downsamplerNode;
-
-        setAudioState('listening');
+            source.connect(downsamplerNode);
+            downsamplerNodeRef.current = downsamplerNode;
+            setAudioState('listening');
+        } catch (error) {
+            stream.getTracks().forEach((track) => track.stop());
+            throw error;
+        }
     }, [getNarrationCeiling, getNarrationDucked, initAudio, teardownCapture]);
 
     const stopListening = useCallback(() => {

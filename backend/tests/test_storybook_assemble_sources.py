@@ -42,12 +42,37 @@ _recommended_audio_boost_gain_db = _ASSEMBLE_MODULE._recommended_audio_boost_gai
 _run_storybook_studio_async = _ASSEMBLE_MODULE._run_storybook_studio_async
 _simplify_for_readalong = _ASSEMBLE_MODULE._simplify_for_readalong
 _scene_sources_from_state_doc = _ASSEMBLE_MODULE._scene_sources_from_state_doc
+_resolve_story_page_sources_for_assembly = _ASSEMBLE_MODULE._resolve_story_page_sources_for_assembly
+_story_page_fallback_data_url = _ASSEMBLE_MODULE._story_page_fallback_data_url
+_backfill_missing_still_paths_with_story_cards = _ASSEMBLE_MODULE._backfill_missing_still_paths_with_story_cards
+_merge_scene_sources_with_recovered_stills = _ASSEMBLE_MODULE._merge_scene_sources_with_recovered_stills
+_build_storybook_cover_filtergraph = _ASSEMBLE_MODULE._build_storybook_cover_filtergraph
 _storybook_burned_caption_filtergraph = _ASSEMBLE_MODULE._storybook_burned_caption_filtergraph
+_storybook_cover_logo_path = _ASSEMBLE_MODULE._storybook_cover_logo_path
 _storybook_motion_vf = _ASSEMBLE_MODULE._storybook_motion_vf
 _synthesize_tts_with_provider = _ASSEMBLE_MODULE._synthesize_tts_with_provider
 
 
 class StorybookAssembleSourceTests(unittest.TestCase):
+    def test_storybook_cover_filtergraph_can_overlay_logo(self) -> None:
+        filtergraph = _build_storybook_cover_filtergraph(
+            title_text="Aaron and the Dark Castle",
+            subtitle_text="by Aaron",
+            duration=3.5,
+            logo_path=Path("/tmp/voxitale arch.png"),
+        )
+
+        self.assertIn("movie='/tmp/voxitale arch.png'", filtergraph)
+        self.assertIn("overlay=", filtergraph)
+        self.assertIn("[outv]", filtergraph)
+
+    def test_storybook_cover_logo_path_finds_repo_asset(self) -> None:
+        logo_path = _storybook_cover_logo_path()
+
+        self.assertIsNotNone(logo_path)
+        assert logo_path is not None
+        self.assertEqual(logo_path.name, "voxitale_arch.png")
+
     @mock.patch.dict("os.environ", {"ELEVENLABS_API_KEY": "eleven-123"}, clear=False)
     def test_storybook_elevenlabs_voice_override_changes_tts_endpoint(self) -> None:
         client = mock.Mock()
@@ -179,6 +204,101 @@ class StorybookAssembleSourceTests(unittest.TestCase):
 
         self.assertEqual(sources, ["https://example.com/treehouse.png"])
 
+    def test_story_page_fallback_data_url_prefers_png_for_ffmpeg_compatibility(self) -> None:
+        data_url = _story_page_fallback_data_url("A cozy treehouse glows at the end of the path.")
+
+        self.assertTrue(data_url.startswith("data:image/png;base64,"))
+
+    def test_resolve_story_page_sources_backfills_missing_page_with_story_card(self) -> None:
+        sources, descriptions, fallback_count = _resolve_story_page_sources_for_assembly(
+            {
+                "story_pages": [
+                    {
+                        "scene_number": 1,
+                        "image_url": "https://example.com/castle-1.png",
+                        "storybeat_text": "Aaron and Lion-O reach the licorice castle.",
+                    },
+                    {
+                        "scene_number": 2,
+                        "storybeat_text": "Inside the castle, they climb toward a secret room.",
+                    },
+                ],
+            },
+            [
+                "Aaron and Lion-O reach the licorice castle.",
+                "Inside the castle, they climb toward a secret room.",
+            ],
+            "Aaron and Lion-O reach the licorice castle. Inside the castle, they climb toward a secret room.",
+        )
+
+        self.assertEqual(len(sources), 2)
+        self.assertEqual(sources[0], "https://example.com/castle-1.png")
+        self.assertTrue(sources[1].startswith("data:image/png;base64,"))
+        self.assertEqual(fallback_count, 1)
+        self.assertEqual(len(descriptions), 2)
+        self.assertIn("secret room", descriptions[1].lower())
+
+    def test_backfill_missing_still_paths_with_story_cards_recovers_trailing_gap(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            existing = tmp / "scene_000.png"
+            existing.write_bytes(b"\x89PNG\r\n\x1a\n")
+
+            completed_paths, created = _backfill_missing_still_paths_with_story_cards(
+                [existing],
+                expected_scene_pages=3,
+                scene_descriptions=[
+                    "Aaron reaches the licorice castle.",
+                    "Aaron climbs the staircase to the secret room.",
+                    "Santa waits inside with presents and candy.",
+                ],
+                story_summary="Aaron reaches the licorice castle, climbs the staircase, and finds Santa waiting inside.",
+                tmp=tmp,
+            )
+
+            self.assertEqual(created, 2)
+            self.assertEqual(len(completed_paths), 3)
+            self.assertEqual(completed_paths[0], existing)
+            self.assertTrue(all(path.exists() for path in completed_paths))
+            self.assertEqual(completed_paths[1].suffix, ".png")
+            self.assertEqual(completed_paths[2].suffix, ".png")
+            self.assertGreater(completed_paths[1].stat().st_size, 32)
+            self.assertGreater(completed_paths[2].stat().st_size, 32)
+
+    def test_merge_scene_sources_with_recovered_stills_prefers_real_pages_and_keeps_tail_fallback(self) -> None:
+        merged_sources, replacement_count = _merge_scene_sources_with_recovered_stills(
+            [
+                "data:image/png;base64,page1",
+                "data:image/png;base64,page2",
+                "data:image/png;base64,page3",
+                "data:image/png;base64,page4",
+                "data:image/png;base64,page5",
+                "data:image/png;base64,page6",
+                "data:image/png;base64,page7",
+            ],
+            [
+                "gs://storybook/session/scene_000.jpg",
+                "gs://storybook/session/scene_001.jpg",
+                "gs://storybook/session/scene_002.jpg",
+                "gs://storybook/session/scene_003.jpg",
+                "gs://storybook/session/scene_004.jpg",
+                "gs://storybook/session/scene_005.jpg",
+            ],
+            expected_scene_pages=7,
+        )
+
+        self.assertEqual(replacement_count, 6)
+        self.assertEqual(len(merged_sources), 7)
+        self.assertEqual(merged_sources[:6], [
+            "gs://storybook/session/scene_000.jpg",
+            "gs://storybook/session/scene_001.jpg",
+            "gs://storybook/session/scene_002.jpg",
+            "gs://storybook/session/scene_003.jpg",
+            "gs://storybook/session/scene_004.jpg",
+            "gs://storybook/session/scene_005.jpg",
+        ])
+        self.assertTrue(merged_sources[6].startswith("data:image/png;base64,"))
+
     def test_narration_sources_preserve_scene_alignment_when_page_storybeat_missing(self) -> None:
         sources = _build_page_narration_source_texts(
             [
@@ -199,6 +319,24 @@ class StorybookAssembleSourceTests(unittest.TestCase):
         self.assertIn("Bubbles shimmer", sources[0])
         self.assertIn("secret path", sources[1])
         self.assertIn("treehouse", sources[2])
+
+    def test_narration_sources_fall_back_when_page_storybeat_is_meta_placeholder(self) -> None:
+        sources = _build_page_narration_source_texts(
+            [
+                {
+                    "scene_number": 1,
+                    "storybeat_text": "Here is the Candyland you described.",
+                    "scene_description": "A chocolate river curls past lollipop trees toward a candy castle.",
+                }
+            ],
+            ["A chocolate river curls past lollipop trees toward a candy castle."],
+            "",
+            1,
+        )
+
+        self.assertEqual(len(sources), 1)
+        self.assertIn("chocolate river", sources[0].lower())
+        self.assertNotIn("you described", sources[0].lower())
 
     def test_storybook_studio_receives_story_context_from_live_session(self) -> None:
         captured_initial_state: dict[str, object] = {}
@@ -488,6 +626,43 @@ class StorybookAssembleSourceTests(unittest.TestCase):
         self.assertEqual(cues[0]["hex_color"], "#B89CFF")
         self.assertEqual(cues[0]["rgb_color"], [184, 156, 255])
         self.assertEqual(cues[0]["cue_source"], "heuristic_scene")
+
+    def test_theater_lighting_cues_keep_scene_boundaries_when_effect_changes(self) -> None:
+        cues = _build_storybook_theater_lighting_cues(
+            scene_durations=[2.2, 2.8],
+            story_pages=[
+                {
+                    "scene_number": 1,
+                    "request_id": "scene-1",
+                    "scene_description": "A moonlit castle hallway glows softly.",
+                    "hex_color": "#6FA8FF",
+                    "rgb_color": [111, 168, 255],
+                    "brightness": 154,
+                    "transition": 1.1,
+                    "cue_source": "page_metadata",
+                },
+                {
+                    "scene_number": 2,
+                    "request_id": "scene-2",
+                    "scene_description": "Lightning flashes through the same moonlit castle hallway.",
+                    "hex_color": "#6FA8FF",
+                    "rgb_color": [111, 168, 255],
+                    "brightness": 154,
+                    "transition": 1.1,
+                    "cue_source": "page_metadata",
+                },
+            ],
+            scene_descriptions=[
+                "A moonlit castle hallway glows softly.",
+                "Lightning flashes through the same moonlit castle hallway.",
+            ],
+        )
+
+        self.assertEqual(len(cues), 2)
+        self.assertEqual(cues[0]["effect"], "steady")
+        self.assertEqual(cues[1]["effect"], "flash")
+        self.assertEqual(cues[1]["start_seconds"], 2.2)
+        self.assertEqual(cues[1]["end_seconds"], 5.0)
 
     def test_narration_segments_do_not_ship_duplicate_words_or_dangling_but(self) -> None:
         lines = _build_narration_segments(

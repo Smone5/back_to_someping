@@ -32,6 +32,7 @@ from .audio import passes_noise_gate, scrub_pii
 from .storybook_flow import derive_story_phase, theater_release_ready
 from shared.story_continuity import (
     ensure_story_continuity_state,
+    prime_character_carryover,
     record_continuity_scene,
     update_continuity_from_child_utterance,
 )
@@ -48,6 +49,7 @@ from agent.tools import (
     reset_storybook_assembly_lock,
     VisualArgs,
     _build_google_genai_client,
+    _crop_image_to_thumbnail_b64,
     _default_live_image_model,
     _is_supported_image_generation_model,
     _load_storybook_firestore_state,
@@ -172,6 +174,40 @@ _DEFAULT_STORYBOOK_ELEVENLABS_VOICE_ID = (
     or "21m00Tcm4TlvDq8ikWAM"
 )
 _SHARED_TOY_COMPANION_NAME = "shared toy companion"
+_TOY_NAME_HINT_PATTERNS = (
+    re.compile(
+        r"\b(?:his|her|their)\s+name\s+is\s+([A-Za-z0-9][A-Za-z0-9' -]{0,40}?)(?=[,.!?]|$|\s+(?:and|with|who|that|because|but)\b)",
+        flags=re.IGNORECASE,
+    ),
+    re.compile(
+        r"\b(?:this|it|he|she|they)\s+(?:is|are|'s)\s+([A-Za-z0-9][A-Za-z0-9' -]{0,40}?)(?=[,.!?]|$|\s+(?:and|with|who|that|because|but)\b)",
+        flags=re.IGNORECASE,
+    ),
+    re.compile(
+        r"\bthat(?:'s| is)\s+([A-Za-z0-9][A-Za-z0-9' -]{0,40}?)(?=[,.!?]|$|\s+(?:and|with|who|that|because|but)\b)",
+        flags=re.IGNORECASE,
+    ),
+)
+_GENERIC_TOY_NAME_HINTS = {
+    "toy",
+    "my toy",
+    "the toy",
+    "this toy",
+    "that toy",
+    "stuffie",
+    "stuffed animal",
+    "photo",
+    "picture",
+    "camera",
+}
+_VOICE_TOY_COMPANION_RE = re.compile(
+    r"\b(?:toy|stuffie|stuffed animal|plush|companion|sidekick)\b",
+    flags=re.IGNORECASE,
+)
+_VOICE_TOY_BRING_ALONG_RE = re.compile(
+    r"\b(?:come(?:\s+with\s+us|\s+too|\s+along)?|join us|bring(?:\s+(?:him|her|it|them))?(?:\s+with\s+us|\s+along)?|along the journey)\b",
+    flags=re.IGNORECASE,
+)
 
 _SESSION_STATE_DEFAULTS: dict[str, Any] = {
     "child_name": "friend",
@@ -191,6 +227,7 @@ _SESSION_STATE_DEFAULTS: dict[str, Any] = {
     "toy_share_active": False,
     "toy_share_turns_remaining": 0,
     "toy_reference_visual_summary": "",
+    "toy_reference_name_hint": "",
     "toy_share_resume_story_summary": "",
     "toy_share_resume_scene_description": "",
     "toy_share_resume_storybeat_text": "",
@@ -207,6 +244,7 @@ _SESSION_STATE_DEFAULTS: dict[str, Any] = {
     "assembly_kind": "initial",
     "assembly_status": "",
     "scene_render_pending": False,
+    "scene_render_skipped": False,
     "queued_scene_child_utterance": "",
     "queued_scene_child_utterance_at_epoch_ms": 0,
     "theater_release_ready": False,
@@ -748,7 +786,7 @@ def _fallback_scene_prompt(assistant_text: str, child_text: str, state: dict[str
 
 
 _IMAGE_CHAT_RE = re.compile(
-    r"\b(what(?:'s| is)|why|who(?:'s| is)|i see|look at|look!|that's|that is|it's|it is|so pretty|sparkly|cute|funny|what color|where is|do you see|wow|cool|silly)\b",
+    r"\b(what(?:'s| is| are)|why|who(?:'s| is| are)|how(?:'s| is| are| do| does)|tell me about|i see|look at|look!|that's|that is|it's|it is|so pretty|sparkly|cute|funny|what color|where is|do you see|wow|cool|silly)\b",
     flags=re.IGNORECASE,
 )
 _LAUGH_CHAT_RE = re.compile(
@@ -770,7 +808,6 @@ _EXPLICIT_VISUAL_REQUEST_RE = re.compile(
     r"|\b(?:draw|picture|image|illustration)\b"
     r"|\b(?:with|in) an image\b"
     r"|\b(?:can|could) (?:i|we) see (?:it|that|the picture|the image|a picture|an image|the [a-z][a-z'\- ]{0,40})\b"
-    r"|\bwhat does .* look like\b"
     r"|\btake me there\b",
     flags=re.IGNORECASE,
 )
@@ -779,6 +816,10 @@ _READ_PAGE_REQUEST_RE = re.compile(
     r"|\bwhat(?:'s| does)\s+(?:this|the)\s+page\s+(?:say|says)\b"
     r"|\bwhat's\s+that\s+say\b"
     r"|\bread\s+(?:it|that)\s+to\s+me\b",
+    flags=re.IGNORECASE,
+)
+_SCENE_DETAIL_LOOK_QUESTION_RE = re.compile(
+    r"\bwhat\s+(?:do|does)\b.*\blook like\b",
     flags=re.IGNORECASE,
 )
 _ASSISTANT_NEW_SCENE_RE = re.compile(
@@ -811,7 +852,7 @@ def _child_requested_scene_chat(text: str) -> bool:
     cleaned = _CTRL_TOKEN_RE.sub("", text or "").strip().lower()
     if not cleaned:
         return False
-    if _READ_PAGE_REQUEST_RE.search(cleaned):
+    if _READ_PAGE_REQUEST_RE.search(cleaned) or _SCENE_DETAIL_LOOK_QUESTION_RE.search(cleaned):
         return True
     if (
         _SCENE_ACTION_RE.search(cleaned)
@@ -825,6 +866,8 @@ def _child_requested_scene_chat(text: str) -> bool:
 def _scene_render_in_progress(session_id: str, state: dict[str, Any] | None) -> bool:
     if not isinstance(state, dict):
         return session_id in _pending_image_events
+    if bool(state.get("scene_render_skipped", False)):
+        return False
     return bool(state.get("scene_render_pending", False)) or session_id in _pending_image_events
 
 
@@ -836,7 +879,7 @@ def _queue_latest_scene_follow_up_request(state: dict[str, Any], child_utterance
     state["queued_scene_child_utterance_at_epoch_ms"] = int(time.time() * 1000)
     state["partial_child_utterance"] = queued_text
     state["partial_child_utterance_finished"] = True
-    update_continuity_from_child_utterance(state, queued_text)
+    _capture_child_story_continuity(state, queued_text)
 
 
 def _arm_queued_scene_follow_up_after_render(state: dict[str, Any]) -> str:
@@ -857,6 +900,27 @@ def _arm_queued_scene_follow_up_after_render(state: dict[str, Any]) -> str:
     state["partial_child_utterance"] = queued_text
     state["partial_child_utterance_finished"] = True
     return queued_text
+
+
+def _send_queued_scene_follow_up_prompt(
+    session_id: str,
+    live_queue: LiveRequestQueue,
+    queued_text: str,
+) -> None:
+    cleaned = str(queued_text or "").strip()
+    if not cleaned:
+        return
+    _send_live_content(
+        session_id,
+        live_queue,
+        (
+            "The child already asked for the next page while the last picture was still drawing: "
+            f"\"{cleaned}\". "
+            "Continue immediately from that newest request. "
+            "Give at most one short acknowledgment if needed, then make the next page. "
+            "Do not ask the child to repeat it."
+        ),
+    )
 
 
 def _should_trigger_fallback_scene(
@@ -912,6 +976,19 @@ async def _trigger_fallback_scene(
         )
     except Exception:
         return
+    try:
+        await _mutate_state(
+            runner,
+            user_id,
+            session_id,
+            lambda state: _prime_pending_scene_request(
+                state,
+                request_id=request_id,
+                description=description,
+            ),
+        )
+    except Exception:
+        logger.debug("Could not prime fallback scene request state for session %s", session_id, exc_info=True)
     # Always send placeholder signal so frontend can show loading indicator.
     should_send_placeholder = True
     if should_send_placeholder:
@@ -1059,6 +1136,206 @@ async def _describe_shared_item_image(image_bytes: bytes) -> str:
     except Exception as exc:
         logger.warning("Shared-item vision summary failed: %s", exc)
         return ""
+
+
+async def _detect_shared_item_subject_thumbnail(
+    image_bytes: bytes,
+    *,
+    toy_name_hint: str = "",
+    summary_text: str = "",
+) -> tuple[str, str] | None:
+    if not image_bytes:
+        return None
+
+    vision_bytes = image_bytes
+    vision_mime = _sniff_mime_type(image_bytes)
+    thumb = _make_thumbnail_b64(image_bytes, max_side=768)
+    if thumb:
+        try:
+            vision_bytes = base64.b64decode(thumb[0])
+            vision_mime = thumb[1] or "image/jpeg"
+        except Exception:
+            vision_bytes = image_bytes
+            vision_mime = _sniff_mime_type(image_bytes)
+
+    clue_bits: list[str] = []
+    normalized_name = _clean_shared_toy_name_hint(toy_name_hint)
+    if normalized_name:
+        clue_bits.append(f"The child calls it {normalized_name}.")
+    if summary_text:
+        clue_bits.append(f"Visible details: {str(summary_text).strip()[:220]}")
+    prompt = (
+        "Find the main toy or special item the child is sharing in this photo. "
+        "Return JSON only with keys visible, x, y, width, height, and notes. "
+        "Use normalized coordinates from 0 to 1000, with x/y as the top-left corner. "
+        "The box should tightly frame the toy or special item itself, not the whole room or the child's hand unless needed to include the toy. "
+        "If no single toy or item is clearly visible, return {\"visible\": false}."
+    )
+    if clue_bits:
+        prompt += " " + " ".join(clue_bits)
+
+    def _run() -> tuple[str, str] | None:
+        client = _build_google_genai_client()
+        response = client.models.generate_content(
+            model=_shared_item_vision_model(),
+            contents=[
+                prompt,
+                google_genai.types.Part.from_bytes(
+                    data=vision_bytes,
+                    mime_type=vision_mime,
+                ),
+            ],
+            config=google_genai.types.GenerateContentConfig(
+                temperature=0.0,
+                max_output_tokens=160,
+                response_mime_type="application/json",
+            ),
+        )
+        raw_text = _extract_response_text(response)
+        if not raw_text:
+            return None
+        try:
+            payload = json.loads(raw_text)
+        except Exception:
+            logger.warning("Shared-item subject crop returned non-JSON payload: %s", raw_text[:200])
+            return None
+        if not isinstance(payload, dict) or not bool(payload.get("visible", False)):
+            return None
+        crop_box = {
+            "x": int(payload.get("x", 0) or 0),
+            "y": int(payload.get("y", 0) or 0),
+            "width": int(payload.get("width", 0) or 0),
+            "height": int(payload.get("height", 0) or 0),
+        }
+        if crop_box["width"] <= 0 or crop_box["height"] <= 0:
+            return None
+        cropped = _crop_image_to_thumbnail_b64(image_bytes, crop_box=crop_box, max_side=384)
+        if not cropped:
+            return None
+        return cropped
+
+    try:
+        return await asyncio.to_thread(_run)
+    except Exception as exc:
+        logger.warning("Shared-item subject crop failed: %s", exc)
+        return None
+
+
+def _clean_shared_toy_name_hint(candidate: Any) -> str:
+    cleaned = re.sub(r"\s+", " ", str(candidate or "")).strip(" \"'.,!?")
+    cleaned = re.sub(r"^(?:my|the|a|an)\s+", "", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"\s+from\s+[A-Za-z0-9][A-Za-z0-9' -]{1,40}$", "", cleaned, flags=re.IGNORECASE)
+    if not cleaned:
+        return ""
+    if len(cleaned) > 48 or len(cleaned.split()) > 4:
+        return ""
+    if cleaned.lower() in _GENERIC_TOY_NAME_HINTS:
+        return ""
+    return cleaned
+
+
+def _extract_shared_toy_name_hint(text: Any) -> str:
+    compact = re.sub(r"\s+", " ", str(text or "")).strip()
+    if not compact:
+        return ""
+
+    for pattern in _TOY_NAME_HINT_PATTERNS:
+        match = pattern.search(compact)
+        if match:
+            name_hint = _clean_shared_toy_name_hint(match.group(1))
+            if name_hint:
+                return name_hint
+
+    fallback = _clean_shared_toy_name_hint(compact)
+    if fallback and 1 <= len(fallback.split()) <= 3:
+        lowered = fallback.lower()
+        if not re.search(r"\b(?:go|look|see|share|show|want|like|have|there|here|is|are|looks|has|with|and|but)\b", lowered):
+            return fallback
+    return ""
+
+
+def _shared_toy_sidekick_description(summary_text: str, toy_name_hint: str) -> str:
+    normalized_summary = str(summary_text or "").strip()
+    normalized_name = _clean_shared_toy_name_hint(toy_name_hint)
+    if not normalized_name or not normalized_summary:
+        return normalized_summary
+    if normalized_name.lower() in normalized_summary.lower():
+        return normalized_summary
+    lowered_summary = normalized_summary[:1].lower() + normalized_summary[1:]
+    return f"{normalized_name}, {lowered_summary}"
+
+
+def _promote_voice_toy_companion_from_utterance(
+    state: dict[str, Any],
+    utterance_text: Any,
+) -> None:
+    cleaned = re.sub(r"\s+", " ", str(utterance_text or "")).strip()
+    if not cleaned:
+        return
+    toy_signal = bool(_VOICE_TOY_COMPANION_RE.search(cleaned))
+    companion_signal = bool(_VOICE_TOY_BRING_ALONG_RE.search(cleaned))
+    existing_name_hint = _clean_shared_toy_name_hint(state.get("toy_reference_name_hint", ""))
+    existing_sidekick_description = str(state.get("sidekick_description", "") or "").strip()
+    extracted_name_hint = _extract_shared_toy_name_hint(cleaned)
+    toy_name_hint = _clean_shared_toy_name_hint(extracted_name_hint or existing_name_hint)
+    if not toy_signal and not companion_signal and not toy_name_hint:
+        return
+    existing_toy_context = bool(
+        existing_name_hint
+        or str(state.get("toy_reference_visual_summary", "") or "").strip()
+        or str(state.get("toy_reference_thumbnail_b64", "") or "").strip()
+        or bool(state.get("camera_received", False))
+        or bool(state.get("toy_share_active", False))
+        or (
+            existing_sidekick_description
+            and existing_sidekick_description != "a magical companion"
+            and any(
+                token in existing_sidekick_description.lower()
+                for token in ("toy companion", "shared toy", "plush", "stuffed animal", "stuffie")
+            )
+        )
+    )
+    if not toy_signal and not companion_signal and not (existing_toy_context and extracted_name_hint):
+        return
+
+    if toy_name_hint and not existing_name_hint:
+        state["toy_reference_name_hint"] = toy_name_hint
+
+    if not existing_sidekick_description or existing_sidekick_description == "a magical companion":
+        state["sidekick_description"] = (
+            f"{toy_name_hint}, the child's toy companion"
+            if toy_name_hint else
+            "the child's toy companion"
+        )
+
+    continuity_label = toy_name_hint or _SHARED_TOY_COMPANION_NAME
+    continuity_fact = (
+        f"{toy_name_hint}, the child's recurring toy companion"
+        if toy_name_hint else
+        "the child's recurring toy companion"
+    )
+    _upsert_character_fact(
+        state,
+        character_name=_SHARED_TOY_COMPANION_NAME,
+        fact=continuity_fact,
+    )
+    if toy_name_hint:
+        _upsert_character_fact(
+            state,
+            character_name=toy_name_hint,
+            fact="shared toy helper and recurring companion in the story",
+        )
+    prime_character_carryover(
+        state,
+        [continuity_label],
+        source="voice_toy",
+        description=str(state.get("sidekick_description", "") or "").strip() or continuity_fact,
+    )
+
+
+def _capture_child_story_continuity(state: dict[str, Any], utterance_text: str) -> None:
+    update_continuity_from_child_utterance(state, utterance_text)
+    _promote_voice_toy_companion_from_utterance(state, utterance_text)
 
 
 def _read_story_turn_limit() -> int:
@@ -1827,6 +2104,22 @@ def _storybook_scene_state_payload(state: dict[str, Any]) -> dict[str, Any]:
 def _clear_pending_scene_request_metadata(state: dict[str, Any]) -> None:
     state["pending_scene_description"] = ""
     state["pending_scene_base_description"] = ""
+    state["scene_render_skipped"] = False
+
+
+def _prime_pending_scene_request(
+    state: dict[str, Any],
+    *,
+    request_id: str | None,
+    description: str = "",
+) -> None:
+    normalized_request_id = str(request_id or "").strip()
+    normalized_description = str(description or "").strip()
+    if normalized_request_id:
+        state["active_scene_request_id"] = normalized_request_id
+    if normalized_description:
+        state["pending_scene_description"] = normalized_description
+        state["pending_scene_base_description"] = normalized_description
 
 
 def _scene_request_matches_active_request(
@@ -1892,11 +2185,16 @@ def _apply_nonpersistent_scene_ready_to_state(
         if is_fallback:
             _clear_pending_scene_request_metadata(state)
         else:
-            _promote_pending_scene_request_to_current(
+            # Preview stills arrive before the durable cloud asset is uploaded.
+            # Record the next page immediately so the frontend can advance page
+            # history and captions in lockstep with the first visible preview.
+            _apply_scene_asset_to_story_state(
                 state,
                 request_id=request_id,
+                image_url="",
                 description=description,
                 storybeat_text=storybeat_text,
+                gcs_uri="",
             )
     else:
         _clear_pending_scene_request_metadata(state)
@@ -2954,10 +3252,16 @@ def _apply_shared_toy_story_state(
     state: dict[str, Any],
     *,
     summary_text: str,
+    toy_name_hint: str = "",
     toy_thumb: tuple[str, str] | None = None,
 ) -> None:
     normalized_summary = str(summary_text or "").strip() or (
         "The photo looks a little fuzzy, but it seems like a very special toy."
+    )
+    normalized_name_hint = _clean_shared_toy_name_hint(toy_name_hint)
+    named_sidekick_description = _shared_toy_sidekick_description(
+        normalized_summary,
+        normalized_name_hint,
     )
     state["camera_stage"] = "done"
     state["camera_received"] = True
@@ -2965,11 +3269,40 @@ def _apply_shared_toy_story_state(
         state["toy_reference_thumbnail_b64"] = str(toy_thumb[0] or "").strip()
         state["toy_reference_thumbnail_mime"] = str(toy_thumb[1] or "").strip()
     state["toy_reference_visual_summary"] = normalized_summary
-    state["sidekick_description"] = normalized_summary
+    state["toy_reference_name_hint"] = normalized_name_hint
+    state["sidekick_description"] = named_sidekick_description or normalized_summary
     _upsert_character_fact(
         state,
         character_name=_SHARED_TOY_COMPANION_NAME,
-        fact=normalized_summary,
+        fact=named_sidekick_description or normalized_summary,
+    )
+    if normalized_name_hint:
+        _upsert_character_fact(
+            state,
+            character_name=normalized_name_hint,
+            fact=f"shared toy helper; {normalized_summary}",
+        )
+    continuity_label = normalized_name_hint or _SHARED_TOY_COMPANION_NAME
+    prime_character_carryover(
+        state,
+        [continuity_label],
+        source="shared_toy",
+        description=named_sidekick_description or normalized_summary,
+    )
+
+
+def _scene_render_still_in_flight_after_tool_call(
+    session_id: str,
+    state: dict[str, Any],
+) -> bool:
+    if bool(state.get("scene_render_skipped", False)):
+        return False
+    image_event = _pending_image_events.get(session_id)
+    if image_event is not None:
+        return not image_event.is_set()
+    return bool(
+        str(state.get("pending_scene_description", "") or "").strip()
+        or str(state.get("pending_scene_base_description", "") or "").strip()
     )
 
 
@@ -3479,6 +3812,8 @@ async def handle_storyteller_ws(websocket: WebSocket, runner: Runner) -> None:
             },
         ).model_dump_json()
     )
+    if assembly_resuming:
+        _ensure_final_video_watch_task(session_id)
     if storybook_resume_state:
         await _restore_storybook_ui_after_reconnect(
             websocket=websocket,
@@ -3785,6 +4120,7 @@ async def _run_agent(
     completed_toy_share_active = False
     completed_scene_chat_turn = False
     completed_story_page_turn = False
+    completed_scene_render_skipped = False
     toy_share_finished_now = False
     silent_recovery_attempts = 0
     last_output_transcription: str = ""
@@ -4403,7 +4739,7 @@ async def _run_agent(
                                         if input_finished:
                                             state["pending_response_interrupted"] = False
                                             _append_child_delight_anchor(state, child_utterance_this_turn)
-                                            update_continuity_from_child_utterance(state, child_utterance_this_turn)
+                                            _capture_child_story_continuity(state, child_utterance_this_turn)
 
                                     await _mutate_state(
                                         runner=runner,
@@ -4593,7 +4929,7 @@ async def _run_agent(
                                         s["last_child_utterance"] = cleaned_text or raw_text
                                         s["partial_child_utterance"] = cleaned_text or raw_text
                                         s["partial_child_utterance_finished"] = True
-                                        update_continuity_from_child_utterance(s, cleaned_text or raw_text)
+                                        _capture_child_story_continuity(s, cleaned_text or raw_text)
                                     await _mutate_state(runner, user_id, session_id, _mark_pending)
 
                             if input_finished and not voice_ui_consumed and not ignored_finished_transcription:
@@ -4923,6 +5259,7 @@ async def _run_agent(
                                 nonlocal completed_toy_share_active
                                 nonlocal completed_scene_chat_turn
                                 nonlocal completed_story_page_turn
+                                nonlocal completed_scene_render_skipped
                                 nonlocal completed_state_snapshot
                                 nonlocal toy_share_finished_now
                                 toy_share_finished_now = False
@@ -5036,14 +5373,23 @@ async def _run_agent(
                                         state=state,
                                     )
                                 )
+                                scene_render_skipped_turn = bool(
+                                    scene_visuals_called_this_turn and state.get("scene_render_skipped", False)
+                                )
                                 scene_chat_turn = (
                                     bool(state.get("story_started", False))
                                     and _has_rendered_scene(state)
-                                    and not scene_visuals_called_this_turn
+                                    and (
+                                        not scene_visuals_called_this_turn
+                                        or scene_render_skipped_turn
+                                    )
                                     and not fallback_scene_turn
                                     and _child_requested_scene_chat(child_utterance_this_turn)
                                 )
-                                story_page_turn = bool(scene_visuals_called_this_turn or fallback_scene_turn)
+                                story_page_turn = bool(
+                                    fallback_scene_turn
+                                    or (scene_visuals_called_this_turn and not scene_render_skipped_turn)
+                                )
                                 current_turn = int(state.get("turn_number", 1))
                                 try:
                                     current_story_page_count = int(state.get("story_page_count", 0) or 0)
@@ -5069,7 +5415,15 @@ async def _run_agent(
                                     state["pending_story_hint"] = ""
                                     state["turn_number"] = min(current_turn + 1, max_turns)
                                     state["story_turn_limit_reached"] = turn_limit_reached
-                                    state["scene_render_pending"] = bool(scene_visuals_called_this_turn or fallback_scene_turn)
+                                    state["scene_render_pending"] = bool(
+                                        fallback_scene_turn
+                                        or (
+                                            scene_visuals_called_this_turn
+                                            and _scene_render_still_in_flight_after_tool_call(session_id, state)
+                                        )
+                                    )
+                                    if not bool(state.get("scene_render_pending", False)):
+                                        _clear_pending_scene_request_metadata(state)
                                     _clear_toy_share_resume_state(state)
                                 _sync_story_page_progress_fields(state)
                                 completed_turn_number = current_turn
@@ -5084,6 +5438,7 @@ async def _run_agent(
                                 completed_toy_share_active = toy_share_active_before
                                 completed_scene_chat_turn = scene_chat_turn
                                 completed_story_page_turn = story_page_turn
+                                completed_scene_render_skipped = scene_render_skipped_turn
                                 if (
                                     state.get("response_turn_number", state.get("turn_number", 1)) >= 3
                                     and str(state.get("child_name", "friend")).strip().lower() == "friend"
@@ -5158,7 +5513,12 @@ async def _run_agent(
                                 _img_wait_evt = _pending_image_events.get(session_id)
                                 _image_already_arrived = _img_wait_evt is not None and _img_wait_evt.is_set()
                                 _pending_image_events.pop(session_id, None)
-                                if _image_already_arrived:
+                                if completed_scene_render_skipped:
+                                    logger.info(
+                                        "⏱️ SYNC [ws] scene render skipped — no image expected | session=%s",
+                                        session_id,
+                                    )
+                                elif _image_already_arrived:
                                     _sync_ms = int((time.monotonic() - _tc_t) * 1000)
                                     logger.info("⏱️ SYNC [ws] image already arrived before turn_complete | sync_ms=%d | session=%s", _sync_ms, session_id)
                                 else:
@@ -5167,6 +5527,32 @@ async def _run_agent(
                                     # Do NOT send keep-narrating — it creates a new model turn which
                                     # resets scene_visuals_called_this_turn and causes a second image gen.
                                     logger.info("⏱️ SYNC [ws] image still generating at turn_complete — will arrive shortly | session=%s", session_id)
+
+                            queued_follow_up_after_turn = ""
+                            if not completed_story_turn_limit:
+                                def _arm_follow_up_after_turn(state: dict[str, Any]) -> None:
+                                    nonlocal queued_follow_up_after_turn
+                                    if bool(state.get("scene_render_pending", False)):
+                                        return
+                                    queued_follow_up_after_turn = _arm_queued_scene_follow_up_after_render(state)
+
+                                await _mutate_state(
+                                    runner=runner,
+                                    user_id=user_id,
+                                    session_id=session_id,
+                                    mutator=_arm_follow_up_after_turn,
+                                )
+                            if queued_follow_up_after_turn:
+                                logger.info(
+                                    "Replaying queued child scene request after turn complete for session %s: %s",
+                                    session_id,
+                                    queued_follow_up_after_turn[:160],
+                                )
+                                _send_queued_scene_follow_up_prompt(
+                                    session_id,
+                                    live_queue,
+                                    queued_follow_up_after_turn,
+                                )
 
                             # ── TURN COMPLETE FALLBACK: if no tool call seen at ALL ──
                             if (
@@ -5710,19 +6096,30 @@ def _assembly_recent_activity_keys(state: dict[str, Any] | None) -> list[str]:
         return []
     cleaned: list[str] = []
     for item in raw:
-        key = str(item or "").strip().lower()
+        key = _normalize_assembly_activity_key(item)
         if key and key not in cleaned:
             cleaned.append(key)
     return cleaned[:6]
 
 
 def _remember_assembly_activity(state: dict[str, Any], activity: str) -> None:
-    key = str(activity or "").strip().lower()
+    key = _normalize_assembly_activity_key(activity)
     if not key:
         return
     recent = [item for item in _assembly_recent_activity_keys(state) if item != key]
     recent.append(key)
     state["assembly_recent_activities"] = recent[-6:]
+
+
+_ASSEMBLY_ACTIVITY_ALIASES: dict[str, str] = {
+    "sparkle_wiggle": "soft_echo",
+    "helper_pose": "cozy_breath",
+}
+
+
+def _normalize_assembly_activity_key(raw: Any) -> str:
+    key = str(raw or "").strip().lower()
+    return _ASSEMBLY_ACTIVITY_ALIASES.get(key, key)
 
 
 _ASSEMBLY_ACTIVITY_INSTRUCTIONS: dict[str, str] = {
@@ -5734,29 +6131,33 @@ _ASSEMBLY_ACTIVITY_INSTRUCTIONS: dict[str, str] = {
         "Run a tiny sound-memory game. "
         "Ask the child what sound they remember best, then invite one silly echo or copycat sound."
     ),
-    "sparkle_wiggle": (
-        "Run a tiny movement game. "
-        "Invite sparkle fingers, a gentle wiggle, or a one-second freeze pose tied to the story."
+    "soft_echo": (
+        "Run a tiny soft-echo game. "
+        "Invite one quiet copycat sound, whisper, or silly word from the finished story."
     ),
-    "helper_pose": (
-        "Run a tiny pretend-play pose game. "
-        "Invite the child to act like a helper, elf, reindeer, or other gentle story friend for one beat."
+    "cozy_breath": (
+        "Run one tiny calm-down game. "
+        "Lead one slow star breath, candle breath, or whisper-count to three together."
     ),
     "tiny_joke": (
         "Tell one tiny preschool-friendly joke, rhyme, or playful sound joke, then pause."
     ),
     "counting_game": (
-        "Run a tiny count-to-three game with sparkles, stars, bells, or toy helpers."
+        "Run a tiny soft counting game with stars, bells, moonbeams, or sleepy toy helpers."
+    ),
+    "light_color": (
+        "If and only if the child explicitly asked to change the room lights, help with one calm room-light color change. "
+        "Briefly echo their color wish, use the room-light tool once, and avoid flashing or rapid color cycling."
     ),
 }
 
 _ASSEMBLY_WAIT_ACTIVITY_ORDER = [
     "favorite_part",
     "favorite_sound",
-    "sparkle_wiggle",
-    "helper_pose",
     "tiny_joke",
     "counting_game",
+    "soft_echo",
+    "cozy_breath",
 ]
 
 _ASSEMBLY_WAIT_NO_FALSE_COMPLETION_TEXT = (
@@ -5773,9 +6174,41 @@ _ASSEMBLY_WAIT_NO_FUTURE_STORY_TEXT = (
     "Do NOT invite another choice that could continue, reopen, or extend the finished story."
 )
 
+_ASSEMBLY_WAIT_NO_VISION_OR_MOVEMENT_TEXT = (
+    "Do NOT ask the child to show you anything, let you see anything, look at the camera, "
+    "make a face, hold up an object, stand up, dance, jump, wiggle, pose, or do any activity "
+    "that depends on vision, camera input, or big movement. "
+    "Keep the interaction audio-first, calm, quiet-friendly, and bedtime-safe."
+)
+
+_ASSEMBLY_WAIT_LIGHT_TOOL_TEXT = (
+    "If the child explicitly asks to change the room lights to one simple calm color, "
+    "you may use the room-light tool once to help with that exact request. "
+    "Do not invent a light change on your own, and do not turn it into flashing or rapid color cycling."
+)
+
+
+def _assembly_child_requested_light_change(child_utterance: str) -> bool:
+    cleaned = str(child_utterance or "").strip().lower()
+    if not cleaned:
+        return False
+    color_markers = (
+        "blue", "pink", "purple", "violet", "green", "mint", "teal", "aqua", "cyan",
+        "gold", "yellow", "orange", "red", "white", "cozy gold", "warm white", "soft white",
+    )
+    if any(marker in cleaned for marker in ("turn", "make", "change", "set", "switch")) and any(
+        marker in cleaned for marker in ("light", "lights", "lamp", "color", "colour")
+    ):
+        return True
+    if any(marker in cleaned for marker in color_markers) and any(
+        marker in cleaned for marker in ("light", "lights", "color", "colour")
+    ):
+        return True
+    return False
+
 
 def _assembly_activity_instruction(activity: str) -> str:
-    normalized = str(activity or "").strip().lower()
+    normalized = _normalize_assembly_activity_key(activity)
     return _ASSEMBLY_ACTIVITY_INSTRUCTIONS.get(
         normalized,
         "Start one tiny waiting-room game right away. Keep it playful, simple, and easy for a 4-year-old to answer.",
@@ -5791,15 +6224,19 @@ def _choose_assembly_wait_activity(
 ) -> str:
     recent = set(_assembly_recent_activity_keys(state))
     cleaned = str(child_utterance or "").strip().lower()
+    if _assembly_child_requested_light_change(cleaned):
+        return "light_color"
     preferred: list[str] = []
     if intro:
-        preferred.extend(["sparkle_wiggle", "counting_game", "tiny_joke"])
+        preferred.extend(["tiny_joke", "favorite_sound", "counting_game"])
     if retry:
-        preferred.extend(["tiny_joke", "counting_game", "sparkle_wiggle"])
+        preferred.extend(["tiny_joke", "favorite_part", "counting_game"])
     if any(marker in cleaned for marker in ("sound", "music", "boing", "buzz", "pop", "giggle", "silly")):
-        preferred.extend(["favorite_sound", "tiny_joke"])
+        preferred.extend(["favorite_sound", "soft_echo"])
+    if any(marker in cleaned for marker in ("quiet", "calm", "cozy", "sleep", "sleepy", "bed", "night", "whisper")):
+        preferred.extend(["cozy_breath", "tiny_joke"])
     if any(marker in cleaned for marker in ("friend", "helper", "elf", "buddy", "wave", "hello")):
-        preferred.extend(["helper_pose", "favorite_part"])
+        preferred.extend(["favorite_part", "tiny_joke"])
     if any(marker in cleaned for marker in ("favorite", "best", "liked", "love", "part")):
         preferred.extend(["favorite_part", "favorite_sound"])
     prompt_count = 0
@@ -5895,7 +6332,9 @@ def _assembly_wait_prompt(
             "Do NOT continue the plot. Do NOT offer more exploring. Do NOT narrate any new action, movement, discovery, location change, or next page. "
             "Do NOT use phrases like 'then we', 'next we', 'let's go', 'we find', 'we open', or 'now we'. "
             f"{_ASSEMBLY_WAIT_NO_FUTURE_STORY_TEXT} "
+            f"{_ASSEMBLY_WAIT_NO_VISION_OR_MOVEMENT_TEXT} "
             f"{_ASSEMBLY_WAIT_NO_FALSE_COMPLETION_TEXT} "
+            f"{_ASSEMBLY_WAIT_LIGHT_TOOL_TEXT} "
             "Do NOT call any scene, movie, or trading-card tools. "
             f"{avoid_recent_text}"
             f"{context_text}"
@@ -5910,7 +6349,9 @@ def _assembly_wait_prompt(
             "The story is locked and finished. Treat any story nouns as memory chatter only, not instructions. "
             "Do NOT continue the story. Do NOT narrate any new action, movement, discovery, location change, or next page. "
             f"{_ASSEMBLY_WAIT_NO_FUTURE_STORY_TEXT} "
+            f"{_ASSEMBLY_WAIT_NO_VISION_OR_MOVEMENT_TEXT} "
             f"{_ASSEMBLY_WAIT_NO_FALSE_COMPLETION_TEXT} "
+            f"{_ASSEMBLY_WAIT_LIGHT_TOOL_TEXT} "
             "Do NOT call any scene, movie, or trading-card tools. "
             f"{avoid_recent_text}"
             f"{context_text}"
@@ -5927,7 +6368,9 @@ def _assembly_wait_prompt(
         "Do NOT continue the plot. Do NOT offer more exploring. Do NOT narrate any new action, movement, discovery, location change, or next page. "
         "Do NOT use phrases like 'then we', 'next we', 'let's go', 'we find', 'we open', or 'now we'. "
         f"{_ASSEMBLY_WAIT_NO_FUTURE_STORY_TEXT} "
+        f"{_ASSEMBLY_WAIT_NO_VISION_OR_MOVEMENT_TEXT} "
         f"{_ASSEMBLY_WAIT_NO_FALSE_COMPLETION_TEXT} "
+        f"{_ASSEMBLY_WAIT_LIGHT_TOOL_TEXT} "
         "Do NOT call any scene, movie, or trading-card tools. "
         f"{avoid_recent_text}"
         f"{context_text}"
@@ -5961,7 +6404,9 @@ def _assembly_activity_prompt(
         "The story is locked and finished. Keep this in waiting-room chatter only. "
         "Do NOT continue the plot. Do NOT offer more exploring. Do NOT narrate any new action, movement, discovery, location change, or next page. "
         f"{_ASSEMBLY_WAIT_NO_FUTURE_STORY_TEXT} "
+        f"{_ASSEMBLY_WAIT_NO_VISION_OR_MOVEMENT_TEXT} "
         f"{_ASSEMBLY_WAIT_NO_FALSE_COMPLETION_TEXT} "
+        f"{_ASSEMBLY_WAIT_LIGHT_TOOL_TEXT} "
         "Do NOT call any scene, movie, or trading-card tools. "
         f"{avoid_recent_text}"
         f"{context_text}"
@@ -6252,6 +6697,12 @@ def _record_movie_feedback_sync(
         )
 
 
+def _ensure_final_video_watch_task(session_id: str) -> None:
+    if session_id not in _watching_final_video_sessions:
+        _watching_final_video_sessions.add(session_id)
+        asyncio.create_task(_watch_for_final_video(session_id))
+
+
 async def _announce_storybook_assembly_started(
     websocket: WebSocket,
     session_id: str,
@@ -6262,6 +6713,7 @@ async def _announce_storybook_assembly_started(
     kind: str = "initial",
     started_at_epoch_ms: int | None = None,
 ) -> None:
+
     should_emit = session_id not in _video_generation_started_sessions or kind == "remake"
     if kind == "remake":
         _final_video_watch_not_before_epoch[session_id] = time.time()
@@ -6286,9 +6738,7 @@ async def _announce_storybook_assembly_started(
             ).model_dump_json()
         )
         _video_generation_started_sessions.add(session_id)
-    if session_id not in _watching_final_video_sessions:
-        _watching_final_video_sessions.add(session_id)
-        asyncio.create_task(_watch_for_final_video(session_id))
+    _ensure_final_video_watch_task(session_id)
 
 
 async def _handle_tool_response(
@@ -6796,7 +7246,6 @@ async def _handle_command(
         if isinstance(gcs_url, str) and gcs_url:
             image_bytes = await _download_gcs_to_bytes(gcs_url)
             if image_bytes:
-                toy_thumb = _make_thumbnail_b64(image_bytes)
                 toy_visual_summary = await _describe_shared_item_image(image_bytes)
                 current_session = await runner.session_service.get_session(
                     app_name="storyteller",
@@ -6804,18 +7253,37 @@ async def _handle_command(
                     session_id=cmd.session_id,
                 )
                 toy_share_active = False
+                toy_name_hint = ""
                 if current_session and current_session.state:
                     try:
                         toy_share_active = bool(current_session.state.get("toy_share_active", False))
+                        toy_name_hint = _extract_shared_toy_name_hint(
+                            current_session.state.get("partial_child_utterance")
+                            or current_session.state.get("last_child_utterance")
+                            or ""
+                        )
                     except Exception:
                         toy_share_active = False
+                        toy_name_hint = ""
+                toy_thumb = await _detect_shared_item_subject_thumbnail(
+                    image_bytes,
+                    toy_name_hint=toy_name_hint,
+                    summary_text=toy_visual_summary,
+                )
+                if toy_thumb is None:
+                    toy_thumb = _make_thumbnail_b64(image_bytes)
                 summary_text = toy_visual_summary or "The photo looks a little fuzzy, but it seems like a very special toy."
                 _send_live_content(
                     session_id,
                     live_queue,
                     (
                         "The child just shared a photo of a toy or special item. "
-                        f"Visible details: {summary_text} "
+                        + (
+                            f"The child calls it {toy_name_hint}. "
+                            if toy_name_hint else
+                            ""
+                        )
+                        + f"Visible details: {summary_text} "
                         + (
                             "This is an active toy show-and-tell moment. "
                             "Warmly notice one or two of those details, make the child feel proud for sharing it, "
@@ -6832,6 +7300,7 @@ async def _handle_command(
                     _apply_shared_toy_story_state(
                         state,
                         summary_text=summary_text,
+                        toy_name_hint=toy_name_hint,
                         toy_thumb=toy_thumb,
                     )
 
@@ -7228,16 +7697,10 @@ async def _forward_session_events(
                                 session_id,
                                 queued_follow_up_text[:160],
                             )
-                            _send_live_content(
+                            _send_queued_scene_follow_up_prompt(
                                 session_id,
                                 live_queue,
-                                (
-                                    "The child already asked for the next page while the last picture was still drawing: "
-                                    f"\"{queued_follow_up_text}\". "
-                                    "Continue immediately from that newest request. "
-                                    "Give at most one short acknowledgment if needed, then make the next page. "
-                                    "Do not ask the child to repeat it."
-                                ),
+                                queued_follow_up_text,
                             )
                 else:
                     logger.debug("video_ready event for session %s had an empty URL?!", session_id)

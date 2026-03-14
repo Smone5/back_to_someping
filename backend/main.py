@@ -102,6 +102,7 @@ class Settings(BaseSettings):
     google_api_key: str
     google_cloud_project: str
     google_cloud_location: str = "us-central1"
+    vertex_ai_location: str = "global"
     google_genai_use_vertexai: bool = True
     elevenlabs_api_key: str
     gcs_assets_bucket: str = "storyteller-session-assets"
@@ -166,6 +167,7 @@ settings = Settings()
 os.environ["GOOGLE_API_KEY"] = settings.google_api_key
 os.environ["GOOGLE_CLOUD_PROJECT"] = settings.google_cloud_project
 os.environ["GOOGLE_CLOUD_LOCATION"] = settings.google_cloud_location
+os.environ["VERTEX_AI_LOCATION"] = settings.vertex_ai_location
 os.environ["GOOGLE_GENAI_USE_VERTEXAI"] = "TRUE" if settings.google_genai_use_vertexai else "FALSE"
 os.environ["ELEVENLABS_API_KEY"] = settings.elevenlabs_api_key
 os.environ["GCS_ASSETS_BUCKET"] = settings.gcs_assets_bucket
@@ -1323,10 +1325,11 @@ async def startup_event() -> None:
     _runner = _create_runner()
     _cleanup_task = asyncio.create_task(_session_ttl_cleanup_loop())
     logger.info(
-        "ADK Runner ready. StorySpark API is live. backend_live_backend=%s storyteller_live_model=%s location=%s",
+        "ADK Runner ready. StorySpark API is live. backend_live_backend=%s storyteller_live_model=%s run_region=%s vertex_location=%s",
         "vertex_ai" if settings.google_genai_use_vertexai else "ai_studio",
         os.environ.get("STORYTELLER_LIVE_MODEL", "").strip() or "default",
         settings.google_cloud_location,
+        settings.vertex_ai_location,
     )
 
 
@@ -1396,6 +1399,7 @@ async def health() -> dict:
             "use_vertex_ai": settings.google_genai_use_vertexai,
             "model": os.environ.get("STORYTELLER_LIVE_MODEL", "").strip() or None,
             "location": settings.google_cloud_location,
+            "vertex_location": settings.vertex_ai_location,
         },
     }
 

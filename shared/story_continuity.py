@@ -37,6 +37,10 @@ _DEFAULT_WORLD_STATE: dict[str, Any] = {
 
 _DEFAULT_REGISTRY_TEXT = "No recurring entities tracked yet."
 _DEFAULT_WORLD_TEXT = "No scene-to-scene world state established yet."
+_INITIAL_SCENE_PLACEHOLDER_RE = re.compile(
+    r"^no image yet\b.*story is just beginning!?$",
+    flags=re.IGNORECASE,
+)
 
 _STOPWORDS = {
     "a", "an", "and", "around", "at", "be", "big", "bright", "by", "can", "cozy",
@@ -78,6 +82,37 @@ _LOCATION_TERMS = [
     "moon",
 ]
 
+_GENERIC_LOCATION_PATTERNS: tuple[re.Pattern[str], ...] = (
+    re.compile(
+        r"\b(?:go|going|head|walk|run|fly|swim|sail|travel|venture|explore|visit|reach|arrive|step|enter|follow)\b"
+        r"(?:\s+\w+){0,2}?\s+\b(?:to|toward|towards|into|inside|through|across|over|under|along|down|up|past|beyond)\b"
+        r"\s+(?:the|a|an|my|our|this|that)?\s*"
+        r"([A-Za-z][A-Za-z'\-]*(?:\s+[A-Za-z][A-Za-z'\-]*){0,7})",
+        flags=re.IGNORECASE,
+    ),
+)
+_GENERIC_LOCATION_SPLIT_RE = re.compile(
+    r"\b(?:with|where|that|which|who|full(?:\s+of)?|filled(?:\s+with)?|made(?:\s+of|\s+from)?|because|while|as|and\s+then|but)\b",
+    flags=re.IGNORECASE,
+)
+_GENERIC_LOCATION_TRAILING_RE = re.compile(
+    r"\b(?:today|tonight|now|next|first|please|instead|again)\b\s*$",
+    flags=re.IGNORECASE,
+)
+_GENERIC_NON_LOCATION_WORDS = {
+    "top",
+    "bottom",
+    "middle",
+    "inside",
+    "outside",
+    "there",
+    "here",
+    "it",
+    "that",
+    "this",
+    "one",
+}
+
 _ANIMATE_TERMS = [
     "santa claus",
     "santa",
@@ -111,6 +146,8 @@ _PROP_TERMS = [
     "books",
     "gift",
     "gifts",
+    "present",
+    "presents",
     "toy",
     "toys",
     "bench",
@@ -123,6 +160,31 @@ _PROP_TERMS = [
     "chair",
     "couch",
 ]
+
+_GENERIC_PROP_LABELS = {
+    "toy",
+    "toys",
+    "my toy",
+    "our toy",
+    "your toy",
+    "his toy",
+    "her toy",
+    "their toy",
+    "can my toy",
+    "can our toy",
+    "can your toy",
+    "can his toy",
+    "can her toy",
+    "can their toy",
+}
+_CONVERSATIONAL_PROP_PREFIX_RE = re.compile(
+    r"^(?:can|could|should|would|do|does|did|let'?s|please|like)\b",
+    flags=re.IGNORECASE,
+)
+_GENERIC_TOY_PROP_RE = re.compile(
+    r"^(?:my|our|your|his|her|their)\s+toy(?:s)?\b",
+    flags=re.IGNORECASE,
+)
 
 _TRANSITION_PATTERNS: list[tuple[str, re.Pattern[str]]] = [
     ("inside", re.compile(r"\b(?:inside|go inside|enter|step inside)\b", flags=re.IGNORECASE)),
@@ -173,8 +235,24 @@ _EXPLICIT_VISUAL_REQUEST_PATTERNS: tuple[re.Pattern[str], ...] = (
     re.compile(r"\b(?:draw|picture|image|illustration)\b", flags=re.IGNORECASE),
     re.compile(r"\b(?:with|in) an image\b", flags=re.IGNORECASE),
     re.compile(r"\b(?:can|could) (?:i|we) see (?:it|that|the picture|the image|a picture|an image)\b", flags=re.IGNORECASE),
-    re.compile(r"\bwhat does .* look like\b", flags=re.IGNORECASE),
     re.compile(r"\btake me there\b", flags=re.IGNORECASE),
+)
+
+_SCENE_CHAT_PATTERNS: tuple[re.Pattern[str], ...] = (
+    re.compile(
+        r"\b(?:what(?:'s| is| are)|why|who(?:'s| is| are)|how(?:'s| is| are| do| does)|where is|tell me about)\b",
+        flags=re.IGNORECASE,
+    ),
+    re.compile(r"\b(?:look at|i see|that's|that is|it's|it is|what color|do you see)\b", flags=re.IGNORECASE),
+    re.compile(r"\bwhat\s+(?:do|does)\b.*\blook like\b", flags=re.IGNORECASE),
+)
+
+_SAME_SCENE_REFRESH_HINT_PATTERNS: tuple[re.Pattern[str], ...] = (
+    re.compile(
+        r"\b(?:get|move|come|walk|go|step)\s+(?:closer|near|next to|over to|toward|towards|up to)\b",
+        flags=re.IGNORECASE,
+    ),
+    re.compile(r"\b(?:zoom|close[- ]up|focus on)\b", flags=re.IGNORECASE),
 )
 
 _NAVIGATION_PAGE_TURN_PATTERNS: tuple[re.Pattern[str], ...] = (
@@ -291,8 +369,41 @@ def _extract_phrase_candidates(text: str, terms: list[str]) -> list[str]:
     return matches
 
 
+def _extract_generic_location_candidates(text: str) -> list[str]:
+    cleaned = _clean_text(text)
+    if not cleaned:
+        return []
+    matches: list[str] = []
+    for pattern in _GENERIC_LOCATION_PATTERNS:
+        for match in pattern.finditer(cleaned):
+            fragment = _clean_text(match.group(1))
+            if not fragment:
+                continue
+            fragment = _GENERIC_LOCATION_SPLIT_RE.split(fragment, maxsplit=1)[0].strip(" ,.;:!?")
+            fragment = _GENERIC_LOCATION_TRAILING_RE.sub("", fragment).strip(" ,.;:!?")
+            candidate = _canonical_label(fragment)
+            if not candidate:
+                continue
+            candidate_words = _safe_words(candidate)
+            if not candidate_words:
+                continue
+            if len(candidate_words) == 1 and candidate_words[0] in _GENERIC_NON_LOCATION_WORDS:
+                continue
+            if _extract_prop_candidates(candidate) and not _is_route_focus_location(candidate):
+                continue
+            lowered = candidate.lower()
+            if lowered not in {item.lower() for item in matches}:
+                matches.append(candidate)
+    return matches
+
+
 def _extract_location_candidates(text: str) -> list[str]:
-    return _extract_phrase_candidates(text, _LOCATION_TERMS)
+    matches = _extract_phrase_candidates(text, _LOCATION_TERMS)
+    for candidate in _extract_generic_location_candidates(text):
+        if candidate.lower() not in {item.lower() for item in matches}:
+            matches.append(candidate)
+    return matches
+
 
 
 def _extract_character_candidates(text: str, state: Mapping[str, Any]) -> list[str]:
@@ -315,8 +426,41 @@ def _extract_character_candidates(text: str, state: Mapping[str, Any]) -> list[s
     return matches
 
 
+def is_meaningful_prop_label(label: str) -> bool:
+    cleaned = _canonical_label(label)
+    if not cleaned:
+        return False
+    lowered = cleaned.lower()
+    if lowered in _GENERIC_PROP_LABELS:
+        return False
+    if _CONVERSATIONAL_PROP_PREFIX_RE.search(lowered):
+        return False
+    if _GENERIC_TOY_PROP_RE.search(lowered):
+        return False
+    words = _safe_words(cleaned)
+    if not words:
+        return False
+    return words not in (["toy"], ["toys"])
+
+
 def _extract_prop_candidates(text: str) -> list[str]:
-    return _extract_phrase_candidates(text, _PROP_TERMS)
+    return [
+        candidate
+        for candidate in _extract_phrase_candidates(text, _PROP_TERMS)
+        if is_meaningful_prop_label(candidate)
+    ]
+
+
+def _meaningful_prop_keys(state: Mapping[str, Any], keys: list[str]) -> list[str]:
+    cleaned_keys: list[str] = []
+    for key in keys:
+        normalized_key = str(key).strip()
+        if not normalized_key:
+            continue
+        if not is_meaningful_prop_label(_entity_label(state, "props", normalized_key)):
+            continue
+        cleaned_keys.append(normalized_key)
+    return cleaned_keys
 
 
 def _detect_transition(text: str) -> str:
@@ -388,7 +532,10 @@ def _is_same_place_reveal_request(state: Mapping[str, Any], text: str) -> bool:
     world = state.get("continuity_world_state", {})
     active_prop_keys = []
     if isinstance(world, Mapping):
-        active_prop_keys = [str(item).strip() for item in list(world.get("active_prop_keys", []) or []) if str(item).strip()]
+        active_prop_keys = _meaningful_prop_keys(
+            state,
+            [str(item).strip() for item in list(world.get("active_prop_keys", []) or []) if str(item).strip()],
+        )
     if _matching_entity_keys_for_fragment(state, "props", "chest", candidate_keys=active_prop_keys):
         return True
     current_scene_bits = " ".join(
@@ -513,6 +660,13 @@ def _is_navigation_page_turn_request(text: str) -> bool:
     return any(pattern.search(cleaned) for pattern in _NAVIGATION_PAGE_TURN_PATTERNS)
 
 
+def _is_same_scene_focus_shift_request(text: str) -> bool:
+    cleaned = _clean_text(text)
+    if not cleaned:
+        return False
+    return any(pattern.search(cleaned) for pattern in _SAME_SCENE_REFRESH_HINT_PATTERNS)
+
+
 def _is_route_focus_location(label: str) -> bool:
     lowered = _clean_text(label).lower()
     return any(term in lowered for term in _ROUTE_FOCUS_TERMS)
@@ -543,6 +697,123 @@ def _has_major_visual_change_signal(*texts: str) -> bool:
     return any(pattern.search(combined) for pattern in _MAJOR_VISUAL_CHANGE_PATTERNS)
 
 
+def _is_placeholder_scene_text(text: Any) -> bool:
+    cleaned = _clean_text(text)
+    if not cleaned:
+        return False
+    return bool(_INITIAL_SCENE_PLACEHOLDER_RE.search(cleaned))
+
+
+def _has_real_current_scene(state: Mapping[str, Any]) -> bool:
+    current_scene_description = _clean_text(state.get("current_scene_description", ""))
+    if current_scene_description and not _is_placeholder_scene_text(current_scene_description):
+        return True
+    if _clean_text(state.get("current_scene_visual_summary", "")):
+        return True
+    if _clean_text(state.get("current_scene_storybeat_text", "")):
+        return True
+    history = state.get("continuity_scene_history", [])
+    if isinstance(history, list):
+        for entry in reversed(history):
+            if not isinstance(entry, Mapping):
+                continue
+            if _clean_text(entry.get("location_label", "")):
+                return True
+            if _clean_text(entry.get("summary", "")) or _clean_text(entry.get("visual_summary", "")):
+                return True
+    for page in story_pages_from_state_data(state):
+        scene_description = _clean_text(page.get("scene_description", ""))
+        if scene_description and not _is_placeholder_scene_text(scene_description):
+            return True
+        if _clean_text(page.get("storybeat_text", "")):
+            return True
+        if _clean_text(page.get("image_url", "")) or _clean_text(page.get("gcs_uri", "")):
+            return True
+    return False
+
+
+def _current_scene_reference_text(state: Mapping[str, Any]) -> str:
+    if not _has_real_current_scene(state):
+        return ""
+    world = state.get("continuity_world_state", {})
+    if not isinstance(world, Mapping):
+        world = {}
+    active_prop_keys = [str(item).strip() for item in list(world.get("active_prop_keys", []) or []) if str(item).strip()]
+    active_character_keys = [str(item).strip() for item in list(world.get("active_character_keys", []) or []) if str(item).strip()]
+    current_scene_description = _clean_text(state.get("current_scene_description", ""))
+    if _is_placeholder_scene_text(current_scene_description):
+        current_scene_description = ""
+    bits = [
+        current_scene_description,
+        _clean_text(state.get("current_scene_visual_summary", "")),
+        _clean_text(state.get("current_scene_storybeat_text", "")),
+        _clean_text(world.get("current_location_label", "")),
+        " ".join(_list_entity_labels(state, "props", _meaningful_prop_keys(state, active_prop_keys))),
+        " ".join(_list_entity_labels(state, "characters", active_character_keys)),
+    ]
+    return " ".join(bit for bit in bits if bit).strip()
+
+
+def _is_current_scene_detail_chat(
+    state: Mapping[str, Any],
+    text: str,
+    *,
+    description: str = "",
+) -> bool:
+    cleaned = _clean_text(text)
+    if not cleaned:
+        return False
+    if _is_explicit_visual_request(cleaned) or _is_navigation_page_turn_request(cleaned):
+        return False
+    if _has_major_visual_change_signal(cleaned, description):
+        return False
+    if _is_same_scene_focus_shift_request(cleaned):
+        return False
+    if not (cleaned.endswith("?") or any(pattern.search(cleaned) for pattern in _SCENE_CHAT_PATTERNS)):
+        return False
+    if re.search(r"^\s*(?:can|could|should|do)\s+(?:i|we)\b", cleaned, flags=re.IGNORECASE):
+        return False
+
+    current_scene_reference = _current_scene_reference_text(state)
+    if not current_scene_reference:
+        return False
+
+    mentioned_labels = []
+    world = state.get("continuity_world_state", {})
+    if isinstance(world, Mapping):
+        mentioned_labels.extend(
+            _list_entity_labels(
+                state,
+                "props",
+                _meaningful_prop_keys(
+                    state,
+                    [str(item).strip() for item in list(world.get("active_prop_keys", []) or []) if str(item).strip()],
+                ),
+            )
+        )
+        mentioned_labels.extend(
+            _list_entity_labels(
+                state,
+                "characters",
+                [str(item).strip() for item in list(world.get("active_character_keys", []) or []) if str(item).strip()],
+            )
+        )
+        current_location_label = _clean_text(world.get("current_location_label", ""))
+        if current_location_label:
+            mentioned_labels.append(current_location_label)
+
+    if any(_mentions_label(cleaned, label) for label in mentioned_labels if label):
+        return True
+
+    current_words = set(_safe_words(current_scene_reference))
+    child_words = set(_safe_words(cleaned))
+    if current_words and child_words and (current_words & child_words):
+        return True
+
+    described_words = set(_safe_words(_clean_text(description)))
+    return bool(described_words and current_words and (described_words & current_words))
+
+
 def should_render_new_scene_page(
     state: dict[str, Any],
     description: str,
@@ -570,11 +841,22 @@ def should_render_new_scene_page(
             current_location_label=current_location_label,
         )
 
-    if not current_location_label and not str(state.get("current_scene_description", "") or "").strip():
+    if not _has_real_current_scene(state):
         return SceneRenderDecision(True, "first_page")
 
     if _is_explicit_visual_request(child_text):
         return SceneRenderDecision(True, "explicit_visual_request")
+
+    active_character_keys = [str(item).strip() for item in list(world.get("active_character_keys", []) or []) if str(item).strip()]
+    pending_character_keys = [str(item).strip() for item in list(world.get("pending_character_keys", []) or []) if str(item).strip()]
+    current_prop_keys = _meaningful_prop_keys(
+        state,
+        [str(item).strip() for item in list(world.get("active_prop_keys", []) or []) if str(item).strip()],
+    )
+    pending_prop_keys = _meaningful_prop_keys(
+        state,
+        [str(item).strip() for item in list(world.get("pending_prop_keys", []) or []) if str(item).strip()],
+    )
 
     if pending_transition:
         return SceneRenderDecision(True, "structural_transition")
@@ -593,16 +875,29 @@ def should_render_new_scene_page(
     ):
         return SceneRenderDecision(True, "location_change")
 
+    if _is_current_scene_detail_chat(state, child_text, description=cleaned_description):
+        if render_in_flight:
+            return SceneRenderDecision(False, "current_scene_detail_chat_while_rendering")
+        return SceneRenderDecision(False, "current_scene_detail_chat")
+
     same_location = bool(
         current_location_label
         and proposed_location_label
         and _locations_match(current_location_label, proposed_location_label)
     )
     if same_location:
+        new_character_keys = [key for key in pending_character_keys if key and key not in active_character_keys]
+        if new_character_keys:
+            return SceneRenderDecision(True, "new_character_reveal_same_location")
+        new_prop_keys = [key for key in pending_prop_keys if key and key not in current_prop_keys]
+        if new_prop_keys:
+            return SceneRenderDecision(True, "new_prop_reveal_same_location")
         if navigation_request:
             return SceneRenderDecision(True, "navigation_request_same_location")
         if render_in_flight:
             return SceneRenderDecision(False, "same_location_while_rendering")
+        if _is_same_scene_focus_shift_request(child_text):
+            return SceneRenderDecision(True, "same_location_focus_shift")
         if younger_child_mode:
             return SceneRenderDecision(False, "same_location_minor_beat_young_child")
         if _has_major_visual_change_signal(child_text, cleaned_description):
@@ -654,6 +949,7 @@ def refresh_continuity_text_fields(state: dict[str, Any]) -> None:
     previous_location = _clean_text(world.get("previous_location_label", ""))
     active_characters = _list_entity_labels(state, "characters", list(world.get("active_character_keys", []) or []))
     active_props = _list_entity_labels(state, "props", list(world.get("active_prop_keys", []) or []))
+    active_props = [label for label in active_props if is_meaningful_prop_label(label)]
     pending_request = _clean_text(world.get("pending_request", ""))
     last_transition = _clean_text(world.get("last_transition", ""))
     current_visual_summary = _clean_text(state.get("current_scene_visual_summary", ""))
@@ -691,7 +987,7 @@ def refresh_continuity_text_fields(state: dict[str, Any]) -> None:
     props = registry.get("props", {})
     if isinstance(props, Mapping) and props:
         labels = [_clean_text(item.get("label", "")) for item in props.values() if isinstance(item, Mapping)]
-        labels = [label for label in labels if label][:5]
+        labels = [label for label in labels if label and is_meaningful_prop_label(label)][:5]
         if labels:
             registry_bits.append(f"Props: {', '.join(labels)}")
     state["continuity_registry_text"] = " | ".join(registry_bits) if registry_bits else _DEFAULT_REGISTRY_TEXT
@@ -763,6 +1059,57 @@ def _bootstrap_continuity_from_state(state: dict[str, Any]) -> None:
             request_id=_clean_text(page.get("request_id", "")),
             scene_number=scene_number,
         )
+
+
+def prime_character_carryover(
+    state: dict[str, Any],
+    labels: list[str],
+    *,
+    source: str = "system",
+    description: str = "",
+) -> list[str]:
+    """Pins recurring characters into continuity carryover for upcoming scenes."""
+    ensure_story_continuity_state(state)
+    world = state["continuity_world_state"]
+    scene_number = _scene_number_hint(state)
+    registered_keys: list[str] = []
+    for raw_label in labels:
+        label = _clean_text(raw_label)
+        if not label:
+            continue
+        key = _register_entity(
+            state,
+            bucket="characters",
+            label=label,
+            source=source,
+            scene_number=scene_number,
+            description=description,
+        )
+        if key and key not in registered_keys:
+            registered_keys.append(key)
+
+    if not registered_keys:
+        return []
+
+    active_keys = [
+        str(item).strip()
+        for item in list(world.get("active_character_keys", []) or [])
+        if str(item).strip()
+    ]
+    pending_keys = [
+        str(item).strip()
+        for item in list(world.get("pending_character_keys", []) or [])
+        if str(item).strip()
+    ]
+    for key in registered_keys:
+        if key not in active_keys:
+            active_keys.append(key)
+        if key not in pending_keys:
+            pending_keys.append(key)
+    world["active_character_keys"] = active_keys[-6:]
+    world["pending_character_keys"] = pending_keys[-6:]
+    refresh_continuity_text_fields(state)
+    return registered_keys
 
 
 def update_continuity_from_child_utterance(state: dict[str, Any], child_text: str) -> None:
@@ -905,12 +1252,18 @@ def validate_live_scene_request(
             current_space_mode,
         )
 
-    active_character_keys = list(world.get("active_character_keys", []) or [])
-    pending_character_keys = list(world.get("pending_character_keys", []) or [])
+    active_character_keys = [str(item).strip() for item in list(world.get("active_character_keys", []) or []) if str(item).strip()]
+    pending_character_keys = [str(item).strip() for item in list(world.get("pending_character_keys", []) or []) if str(item).strip()]
     carry_character_keys = pending_character_keys or active_character_keys
     carry_character_labels = _list_entity_labels(state, "characters", carry_character_keys[:3])
-    current_prop_keys = list(world.get("active_prop_keys", []) or [])
-    pending_prop_keys = list(world.get("pending_prop_keys", []) or [])
+    current_prop_keys = _meaningful_prop_keys(
+        state,
+        [str(item).strip() for item in list(world.get("active_prop_keys", []) or []) if str(item).strip()],
+    )
+    pending_prop_keys = _meaningful_prop_keys(
+        state,
+        [str(item).strip() for item in list(world.get("pending_prop_keys", []) or []) if str(item).strip()],
+    )
     carry_prop_keys = pending_prop_keys or current_prop_keys
     carry_prop_labels = _list_entity_labels(state, "props", carry_prop_keys[:2])
 
@@ -1108,9 +1461,23 @@ def record_continuity_scene(
 
     prop_labels = _extract_prop_candidates(combined)
     if not prop_labels:
-        prop_labels = _list_entity_labels(state, "props", list(world.get("pending_prop_keys", []) or []))
+        prop_labels = _list_entity_labels(
+            state,
+            "props",
+            _meaningful_prop_keys(
+                state,
+                [str(item).strip() for item in list(world.get("pending_prop_keys", []) or []) if str(item).strip()],
+            ),
+        )
     if not prop_labels and location_label and _locations_match(location_label, _clean_text(world.get("current_location_label", ""))):
-        prop_labels = _list_entity_labels(state, "props", list(world.get("active_prop_keys", []) or []))
+        prop_labels = _list_entity_labels(
+            state,
+            "props",
+            _meaningful_prop_keys(
+                state,
+                [str(item).strip() for item in list(world.get("active_prop_keys", []) or []) if str(item).strip()],
+            ),
+        )
 
     location_key = ""
     if location_label:

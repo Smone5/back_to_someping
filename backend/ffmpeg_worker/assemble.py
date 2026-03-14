@@ -28,6 +28,8 @@ import subprocess
 import tempfile
 import time
 import textwrap
+import struct
+import zlib
 from typing import Any, Literal
 from pathlib import Path
 from collections import Counter
@@ -83,6 +85,7 @@ from shared.storybook_movie_quality import (
 )
 from shared.storybook_lighting import (
     heuristic_storybook_lighting_command,
+    heuristic_storybook_lighting_effect,
     lighting_cue_from_story_page,
     normalize_storybook_lighting_cues,
 )
@@ -103,6 +106,12 @@ from shared.storybook_studio_workflow import (
 from shared.storybook_video_assembly_workflow import (
     build_storybook_video_assembly_summary,
     run_storybook_video_assembly_workflow,
+)
+from shared.storybook_titles import (
+    build_storybook_title_prompt as shared_build_storybook_title_prompt,
+    clean_storybook_title as shared_clean_storybook_title,
+    heuristic_storybook_title as shared_heuristic_storybook_title,
+    validate_storybook_title as shared_validate_storybook_title,
 )
 
 logger = logging.getLogger(__name__)
@@ -415,7 +424,7 @@ def _lyria_generate_music_sync(
 ) -> tuple[bytes, str] | None:
     if not PROJECT or not prompt:
         return None
-    location = os.environ.get("GOOGLE_CLOUD_LOCATION", "us-central1").strip() or "us-central1"
+    location = _vertex_ai_location()
     creds, _ = google.auth.default(scopes=["https://www.googleapis.com/auth/cloud-platform"])
     auth_req = google.auth.transport.requests.Request()
     creds.refresh(auth_req)
@@ -531,6 +540,12 @@ def _build_storybook_theater_lighting_cues(
                 )
             )
 
+        effect_defaults = heuristic_storybook_lighting_effect(
+            scene_text,
+            is_cover=is_cover,
+            is_end_card=is_end_card,
+            duration_seconds=duration,
+        )
         cue = None
         if request_id:
             cue = cues_by_request_id.get(request_id)
@@ -556,6 +571,11 @@ def _build_storybook_theater_lighting_cues(
                 0.6,
                 1.8,
             )
+            if not str(cue.get("effect") or "").strip():
+                cue["effect"] = effect_defaults.get("effect", "steady")
+            if not cue.get("effect_interval_ms"):
+                if effect_defaults.get("effect_interval_ms") is not None:
+                    cue["effect_interval_ms"] = effect_defaults["effect_interval_ms"]
 
         entry = {
             "start_seconds": round(start_seconds, 3),
@@ -568,6 +588,8 @@ def _build_storybook_theater_lighting_cues(
             "brightness": cue.get("brightness"),
             "transition": cue.get("transition"),
             "cue_source": cue.get("cue_source"),
+            "effect": cue.get("effect"),
+            "effect_interval_ms": cue.get("effect_interval_ms"),
         }
         if built:
             previous = built[-1]
@@ -575,6 +597,9 @@ def _build_storybook_theater_lighting_cues(
                 previous.get("hex_color") == entry.get("hex_color")
                 and previous.get("rgb_color") == entry.get("rgb_color")
                 and previous.get("brightness") == entry.get("brightness")
+                and previous.get("transition") == entry.get("transition")
+                and previous.get("effect") == entry.get("effect")
+                and previous.get("effect_interval_ms") == entry.get("effect_interval_ms")
             ):
                 previous["end_seconds"] = entry["end_seconds"]
                 start_seconds += duration
@@ -685,6 +710,14 @@ def _sniff_mime_type(image_bytes: bytes) -> str:
 
 def _is_placeholder_scene_source(source: str) -> bool:
     return str(source or "").strip().lower().startswith("data:image/svg+xml")
+
+
+def _vertex_ai_location() -> str:
+    return (
+        os.environ.get("VERTEX_AI_LOCATION")
+        or os.environ.get("GOOGLE_CLOUD_LOCATION")
+        or "us-central1"
+    ).strip() or "us-central1"
 
 
 def _is_reviewable_raster_image(image_bytes: bytes) -> bool:
@@ -1063,7 +1096,7 @@ def _review_storyboard_pass(
         return None
 
     model = os.environ.get("STORYBOOK_SCENE_REVIEW_MODEL", DEFAULT_VERTEX_TEXT_MODEL).strip() or DEFAULT_VERTEX_TEXT_MODEL
-    location = os.environ.get("GOOGLE_CLOUD_LOCATION", "us-central1")
+    location = _vertex_ai_location()
     ordered_indices = list(range(len(still_paths)))
     if direction == "BACKWARD":
         ordered_indices.reverse()
@@ -1217,7 +1250,7 @@ def _generate_repaired_story_still(
 
     model = os.environ.get("STORYBOOK_SCENE_IMAGE_MODEL", DEFAULT_VERTEX_IMAGE_MODEL).strip() or DEFAULT_VERTEX_IMAGE_MODEL
     image_size = os.environ.get("STORYBOOK_SCENE_IMAGE_SIZE", "512px").strip() or "512px"
-    location = os.environ.get("GOOGLE_CLOUD_LOCATION", "us-central1")
+    location = _vertex_ai_location()
     meta_guidance = build_principles_injection_text("storyboard_repair")
     prompt = f"""
 Create a single 16:9 children's storybook illustration.
@@ -1526,8 +1559,7 @@ def _llm_audio_cue_plan(
         return None
 
     model = os.environ.get("STORYBOOK_AUDIO_MODEL", DEFAULT_VERTEX_TEXT_MODEL).strip() or DEFAULT_VERTEX_TEXT_MODEL
-    location = os.environ.get("GOOGLE_CLOUD_LOCATION", "us-central1")
-    client = google_genai.Client(vertexai=True, project=PROJECT, location=location)
+    client = google_genai.Client(vertexai=True, project=PROJECT, location=_vertex_ai_location())
 
     scene_lines = []
     for idx, desc in enumerate(scene_descriptions, start=1):
@@ -1725,7 +1757,7 @@ def _llm_rewrite_storybook_narration_line(
         return None
 
     model = os.environ.get("STORYBOOK_STUDIO_MODEL", DEFAULT_VERTEX_TEXT_MODEL).strip() or DEFAULT_VERTEX_TEXT_MODEL
-    location = os.environ.get("GOOGLE_CLOUD_LOCATION", "us-central1")
+    location = _vertex_ai_location()
     prompt = f"""
 You rewrite one preschool narration line so it stays complete, gentle, and short.
 
@@ -2296,6 +2328,10 @@ _STORYBOOK_CAPTION_FONT_CANDIDATES: tuple[Path, ...] = (
     _IMPORT_ROOT / "shared" / "assets" / "fonts" / "Fredoka.ttf",
     Path("/app/shared/assets/fonts/Fredoka.ttf"),
 )
+_STORYBOOK_COVER_LOGO_CANDIDATES: tuple[Path, ...] = (
+    _IMPORT_ROOT / "frontend" / "public" / "voxitale_arch.png",
+    Path("/app/frontend/public/voxitale_arch.png"),
+)
 
 
 def _storybook_caption_font_option() -> str:
@@ -2303,6 +2339,13 @@ def _storybook_caption_font_option() -> str:
         if candidate.exists():
             return f"fontfile={candidate}"
     return "font=Sans"
+
+
+def _storybook_cover_logo_path() -> Path | None:
+    for candidate in _STORYBOOK_COVER_LOGO_CANDIDATES:
+        if candidate.exists():
+            return candidate
+    return None
 
 
 def _storybook_caption_fonts_dir() -> Path | None:
@@ -2817,88 +2860,74 @@ def _render_storybook_end_card_segment(
     )
 
 
-def _clean_title(raw: str) -> str:
-    title = (raw or "").strip()
-    if not title:
-        return ""
-    if "sdk_http_response" in title.lower() or "candidates=[" in title.lower():
-        return ""
-    title = re.sub(r"^(title|story)\\s*[:\\-]\\s*", "", title, flags=re.IGNORECASE)
-    title = title.strip().strip("\"'`")
-    title = re.sub(r"\\s+", " ", title).strip()
-    weak_leads = {"what", "where", "when", "why", "how", "let", "lets", "can"}
-    generic_nouns = {
-        "drawing", "image", "picture", "illustration", "scene", "page", "story", "book", "adventure"
-    }
-    words = title.split()
-    if len(words) > 8:
-        title = " ".join(words[:8])
-        words = title.split()
-    lowered_words = [
-        re.sub(r"[^a-z']", "", word.lower())
-        for word in words
-        if re.sub(r"[^a-z']", "", word.lower())
+def _build_storybook_cover_filtergraph(
+    *,
+    title_text: str,
+    subtitle_text: str = "",
+    duration: float,
+    logo_path: Path | None = None,
+) -> str:
+    title_font = 60 if len(title_text) <= 18 else 52 if len(title_text) <= 28 else 44
+    escaped_title = _ffmpeg_escape(title_text or "A Storybook Adventure")
+    escaped_subtitle = _ffmpeg_escape(subtitle_text) if subtitle_text else ""
+    fade_out_start = max(0.2, float(duration) - 0.4)
+    chains = [
+        "[0:v]scale=1280:720:force_original_aspect_ratio=decrease:flags=lanczos,"
+        "pad=1280:720:(ow-iw)/2:(oh-ih)/2:color=#0b2d5b,"
+        "eq=brightness=-0.02:saturation=1.08,"
+        "drawbox=x=60:y=90:w=1160:h=560:color=#000000@0.18:t=fill,"
+        "drawbox=x=60:y=90:w=1160:h=560:color=#f8f1dc@0.6:t=2,"
+        "drawbox=x=130:y=250:w=1020:h=200:color=#000000@0.35:t=fill,"
+        f"drawtext=text='{escaped_title}':fontcolor=white:fontsize={title_font}:x=(w-text_w)/2:y=h*0.42:shadowcolor=black:shadowx=2:shadowy=2"
+        + (
+            f",drawtext=text='{escaped_subtitle}':fontcolor=white:fontsize=28:x=(w-text_w)/2:y=h*0.56:shadowcolor=black:shadowx=2:shadowy=2"
+            if escaped_subtitle
+            else ""
+        )
+        + "[coverbase]"
     ]
-    content_words = [word for word in lowered_words if word not in {"a", "an", "the", "and", "of"}]
-    if not content_words:
-        return ""
-    if content_words[0] in weak_leads and all(word in generic_nouns or word in weak_leads for word in content_words[1:]):
-        return ""
-    if all(word in generic_nouns or word in weak_leads for word in content_words):
-        return ""
-    return title
+    final_source = "coverbase"
+    if logo_path is not None:
+        chains.append(f"movie='{_ffmpeg_filter_path(logo_path)}',scale=230:-1[coverlogo]")
+        chains.append("[coverbase][coverlogo]overlay=x=W-w-84:y=108:format=auto[coverwithlogo]")
+        final_source = "coverwithlogo"
+    chains.append(
+        f"[{final_source}]fade=t=in:st=0:d=0.4,fade=t=out:st={fade_out_start:.3f}:d=0.4,setsar=1[outv]"
+    )
+    return ";".join(chains)
 
 
-def _heuristic_title(scene_descriptions: list[str], story_summary: str) -> str:
-    text = " ".join(scene_descriptions) + " " + (story_summary or "")
-    words = re.findall(r"[A-Za-z']{4,}", text)
-    stopwords = {
-        "this", "that", "with", "from", "they", "them", "were", "where", "when", "then",
-        "there", "their", "your", "have", "into", "over", "under", "across", "about",
-        "story", "book", "books", "child", "little", "gentle", "glowing", "bright",
-        "light", "magic", "magical", "soft", "warm", "night", "cloud", "clouds",
-        "reading", "disney", "pixar", "what", "where", "when", "why", "how",
-        "drawing", "image", "picture", "illustration", "scene", "page", "pages",
-        "show", "shows",
-    }
-    counts = Counter(w.lower() for w in words if w.lower() not in stopwords)
-    if not counts:
-        return "A Storybook Adventure"
-    top = [w.title() for w, _ in counts.most_common(3)]
-    if len(top) >= 2:
-        title = f"{top[0]} and the {top[1]}"
-    else:
-        title = f"The {top[0]} Story"
-    if re.search(r"reading\\s+rainbow", title, re.IGNORECASE):
-        return "A Storybook Adventure"
-    return title
+def _clean_title(raw: str) -> str:
+    return shared_clean_storybook_title(raw)
 
 
-def _generate_story_title(scene_descriptions: list[str], story_summary: str) -> str:
+def _heuristic_title(
+    scene_descriptions: list[str],
+    story_summary: str,
+    child_name: str = "",
+) -> str:
+    return shared_heuristic_storybook_title(scene_descriptions, story_summary, child_name)
+
+
+def _generate_story_title(
+    scene_descriptions: list[str],
+    story_summary: str,
+    child_name: str = "",
+) -> str:
     if not _env_enabled("ENABLE_STORYBOOK_TITLE_LLM", default=True):
-        return _heuristic_title(scene_descriptions, story_summary)
+        return _heuristic_title(scene_descriptions, story_summary, child_name)
     if not PROJECT:
-        return _heuristic_title(scene_descriptions, story_summary)
+        return _heuristic_title(scene_descriptions, story_summary, child_name)
     try:
         from google import genai as google_genai
     except Exception as exc:
         logger.warning("Title LLM unavailable (google-genai not installed): %s", exc)
-        return _heuristic_title(scene_descriptions, story_summary)
+        return _heuristic_title(scene_descriptions, story_summary, child_name)
 
     model = os.environ.get("STORYBOOK_TITLE_MODEL", DEFAULT_VERTEX_TEXT_MODEL).strip() or DEFAULT_VERTEX_TEXT_MODEL
-    scene_lines = []
-    for idx, desc in enumerate(scene_descriptions, start=1):
-        scene_lines.append(f"{idx}. {desc.strip() or 'Scene with no description.'}")
-    prompt = (
-        "Create a short, original children's storybook title based on the scenes below. "
-        "2 to 6 words. No quotes. Avoid brand names (e.g., Reading Rainbow, Disney). "
-        "Return only the title text.\n\n"
-        f"Story summary: {story_summary.strip() or 'No summary available.'}\n\n"
-        "Scenes:\n" + "\n".join(scene_lines)
-    )
+    prompt = shared_build_storybook_title_prompt(scene_descriptions, story_summary, child_name)
     try:
-        location = os.environ.get("GOOGLE_CLOUD_LOCATION", "us-central1")
-        client = google_genai.Client(vertexai=True, project=PROJECT, location=location)
+        client = google_genai.Client(vertexai=True, project=PROJECT, location=_vertex_ai_location())
         response = client.models.generate_content(
             model=model,
             contents=[prompt],
@@ -2909,12 +2938,12 @@ def _generate_story_title(scene_descriptions: list[str], story_summary: str) -> 
         )
     except Exception as exc:
         logger.warning("Title LLM request failed: %s", exc)
-        return _heuristic_title(scene_descriptions, story_summary)
+        return _heuristic_title(scene_descriptions, story_summary, child_name)
 
     text = _extract_response_text(response)
-    title = _clean_title(text)
-    if not title or re.search(r"reading\\s+rainbow", title, re.IGNORECASE):
-        return _heuristic_title(scene_descriptions, story_summary)
+    title = shared_validate_storybook_title(text, scene_descriptions, story_summary, child_name)
+    if not title:
+        return _heuristic_title(scene_descriptions, story_summary, child_name)
     return title
 
 
@@ -2948,8 +2977,7 @@ def _generate_cover_image(scene_descriptions: list[str], story_summary: str) -> 
         return None
 
     model = os.environ.get("STORYBOOK_COVER_IMAGE_MODEL", DEFAULT_VERTEX_IMAGE_MODEL).strip()
-    location = os.environ.get("GOOGLE_CLOUD_LOCATION", "us-central1")
-    client = google_genai.Client(vertexai=True, project=PROJECT, location=location)
+    client = google_genai.Client(vertexai=True, project=PROJECT, location=_vertex_ai_location())
 
     focus = story_summary.strip() or (scene_descriptions[0].strip() if scene_descriptions else "")
     prompt = (
@@ -4056,27 +4084,229 @@ def _scene_sources_from_state_doc(data: dict[str, Any]) -> list[str]:
 
 
 def _story_page_fallback_data_url(text: str) -> str:
-    safe_text = html.escape((text or "A magical story page")[:180])
-    svg = f"""<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="720" viewBox="0 0 1280 720">
-  <defs>
-    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
-      <stop offset="0%" stop-color="#1a0d40"/>
-      <stop offset="55%" stop-color="#3c1f72"/>
-      <stop offset="100%" stop-color="#103b62"/>
-    </linearGradient>
-    <radialGradient id="glow" cx="52%" cy="38%" r="42%">
-      <stop offset="0%" stop-color="#ffd166" stop-opacity="0.50"/>
-      <stop offset="100%" stop-color="#ffd166" stop-opacity="0"/>
-    </radialGradient>
-  </defs>
-  <rect width="1280" height="720" fill="url(#bg)"/>
-  <rect width="1280" height="720" fill="url(#glow)"/>
-  <circle cx="280" cy="560" r="180" fill="#ff7fbe" opacity="0.42"/>
-  <circle cx="640" cy="580" r="220" fill="#68f7cf" opacity="0.34"/>
-  <circle cx="1020" cy="550" r="170" fill="#6fc8ff" opacity="0.38"/>
-  <text x="640" y="332" text-anchor="middle" font-family="sans-serif" font-size="34" fill="#fff7d6" opacity="0.92">{safe_text}</text>
-</svg>"""
-    return "data:image/svg+xml;base64," + base64.b64encode(svg.encode("utf-8")).decode("ascii")
+    caption = str(text or "A magical story page").strip()[:180] or "A magical story page"
+    try:
+        from PIL import Image, ImageDraw, ImageFont
+
+        width, height = 1280, 720
+        image = Image.new("RGB", (width, height), "#1a0d40")
+        draw = ImageDraw.Draw(image, "RGBA")
+
+        top_color = (26, 13, 64)
+        mid_color = (60, 31, 114)
+        bottom_color = (16, 59, 98)
+        for y in range(height):
+            progress = y / max(1, height - 1)
+            if progress < 0.55:
+                blend = progress / 0.55
+                color = tuple(
+                    int(top_color[idx] + (mid_color[idx] - top_color[idx]) * blend)
+                    for idx in range(3)
+                )
+            else:
+                blend = (progress - 0.55) / 0.45
+                color = tuple(
+                    int(mid_color[idx] + (bottom_color[idx] - mid_color[idx]) * blend)
+                    for idx in range(3)
+                )
+            draw.line((0, y, width, y), fill=color, width=1)
+
+        draw.ellipse((120, 430, 470, 780), fill=(255, 127, 190, 92))
+        draw.ellipse((430, 380, 930, 880), fill=(104, 247, 207, 72))
+        draw.ellipse((860, 420, 1180, 740), fill=(111, 200, 255, 84))
+        draw.ellipse((440, 80, 840, 470), fill=(255, 209, 102, 44))
+        draw.rounded_rectangle(
+            (180, 230, 1100, 470),
+            radius=42,
+            fill=(17, 8, 44, 148),
+            outline=(255, 247, 214, 70),
+            width=4,
+        )
+
+        try:
+            font = ImageFont.truetype("DejaVuSans.ttf", 42)
+        except Exception:
+            font = ImageFont.load_default()
+
+        wrapped_lines: list[str] = []
+        current_line = ""
+        for word in caption.split():
+            candidate = f"{current_line} {word}".strip()
+            bbox = draw.textbbox((0, 0), candidate, font=font)
+            if current_line and (bbox[2] - bbox[0]) > 820:
+                wrapped_lines.append(current_line)
+                current_line = word
+            else:
+                current_line = candidate
+        if current_line:
+            wrapped_lines.append(current_line)
+        wrapped_lines = wrapped_lines[:3] or [caption]
+
+        line_gap = 18
+        line_heights: list[int] = []
+        for line in wrapped_lines:
+            bbox = draw.textbbox((0, 0), line, font=font)
+            line_heights.append(max(1, bbox[3] - bbox[1]))
+        total_height = sum(line_heights) + line_gap * max(0, len(line_heights) - 1)
+        current_y = 350 - total_height // 2
+        for line, line_height in zip(wrapped_lines, line_heights):
+            bbox = draw.textbbox((0, 0), line, font=font)
+            line_width = bbox[2] - bbox[0]
+            x = (width - line_width) // 2
+            draw.text((x + 2, current_y + 2), line, font=font, fill=(17, 8, 44, 180))
+            draw.text((x, current_y), line, font=font, fill=(255, 247, 214, 245))
+            current_y += line_height + line_gap
+
+        output = io.BytesIO()
+        image.save(output, format="PNG", optimize=True)
+        png_bytes = output.getvalue()
+    except Exception:
+        width, height = 1280, 720
+
+        def _png_chunk(tag: bytes, payload: bytes) -> bytes:
+            encoded = tag + payload
+            return (
+                len(payload).to_bytes(4, "big")
+                + encoded
+                + (zlib.crc32(encoded) & 0xFFFFFFFF).to_bytes(4, "big")
+            )
+
+        top_color = (26, 13, 64)
+        mid_color = (60, 31, 114)
+        bottom_color = (16, 59, 98)
+        scanlines = bytearray()
+        for y in range(height):
+            progress = y / max(1, height - 1)
+            if progress < 0.55:
+                blend = progress / 0.55
+                color = tuple(
+                    int(top_color[idx] + (mid_color[idx] - top_color[idx]) * blend)
+                    for idx in range(3)
+                )
+            else:
+                blend = (progress - 0.55) / 0.45
+                color = tuple(
+                    int(mid_color[idx] + (bottom_color[idx] - mid_color[idx]) * blend)
+                    for idx in range(3)
+                )
+            scanlines.append(0)
+            scanlines.extend(bytes(color) * width)
+
+        ihdr = struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0)
+        png_bytes = b"".join(
+            [
+                b"\x89PNG\r\n\x1a\n",
+                _png_chunk(b"IHDR", ihdr),
+                _png_chunk(b"IDAT", zlib.compress(bytes(scanlines), level=9)),
+                _png_chunk(b"IEND", b""),
+            ]
+        )
+
+    return "data:image/png;base64," + base64.b64encode(png_bytes).decode("ascii")
+
+
+def _backfill_missing_still_paths_with_story_cards(
+    still_paths: list[Path],
+    *,
+    expected_scene_pages: int,
+    scene_descriptions: list[str],
+    story_summary: str,
+    tmp: Path,
+) -> tuple[list[Path], int]:
+    if expected_scene_pages <= len(still_paths):
+        return list(still_paths), 0
+
+    completed_paths = list(still_paths)
+    created = 0
+    for idx in range(len(completed_paths), expected_scene_pages):
+        fallback_text = _scene_text_for_index(scene_descriptions, idx, story_summary)
+        fallback_url = _story_page_fallback_data_url(fallback_text)
+        _, data = fallback_url.split(",", 1)
+        fallback_path = tmp / f"scene_{idx:03d}_fallback.png"
+        fallback_path.write_bytes(base64.b64decode(data))
+        completed_paths.append(fallback_path)
+        created += 1
+    return completed_paths, created
+
+
+def _merge_scene_sources_with_recovered_stills(
+    scene_source_urls: list[str],
+    recovered_scene_sources: list[str],
+    *,
+    expected_scene_pages: int,
+) -> tuple[list[str], int]:
+    if not recovered_scene_sources:
+        return list(scene_source_urls), 0
+
+    target_len = max(expected_scene_pages, len(scene_source_urls))
+    merged_sources = list(scene_source_urls[:target_len])
+    if len(merged_sources) < target_len:
+        merged_sources.extend([""] * (target_len - len(merged_sources)))
+
+    replacements = 0
+    recovered_index = 0
+    for idx in range(target_len):
+        current = str(merged_sources[idx] or "").strip()
+        current_is_real = bool(current) and not current.startswith("data:")
+        if current_is_real:
+            if recovered_index < len(recovered_scene_sources):
+                recovered_index += 1
+            continue
+        if recovered_index >= len(recovered_scene_sources):
+            break
+        merged_sources[idx] = recovered_scene_sources[recovered_index]
+        recovered_index += 1
+        replacements += 1
+
+    merged_sources = [str(source or "").strip() for source in merged_sources if str(source or "").strip()]
+    return merged_sources, replacements
+
+
+def _resolve_story_page_sources_for_assembly(
+    data: dict[str, Any],
+    scene_descriptions: list[str],
+    story_summary: str,
+) -> tuple[list[str], list[str], int]:
+    story_pages = story_pages_from_state_data(data)
+    if not story_pages:
+        return _scene_sources_from_state_doc(data), list(scene_descriptions), 0
+
+    raw_scene_urls = list(data.get("scene_asset_urls", []) or [])
+    raw_scene_gcs_uris = list(data.get("scene_asset_gcs_uris", []) or [])
+    resolved_page_sources: list[str] = []
+    resolved_page_descriptions: list[str] = []
+    fallback_page_count = 0
+
+    for idx, page in enumerate(story_pages):
+        page_description = (
+            str(page.get("scene_description", "") or "").strip()
+            or str(page.get("storybeat_text", "") or "").strip()
+            or _scene_text_for_index(scene_descriptions, idx, story_summary)
+        )
+        page_gcs_uri = str(page.get("gcs_uri", "") or "").strip()
+        page_image_url = str(page.get("image_url", "") or "").strip()
+        if _is_placeholder_scene_source(page_gcs_uri):
+            page_gcs_uri = ""
+        if _is_placeholder_scene_source(page_image_url):
+            page_image_url = ""
+        source = page_gcs_uri or page_image_url
+        if not source:
+            array_gcs = str(raw_scene_gcs_uris[idx]).strip() if idx < len(raw_scene_gcs_uris) and raw_scene_gcs_uris[idx] else ""
+            array_url = str(raw_scene_urls[idx]).strip() if idx < len(raw_scene_urls) and raw_scene_urls[idx] else ""
+            if array_url.startswith("data:"):
+                source = array_url
+            else:
+                source = array_gcs or array_url
+            if _is_placeholder_scene_source(source):
+                source = ""
+        if not source:
+            source = _story_page_fallback_data_url(page_description)
+            fallback_page_count += 1
+        if source:
+            resolved_page_sources.append(source)
+            resolved_page_descriptions.append(page_description)
+
+    return resolved_page_sources, resolved_page_descriptions, fallback_page_count
 
 
 def _discover_scene_stills_from_bucket(gcs: storage.Client, session_id: str) -> list[str]:
@@ -4383,10 +4613,9 @@ async def _assemble_pipeline(
         or data.get("title")
         or os.environ.get("STORYBOOK_TITLE", "")
     ).strip()
-    if not raw_title or raw_title.lower() == "auto":
-        title = _generate_story_title(scene_descriptions, story_summary)
-    else:
-        title = raw_title
+    title = shared_validate_storybook_title(raw_title, scene_descriptions, story_summary, child_name)
+    if not title:
+        title = _generate_story_title(scene_descriptions, story_summary, child_name)
 
     story_pages = story_pages_from_state_data(data)
     narration_source_scene_count = max(len(story_pages), len(scene_descriptions), len(video_urls))
@@ -4397,42 +4626,31 @@ async def _assemble_pipeline(
         narration_source_scene_count,
     )
     fast_storybook_assembly = _fast_storybook_assembly_enabled()
+    fallback_page_count = 0
     if story_pages:
-        raw_scene_urls = list(data.get("scene_asset_urls", []) or [])
-        raw_scene_gcs_uris = list(data.get("scene_asset_gcs_uris", []) or [])
-        resolved_page_sources: list[str] = []
-        resolved_page_descriptions: list[str] = []
-        for idx, page in enumerate(story_pages):
-            page_description = (
-                str(page.get("scene_description", "") or "").strip()
-                or str(page.get("storybeat_text", "") or "").strip()
-                or (str(scene_descriptions[idx]).strip() if idx < len(scene_descriptions) else "")
+        scene_source_urls, resolved_page_descriptions, fallback_page_count = _resolve_story_page_sources_for_assembly(
+            data,
+            scene_descriptions,
+            story_summary,
+        )
+        if resolved_page_descriptions:
+            scene_descriptions = resolved_page_descriptions
+        if fallback_page_count:
+            logger.warning(
+                "Storybook assembly recovered %d missing page image(s) for %s with generated fallback story cards.",
+                fallback_page_count,
+                session_id,
             )
-            page_gcs_uri = str(page.get("gcs_uri", "") or "").strip()
-            page_image_url = str(page.get("image_url", "") or "").strip()
-            if _is_placeholder_scene_source(page_gcs_uri):
-                page_gcs_uri = ""
-            if _is_placeholder_scene_source(page_image_url):
-                page_image_url = ""
-            source = page_gcs_uri or page_image_url
-            if not source:
-                array_gcs = str(raw_scene_gcs_uris[idx]).strip() if idx < len(raw_scene_gcs_uris) and raw_scene_gcs_uris[idx] else ""
-                array_url = str(raw_scene_urls[idx]).strip() if idx < len(raw_scene_urls) and raw_scene_urls[idx] else ""
-                if array_url.startswith("data:"):
-                    source = array_url
-                else:
-                    source = array_gcs or array_url
-            if source.startswith("data:image/svg+xml"):
-                source = ""
-            if source:
-                resolved_page_sources.append(source)
-                if page_description:
-                    resolved_page_descriptions.append(page_description)
-        if resolved_page_sources:
-            scene_source_urls = resolved_page_sources
-            scene_descriptions = resolved_page_descriptions or scene_descriptions
-        else:
-            scene_source_urls = _scene_sources_from_state_doc(data)
+            try:
+                await doc_ref.set(
+                    {
+                        "assembly_asset_recovery": "page_fallback_cards",
+                        "assembly_missing_page_count": fallback_page_count,
+                    },
+                    merge=True,
+                )
+            except Exception:
+                pass
     else:
         scene_source_urls = _scene_sources_from_state_doc(data)
     scene_source_urls = [
@@ -4441,18 +4659,26 @@ async def _assemble_pipeline(
         if str(source or "").strip() and not _is_placeholder_scene_source(str(source))
     ]
     expected_scene_pages = max(len(story_pages), len(video_urls), len(scene_source_urls))
-    if expected_scene_pages and len(scene_source_urls) < expected_scene_pages:
+    if expected_scene_pages and (
+        len(scene_source_urls) < expected_scene_pages
+        or any(str(source or "").strip().startswith("data:") for source in scene_source_urls)
+    ):
         recovered_scene_sources = await asyncio.to_thread(_discover_scene_stills_from_bucket, gcs, session_id)
         recovered_scene_sources = [
             source
             for source in recovered_scene_sources
             if str(source or "").strip() and not _is_placeholder_scene_source(str(source))
         ]
-        if len(recovered_scene_sources) > len(scene_source_urls):
-            scene_source_urls = recovered_scene_sources
+        merged_scene_sources, recovered_replacements = _merge_scene_sources_with_recovered_stills(
+            scene_source_urls,
+            recovered_scene_sources,
+            expected_scene_pages=expected_scene_pages,
+        )
+        if recovered_replacements > 0 or len(merged_scene_sources) > len(scene_source_urls):
+            scene_source_urls = merged_scene_sources
             logger.warning(
                 "Recovered %d real scene stills for %s directly from gs://%s/%s/scene_stills/ because Firestore page assets were incomplete.",
-                len(scene_source_urls),
+                len(recovered_scene_sources),
                 session_id,
                 GCS_ASSETS_BUCKET,
                 session_id,
@@ -4469,14 +4695,20 @@ async def _assemble_pipeline(
                 pass
 
     if not scene_source_urls and not video_urls:
-        await _mark_assembly_failed(
-            doc_ref,
-            session_id,
-            (
-                f"No scene assets found for session {session_id}. "
-                "Firestore scene arrays were empty and no files were found under the scene_stills bucket prefix."
-            ),
-        )
+        if story_pages:
+            logger.warning(
+                "No persisted scene assets were available for %s; the worker will assemble from generated fallback story cards.",
+                session_id,
+            )
+        else:
+            await _mark_assembly_failed(
+                doc_ref,
+                session_id,
+                (
+                    f"No scene assets found for session {session_id}. "
+                    "Firestore scene arrays were empty and no files were found under the scene_stills bucket prefix."
+                ),
+            )
 
     storyboard_review_report: dict[str, Any] = {
         "status": "skipped",
@@ -4511,6 +4743,33 @@ async def _assemble_pipeline(
                     for i, url in enumerate(video_urls)
                 ]
                 downloaded_videos = await asyncio.gather(*video_tasks)
+
+        expected_scene_pages = max(len(story_pages), len(scene_source_urls), len(downloaded_videos))
+        late_fallback_count = 0
+        if not downloaded_videos and expected_scene_pages and len(still_paths) < expected_scene_pages:
+            still_paths, late_fallback_count = _backfill_missing_still_paths_with_story_cards(
+                still_paths,
+                expected_scene_pages=expected_scene_pages,
+                scene_descriptions=scene_descriptions,
+                story_summary=story_summary,
+                tmp=tmp,
+            )
+            if late_fallback_count:
+                logger.warning(
+                    "Storybook assembly backfilled %d missing downloaded page image(s) for %s with local fallback story cards.",
+                    late_fallback_count,
+                    session_id,
+                )
+                try:
+                    await doc_ref.set(
+                        {
+                            "assembly_asset_recovery": "local_page_fallback_cards",
+                            "assembly_missing_page_count": late_fallback_count,
+                        },
+                        merge=True,
+                    )
+                except Exception:
+                    pass
 
         scene_count = len(still_paths) if still_paths else len(downloaded_videos)
         try:
@@ -4782,7 +5041,6 @@ async def _assemble_pipeline(
             pass
 
         valid_audios = [a for a in downloaded_audios if isinstance(a, Path) and a.exists()]
-        expected_scene_pages = max(len(story_pages), len(scene_source_urls), len(downloaded_videos))
         if still_paths and expected_scene_pages and len(still_paths) < expected_scene_pages:
             await _mark_assembly_failed(
                 doc_ref,
@@ -5295,25 +5553,13 @@ async def _assemble_pipeline(
             if cover_audio_len > 0.0:
                 cover_duration = max(cover_duration, cover_audio_len + 0.4)
 
-            title_font = 60 if len(title) <= 18 else 52 if len(title) <= 28 else 44
-            title_text = _ffmpeg_escape(title or "A Storybook Adventure")
-            subtitle_text = _ffmpeg_escape(cover_author) if cover_author else ""
-            vf_parts = [
-                "scale=1280:720:force_original_aspect_ratio=decrease:flags=lanczos",
-                "pad=1280:720:(ow-iw)/2:(oh-ih)/2:color=#0b2d5b",
-                "eq=brightness=-0.02:saturation=1.08",
-                "drawbox=x=60:y=90:w=1160:h=560:color=#000000@0.18:t=fill",
-                "drawbox=x=60:y=90:w=1160:h=560:color=#f8f1dc@0.6:t=2",
-                "drawbox=x=130:y=250:w=1020:h=200:color=#000000@0.35:t=fill",
-                f"drawtext=text='{title_text}':fontcolor=white:fontsize={title_font}:x=(w-text_w)/2:y=h*0.42:shadowcolor=black:shadowx=2:shadowy=2",
-            ]
-            if subtitle_text:
-                vf_parts.append(
-                    f"drawtext=text='{subtitle_text}':fontcolor=white:fontsize=28:x=(w-text_w)/2:y=h*0.56:shadowcolor=black:shadowx=2:shadowy=2"
-                )
-            fade_out_start = max(0.2, cover_duration - 0.4)
-            vf_parts.append(f"fade=t=in:st=0:d=0.4,fade=t=out:st={fade_out_start:.3f}:d=0.4,setsar=1")
-            cover_vf = ",".join(vf_parts)
+            cover_logo_path = _storybook_cover_logo_path()
+            cover_filter = _build_storybook_cover_filtergraph(
+                title_text=title or "A Storybook Adventure",
+                subtitle_text=cover_author,
+                duration=cover_duration,
+                logo_path=cover_logo_path,
+            )
             cover_path = tmp / "segment_cover.mp4"
             if cover_image_bytes:
                 cover_image_path = tmp / "cover.png"
@@ -5325,7 +5571,8 @@ async def _assemble_pipeline(
                         "-framerate", str(_STORYBOOK_FPS),
                         "-i", str(cover_image_path),
                         "-t", f"{cover_duration:.3f}",
-                        "-vf", cover_vf,
+                        "-filter_complex", cover_filter,
+                        "-map", "[outv]",
                         "-r", "30",
                         "-pix_fmt", "yuv420p",
                         "-c:v", "libx264",
@@ -5340,7 +5587,8 @@ async def _assemble_pipeline(
                         "ffmpeg", "-y",
                         "-f", "lavfi",
                         "-i", f"color=c=#0b2d5b:s=1280x720:d={cover_duration:.3f}",
-                        "-vf", cover_vf,
+                        "-filter_complex", cover_filter,
+                        "-map", "[outv]",
                         "-r", "30",
                         "-pix_fmt", "yuv420p",
                         "-c:v", "libx264",
@@ -5381,7 +5629,7 @@ async def _assemble_pipeline(
 
             veo_clips: dict[int, Path] = {}
             if veo_indices:
-                location = os.environ.get("GOOGLE_CLOUD_LOCATION", "us-central1")
+                location = _vertex_ai_location()
                 for idx in veo_indices:
                     try:
                         img_bytes = still_paths[idx].read_bytes()

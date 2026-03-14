@@ -82,6 +82,25 @@ _STORYBOOK_LIGHTING_PRIORITY: dict[str, int] = {
     "moonlit_blue": 1,
 }
 
+_STORYBOOK_LIGHTING_EFFECTS = {"steady", "pulse", "flicker", "flash"}
+
+_STORYBOOK_LIGHTING_EFFECT_KEYWORDS: dict[str, set[str]] = {
+    "flash": {
+        "blast", "bolt", "crash", "electric", "electricity", "flash", "lightning",
+        "spark", "sparks", "storm", "stormy", "thunder",
+    },
+    "pulse": {
+        "beat", "beats", "celebrate", "celebration", "dance", "dancing", "drum", "drums",
+        "heartbeat", "heartbeats", "music", "musical", "parade", "party", "rhythm",
+        "song", "songs",
+    },
+    "flicker": {
+        "creaky", "creepy", "eerie", "flicker", "flickering", "ghost", "ghostly",
+        "haunt", "haunted", "howl", "monster", "monsters", "scary", "shadow",
+        "shadows", "spooky", "witch", "witches",
+    },
+}
+
 
 def storybook_rgb_from_hex(hex_color: str) -> list[int]:
     clean = str(hex_color or "").strip().lstrip("#")
@@ -92,6 +111,46 @@ def storybook_rgb_from_hex(hex_color: str) -> list[int]:
         int(clean[2:4], 16),
         int(clean[4:6], 16),
     ]
+
+
+def _normalize_storybook_lighting_effect(value: Any, default: str = "steady") -> str:
+    normalized = str(value or "").strip().lower()
+    if normalized in _STORYBOOK_LIGHTING_EFFECTS:
+        return normalized
+    return default
+
+
+def _default_storybook_effect_interval_ms(effect: str, duration_seconds: float) -> int | None:
+    if effect == "flash":
+        return _clamp_int(round(max(1700, min(duration_seconds * 550, 3400))), 2400, 1500, 3600)
+    if effect == "pulse":
+        return _clamp_int(round(max(650, min(duration_seconds * 230, 1400))), 960, 650, 1600)
+    if effect == "flicker":
+        return _clamp_int(round(max(180, min(duration_seconds * 120, 520))), 380, 180, 650)
+    return None
+
+
+def heuristic_storybook_lighting_effect(
+    scene_text: str,
+    *,
+    is_cover: bool = False,
+    is_end_card: bool = False,
+    duration_seconds: float = 4.0,
+) -> dict[str, Any]:
+    if is_cover or is_end_card:
+        return {"effect": "steady"}
+
+    tokens = set(re.findall(r"[a-z]+", str(scene_text or "").lower()))
+    for effect_name in ("flash", "pulse", "flicker"):
+        keywords = _STORYBOOK_LIGHTING_EFFECT_KEYWORDS[effect_name]
+        if any(keyword in tokens for keyword in keywords):
+            interval_ms = _default_storybook_effect_interval_ms(effect_name, duration_seconds)
+            result: dict[str, Any] = {"effect": effect_name}
+            if interval_ms is not None:
+                result["effect_interval_ms"] = interval_ms
+            return result
+
+    return {"effect": "steady"}
 
 
 def normalize_storybook_lighting_cues(raw_cues: Any) -> list[dict[str, Any]]:
@@ -116,6 +175,16 @@ def normalize_storybook_lighting_cues(raw_cues: Any) -> list[dict[str, Any]]:
             scene_number = int(item.get("scene_number") or 0)
         except Exception:
             scene_number = 0
+        raw_effect = str(item.get("effect") or "").strip()
+        effect = _normalize_storybook_lighting_effect(raw_effect, "") if raw_effect else ""
+        effect_interval_ms = None
+        if effect and effect != "steady":
+            effect_interval_ms = _clamp_int(
+                item.get("effect_interval_ms"),
+                _default_storybook_effect_interval_ms(effect, 4.0) or 900,
+                180,
+                3600,
+            )
         normalized.append(
             {
                 "scene_number": max(0, scene_number),
@@ -127,6 +196,8 @@ def normalize_storybook_lighting_cues(raw_cues: Any) -> list[dict[str, Any]]:
                 "scene_description": str(item.get("scene_description") or "").strip(),
                 "storybeat_text": str(item.get("storybeat_text") or "").strip(),
                 "cue_source": str(item.get("cue_source") or "").strip(),
+                "effect": effect or None,
+                "effect_interval_ms": effect_interval_ms,
             }
         )
     return normalized
@@ -139,12 +210,20 @@ def heuristic_storybook_lighting_command(
     is_end_card: bool = False,
     duration_seconds: float = 4.0,
 ) -> dict[str, Any]:
+    effect = heuristic_storybook_lighting_effect(
+        scene_text,
+        is_cover=is_cover,
+        is_end_card=is_end_card,
+        duration_seconds=duration_seconds,
+    )
+
     if is_end_card:
         palette = _STORYBOOK_LIGHTING_PALETTES["warm_gold"]
         return {
             **palette,
             "transition": _clamp_float(min(duration_seconds * 0.3, 1.4), 1.2, 0.6, 1.6),
             "cue_source": "heuristic_end_card",
+            **effect,
         }
 
     tokens = set(re.findall(r"[a-z]+", str(scene_text or "").lower()))
@@ -169,6 +248,7 @@ def heuristic_storybook_lighting_command(
         **palette,
         "transition": _clamp_float(min(duration_seconds * 0.28, 1.5), 1.1, 0.6, 1.8),
         "cue_source": "heuristic_scene",
+        **effect,
     }
 
 
@@ -192,6 +272,8 @@ def lighting_cue_from_story_page(
                 "scene_description": page.get("scene_description"),
                 "storybeat_text": page.get("storybeat_text"),
                 "cue_source": page.get("cue_source") or "page_metadata",
+                "effect": page.get("effect"),
+                "effect_interval_ms": page.get("effect_interval_ms"),
             }
         ]
     )

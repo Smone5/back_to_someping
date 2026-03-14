@@ -27,14 +27,17 @@ if str(_PROJECT_ROOT) not in sys.path:
 from agent.tools import (
     VisualArgs,
     _build_visual_continuity_plan,
+    _character_bible_entries_for_keys,
     _character_crop_references_from_detection,
     _character_reference_images_for_keys,
+    _continuity_plan_prompt,
     _copy_state_mapping,
     _continuity_anchor_text,
     _repair_visual_args_from_audit,
     _recent_scene_reference_entries,
     _remember_character_visual_references,
     _remember_recent_scene_reference,
+    _should_block_live_preview_for_audit_retry,
 )
 
 
@@ -265,8 +268,7 @@ class LiveSceneVisualContinuityTests(unittest.TestCase):
                 "friendly_dragon": {
                     "character_key": "friendly_dragon",
                     "label": "friendly dragon",
-                    "species": "dragon",
-                    "role": "recurring_creature",
+                    "role": "story_character",
                     "canonical_visual_traits": ["colors: purple", "traits: friendly"],
                     "outfit_accessories": ["key"],
                     "latest_visual_summary": "The friendly dragon glows purple beside a golden key.",
@@ -292,6 +294,83 @@ class LiveSceneVisualContinuityTests(unittest.TestCase):
         self.assertTrue(any("friendly dragon" in item.lower() for item in plan["forbidden_drift"]))
         self.assertTrue(any("purple castle" in item.lower() for item in plan["forbidden_drift"]))
 
+    def test_character_bible_fallback_does_not_guess_species_from_label(self) -> None:
+        state: dict[str, object] = {
+            "continuity_entity_registry": {
+                "characters": {
+                    "friendly_dragon": {"label": "friendly dragon"},
+                },
+                "locations": {},
+                "props": {},
+            },
+            "continuity_world_state": {
+                "active_character_keys": ["friendly_dragon"],
+            },
+        }
+
+        entries = _character_bible_entries_for_keys(state, ["friendly_dragon"])
+
+        self.assertEqual(len(entries), 1)
+        self.assertEqual(entries[0]["role"], "story_character")
+        self.assertEqual(entries[0]["species"], "")
+
+    def test_sidekick_identity_lock_is_carried_into_prompt(self) -> None:
+        state: dict[str, object] = {
+            "continuity_entity_registry": {
+                "characters": {
+                    "lino": {"label": "Lino"},
+                },
+                "locations": {},
+                "props": {},
+            },
+            "continuity_world_state": {
+                "current_location_label": "licorice castle",
+                "active_character_keys": ["lino"],
+                "active_prop_keys": [],
+                "pending_transition": "inside",
+            },
+            "continuity_scene_history": [
+                {
+                    "scene_number": 1,
+                    "request_id": "scene-1",
+                    "character_keys": ["lino"],
+                }
+            ],
+            "sidekick_description": "Lion-O, an orange cat-like hero toy with a red mane and blue suit.",
+            "toy_reference_name_hint": "Lion-O",
+            "toy_reference_visual_summary": "An orange cat-like hero toy with a red mane and blue suit.",
+        }
+
+        _remember_character_visual_references(
+            state,
+            request_id="scene-1",
+            description="Lino the toy lion explores the licorice castle hall.",
+            storybeat_text="Lino the toy lion pads bravely past the candy columns.",
+            visual_summary="Lino is a brave orange toy lion with a red mane and blue hero suit.",
+            thumbnail_b64="lino-thumb",
+            thumbnail_mime="image/jpeg",
+            scene_number=1,
+        )
+
+        lino_entry = state["character_bible"]["lino"]
+        self.assertEqual(lino_entry["latest_visual_summary"], "Lino is a brave orange toy lion with a red mane and blue hero suit.")
+        self.assertEqual(lino_entry["species"], "")
+
+        plan = _build_visual_continuity_plan(
+            state,
+            validation=SimpleNamespace(
+                location_label="licorice castle",
+                character_keys=["lino"],
+                prop_keys=[],
+            ),
+            request_description="Go inside the licorice castle hall.",
+        )
+        prompt = _continuity_plan_prompt(plan, [lino_entry])
+
+        self.assertIn("orange toy lion", prompt.lower())
+        self.assertIn("toy sidekick", prompt.lower())
+        self.assertTrue(any("identity-swap lino" in item.lower() for item in plan["forbidden_drift"]))
+
     def test_visual_audit_repair_updates_prompt_text(self) -> None:
         args = VisualArgs(
             description="Inside the purple castle, the friendly dragon sleeps beside a secret door.",
@@ -312,6 +391,42 @@ class LiveSceneVisualContinuityTests(unittest.TestCase):
         self.assertIsNotNone(repaired)
         self.assertIn("Repair continuity", repaired.description)
         self.assertIn("preserve the same purple colors", repaired.base_description)
+
+    def test_live_scene_audit_retry_skips_noncritical_polish_retry(self) -> None:
+        self.assertFalse(
+            _should_block_live_preview_for_audit_retry(
+                {
+                    "status": "repair",
+                    "should_retry": True,
+                    "repair_prompt_suffix": "Make the sky more purple and the candy path more obvious.",
+                    "issues": [
+                        {
+                            "severity": "major",
+                            "kind": "character_palette_drift",
+                            "issue": "The palette drifted a bit from the previous page.",
+                        }
+                    ],
+                }
+            )
+        )
+
+    def test_live_scene_audit_retry_keeps_blocking_on_critical_continuity_failure(self) -> None:
+        self.assertTrue(
+            _should_block_live_preview_for_audit_retry(
+                {
+                    "status": "repair",
+                    "should_retry": True,
+                    "repair_prompt_suffix": "Keep the next page in the castle and restore the missing hero.",
+                    "issues": [
+                        {
+                            "severity": "critical",
+                            "kind": "location_teleport",
+                            "issue": "The scene teleported to an unrelated place and dropped the main hero.",
+                        }
+                    ],
+                }
+            )
+        )
 
 if __name__ == "__main__":
     unittest.main()

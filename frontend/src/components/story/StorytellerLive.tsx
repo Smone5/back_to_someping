@@ -118,12 +118,19 @@ type SceneBranchPickerOptions = {
     selectedSceneNumber?: number | null;
     warning?: string | null;
 };
+type CommitSceneImageOptions = {
+    thumbnailB64?: string | null;
+    requestId?: string | null;
+    onCommitted?: () => void;
+};
 const MIC_OK_KEY = 'storyteller_mic_setup_v2';
 const MIC_DEVICE_KEY = 'storyteller_mic_device_id_v1';
 const STORYBOOK_ASSEMBLY_STORAGE_PREFIX = 'storyteller_assembly_ui:';
 const STORYBOOK_ASSEMBLY_STORAGE_TTL_MS = 15 * 60 * 1000;
-const STORYBOOK_ASSEMBLY_REHYDRATION_GRACE_MS = 90 * 1000;
+const STORYBOOK_ASSEMBLY_REHYDRATION_GRACE_MS = STORYBOOK_ASSEMBLY_STORAGE_TTL_MS;
+const SCENE_PLACEHOLDER_TIMEOUT_MS = 45 * 1000;
 const QUICK_ACK_AUDIO_URL = '/audio/got-it-lets-go.mp3';
+const ENABLE_SCENE_BRANCH_UI = false;
 
 type PersistedStorybookAssemblyState = {
     savedAtMs: number;
@@ -250,6 +257,21 @@ function normalizeStoryFlowPhase(raw: unknown): StoryFlowPhase {
 
 function isAssemblyStoryPhase(phase: StoryFlowPhase): boolean {
     return phase === 'assembling_movie' || phase === 'remake';
+}
+
+function isToyShareAllowedForState(
+    phase: AppPhase,
+    storyPhase: StoryFlowPhase,
+    isEndingStory: boolean,
+    storybookStatus: StorybookStatus | null,
+): boolean {
+    return (
+        phase === 'story'
+        && !isEndingStory
+        && !storybookStatus
+        && storyPhase !== 'ending_story'
+        && !isAssemblyStoryPhase(storyPhase)
+    );
 }
 
 function deriveBackendRunAppHost(host: string): string | null {
@@ -390,6 +412,8 @@ type PageReadAloudPayload = {
 const STORY_CAPTION_DECORATIVE_RE = /[✨🌟💫🎵🎶🪄🔊⏹️▶️]/g;
 const STORY_CAPTION_CHOICE_RE = /(?:\s+)?(?:what should we do(?: next)?|should we|do you want to|or maybe)\b.*$/i;
 const STORY_CAPTION_META_PREFIX_RE = /^(?:(?:sure|okay|ok|great|wonderful)[!,. ]+\s*)?here(?:'s| is)\s+(?:(?:a|an|the)\s+)?(?:(?:[\w']+(?:-[\w']+)?\s+){0,6})?(?:illustration|image|picture|page|caption)\s*(?::|-)\s*/i;
+const STORY_CAPTION_HTML_TAG_RE = /<[^>]+>/g;
+const STORY_CAPTION_ENCODED_HTML_TAG_RE = /&lt;[^&]+&gt;/gi;
 
 function normalizeStoryCaptionText(raw: string | null | undefined): string {
     const normalized = `${raw ?? ''}`
@@ -399,6 +423,8 @@ function normalizeStoryCaptionText(raw: string | null | undefined): string {
         .replace(/\u2013|\u2014/g, '-')
         .replace(/\u2026/g, '...')
         .replace(/<ctrl\d+>/gi, ' ')
+        .replace(STORY_CAPTION_HTML_TAG_RE, ' ')
+        .replace(STORY_CAPTION_ENCODED_HTML_TAG_RE, ' ')
         .replace(/^(caption|storybeat|scene)\s*:\s*/i, '')
         .replace(STORY_CAPTION_DECORATIVE_RE, ' ')
         .replace(STORY_CAPTION_CHOICE_RE, '')
@@ -598,21 +624,21 @@ const ASSEMBLY_MISSIONS: AssemblyMission[] = [
         ],
     },
     {
-        kicker: 'Move Break',
-        title: 'Do a tiny pretend game with Amelia.',
-        helper: 'Short movement breaks help little kids reset attention while they wait.',
+        kicker: 'Cozy Break',
+        title: 'Choose a calm little sound game.',
+        helper: 'Quiet, voice-first games work better while Amelia cannot see the room.',
         options: [
-            { key: 'sparkle_wiggle', label: 'Sparkle wiggle' },
-            { key: 'helper_pose', label: 'Helper pose' },
+            { key: 'soft_echo', label: 'Soft echo' },
+            { key: 'cozy_breath', label: 'Star breaths' },
         ],
     },
     {
         kicker: 'Giggle Break',
         title: 'Choose a quick silly turn.',
-        helper: 'Rhythm, counting, and tiny jokes make waiting feel shorter.',
+        helper: 'Tiny jokes and soft counting make waiting feel shorter.',
         options: [
             { key: 'tiny_joke', label: 'Tiny joke' },
-            { key: 'counting_game', label: 'Count to 3' },
+            { key: 'counting_game', label: 'Count softly' },
         ],
     },
 ];
@@ -1107,12 +1133,30 @@ export default function StorytellerLive() {
     }, [currentSceneImageUrl]);
 
     // Keep the last scene image visible until a newer image URL is confirmed loadable.
-    const commitSceneImage = useCallback((url: string, thumbnailB64?: string | null) => {
+    const commitSceneImage = useCallback((url: string, options?: CommitSceneImageOptions) => {
         if (!url) return;
 
-        if (thumbnailB64) {
-            setCurrentSceneThumbnailB64(thumbnailB64);
-        }
+        const thumbnailB64 = options?.thumbnailB64;
+        const requestId = typeof options?.requestId === 'string'
+            ? options.requestId.trim() || null
+            : null;
+        const sceneRequestIsActive = () => (
+            !requestId
+            || !activeSceneRequestIdRef.current
+            || activeSceneRequestIdRef.current === requestId
+        );
+        const commitCurrentScene = () => {
+            if (!sceneRequestIsActive()) {
+                return false;
+            }
+            if (thumbnailB64) {
+                setCurrentSceneThumbnailB64(thumbnailB64);
+            }
+            setCurrentSceneImageUrl(url);
+            options?.onCommitted?.();
+            return true;
+        };
+        const pendingToken = requestId ? `${requestId}::${url}` : url;
 
         if (url.startsWith('data:image')) {
             const isPlaceholder = url.startsWith('data:image/svg+xml');
@@ -1121,12 +1165,22 @@ export default function StorytellerLive() {
             // This keeps the old scene visible while the 'sceneLoading' state (set elsewhere) 
             // shows the "Amelia is drawing" overlay on top.
             if (isPlaceholder && currentSceneImageUrlRef.current && !currentSceneImageUrlRef.current.startsWith('data:image/svg+xml')) {
+                pendingSceneImageRef.current = pendingToken;
+                if (placeholderTimeoutRef.current) {
+                    clearTimeout(placeholderTimeoutRef.current);
+                }
+                placeholderTimeoutRef.current = setTimeout(() => {
+                    if (pendingSceneImageRef.current === pendingToken) {
+                        setSceneLoading(false);
+                        setSceneError('Picture is taking a bit longer. Keep talking and we’ll catch up!');
+                    }
+                }, SCENE_PLACEHOLDER_TIMEOUT_MS);
                 console.log('Preserving existing scene image while new one generates.');
                 return;
             }
 
-            pendingSceneImageRef.current = url;
-            setCurrentSceneImageUrl(url);
+            pendingSceneImageRef.current = pendingToken;
+            commitCurrentScene();
             setSceneLoading(isPlaceholder);
             if (placeholderTimeoutRef.current) {
                 clearTimeout(placeholderTimeoutRef.current);
@@ -1134,24 +1188,24 @@ export default function StorytellerLive() {
             }
             if (isPlaceholder) {
                 placeholderTimeoutRef.current = setTimeout(() => {
-                    if (pendingSceneImageRef.current === url) {
+                    if (pendingSceneImageRef.current === pendingToken) {
                         setSceneLoading(false);
                         setSceneError('Picture is taking a bit longer. Keep talking and we’ll catch up!');
                     }
-                }, 20000);
+                }, SCENE_PLACEHOLDER_TIMEOUT_MS);
             }
             return;
         }
 
         const probe = new window.Image();
-        pendingSceneImageRef.current = url;
+        pendingSceneImageRef.current = pendingToken;
         probe.onload = () => {
-            if (pendingSceneImageRef.current === url) {
+            if (pendingSceneImageRef.current === pendingToken && sceneRequestIsActive()) {
                 if (placeholderTimeoutRef.current) {
                     clearTimeout(placeholderTimeoutRef.current);
                     placeholderTimeoutRef.current = null;
                 }
-                setCurrentSceneImageUrl(url);
+                commitCurrentScene();
                 setIsNewScene(true);
                 setTimeout(() => setIsNewScene(false), 2000);
                 setSceneLoading(false);
@@ -1159,7 +1213,7 @@ export default function StorytellerLive() {
             }
         };
         probe.onerror = () => {
-            if (pendingSceneImageRef.current === url) {
+            if (pendingSceneImageRef.current === pendingToken && sceneRequestIsActive()) {
                 if (placeholderTimeoutRef.current) {
                     clearTimeout(placeholderTimeoutRef.current);
                     placeholderTimeoutRef.current = null;
@@ -1796,9 +1850,7 @@ export default function StorytellerLive() {
                             ? (msg.payload.request_id as string).trim() || null
                             : null;
                         const nextSceneHistory = normalizeSceneHistory(msg.payload?.scene_history);
-                        if (nextSceneHistory.length) {
-                            setSceneHistory(nextSceneHistory);
-                        }
+                        const hasSceneHistoryPayload = Array.isArray(msg.payload?.scene_history);
                         const isPlaceholder = Boolean(msg.payload?.is_placeholder);
                         setStoryPhase(isPlaceholder ? 'drawing_scene' : 'waiting_for_child');
                         const isFallback = Boolean(msg.payload?.is_fallback);
@@ -1824,19 +1876,34 @@ export default function StorytellerLive() {
                                     break;
                                 }
                             }
-                            if (storybeatText) {
-                                setCurrentSceneStorybeatText(storybeatText);
-                            } else if (!isPlaceholder) {
-                                setCurrentSceneStorybeatText(null);
-                            }
+                            let scenePresentationApplied = false;
+                            const applyCommittedScenePresentation = () => {
+                                if (scenePresentationApplied) {
+                                    return;
+                                }
+                                scenePresentationApplied = true;
+                                if (hasSceneHistoryPayload && nextSceneHistory.length) {
+                                    setSceneHistory(nextSceneHistory);
+                                }
+                                if (storybeatText) {
+                                    setCurrentSceneStorybeatText(storybeatText);
+                                }
+                            };
                             const thumbB64 = msg.payload?.thumbnail_b64 as string | undefined;
                             const thumbMime = typeof msg.payload?.thumbnail_mime === 'string'
                                 ? (msg.payload.thumbnail_mime as string).trim() || 'image/jpeg'
                                 : 'image/jpeg';
                             if (!isPlaceholder && !isFallback && thumbB64 && !url.startsWith('data:image')) {
-                                commitSceneImageRef.current(`data:${thumbMime};base64,${thumbB64}`);
+                                commitSceneImageRef.current(`data:${thumbMime};base64,${thumbB64}`, {
+                                    requestId,
+                                    onCommitted: applyCommittedScenePresentation,
+                                });
                             }
-                            commitSceneImageRef.current(url, thumbB64);
+                            commitSceneImageRef.current(url, {
+                                thumbnailB64: thumbB64,
+                                requestId,
+                                onCommitted: applyCommittedScenePresentation,
+                            });
                             setCurrentSceneVideoUrl(null);
 
                             if (isFallback) {
@@ -1852,12 +1919,8 @@ export default function StorytellerLive() {
                                 setSceneLoading(true);
                                 setSceneError(null);
                             } else {
-                                // Full image arrived: commitSceneImage will handle clearing loading state
-                                // once it probes the URL and confirms it loaded.
-                                // We ALSO force it here just in case commitSceneImage's data-url path
-                                // needs an extra nudge to clear the state.
-                                console.log('Full image arrived via video_ready, clearing loading state.');
-                                setSceneLoading(false);
+                                // Full image arrived: let commitSceneImage clear loading only after
+                                // the new asset has actually been accepted into the scene.
                                 setSceneError(null);
                             }
                         } else if (!currentSceneImageUrlRef.current) {
@@ -2048,7 +2111,13 @@ export default function StorytellerLive() {
                         const persistedAssemblyState = sessionIdRef.current
                             ? loadPersistedStorybookAssemblyState(sessionIdRef.current)
                             : null;
-                        if (msg.payload?.toy_share_active) {
+                        const canResumeToyShare = isToyShareAllowedForState(
+                            'story',
+                            rehydratedStoryPhase,
+                            Boolean(msg.payload?.ending_story),
+                            persistedAssemblyState?.status ?? null,
+                        );
+                        if (msg.payload?.toy_share_active && canResumeToyShare) {
                             void openToyShareOverlayRef.current({ notifyBackend: false, autoStartCamera: false });
                         } else {
                             closeToyShareOverlayRef.current({ notifyBackend: false });
@@ -2169,7 +2238,12 @@ export default function StorytellerLive() {
                         if (msg.payload?.story_started || msg.payload?.ending_story || recentPersistedAssembly) {
                             setPhase('story');
                             sendClientReadyRef.current();
-                            if (!recentPersistedAssembly && resumeMicOnReconnectRef.current && !isMicMutedRef.current) {
+                            const shouldAutoResumeMic = (
+                                resumeMicOnReconnectRef.current
+                                && !isMicMutedRef.current
+                                && (!recentPersistedAssembly || assemblyStillRunning)
+                            );
+                            if (shouldAutoResumeMic) {
                                 void startListeningRef.current();
                             }
                         }
@@ -2187,6 +2261,9 @@ export default function StorytellerLive() {
                         break;
                     }
                     if (action === 'open_scene_branch_picker') {
+                        if (!ENABLE_SCENE_BRANCH_UI) {
+                            break;
+                        }
                         const nextSceneHistory = normalizeSceneHistory(msg.payload?.scene_history);
                         if (nextSceneHistory.length || Array.isArray(msg.payload?.scene_history)) {
                             setSceneHistory(nextSceneHistory);
@@ -2783,6 +2860,10 @@ export default function StorytellerLive() {
     const openToyShareOverlay = useCallback(async (options: ToyShareOverlayOptions = {}) => {
         const { notifyBackend = true, autoStartCamera = true } = options;
         if (toyShareState === 'uploading') return;
+        if (!sessionId) return;
+        if (!isToyShareAllowedForState(phase, storyPhase, isEndingStory, storybookStatus)) {
+            return;
+        }
         setToyShareOverlayOpen(true);
         setToyShareCameraError(null);
         if (notifyBackend && sessionId) {
@@ -2791,10 +2872,13 @@ export default function StorytellerLive() {
         if (autoStartCamera) {
             await handleSpyglass();
         }
-    }, [handleSpyglass, sendJson, sessionId, toyShareState]);
+    }, [handleSpyglass, isEndingStory, phase, sendJson, sessionId, storyPhase, storybookStatus, toyShareState]);
     openToyShareOverlayRef.current = openToyShareOverlay;
 
     const openSceneBranchPicker = useCallback((options: SceneBranchPickerOptions = {}) => {
+        if (!ENABLE_SCENE_BRANCH_UI) {
+            return;
+        }
         const {
             selectedSceneNumber: requestedSceneNumber = null,
         } = options;
@@ -2813,6 +2897,12 @@ export default function StorytellerLive() {
         setSceneBranchWarning('Going back will remove the pages after that scene.');
     }, []);
     closeSceneBranchPickerRef.current = closeSceneBranchPicker;
+
+    useEffect(() => {
+        if (!ENABLE_SCENE_BRANCH_UI && showSceneBranchPicker) {
+            closeSceneBranchPicker();
+        }
+    }, [closeSceneBranchPicker, showSceneBranchPicker]);
 
     const handleRestartStory = useCallback(() => {
         setShowRestartConfirm(true);
@@ -2911,6 +3001,35 @@ export default function StorytellerLive() {
             closeSceneBranchPicker();
         }
     }, [closeSceneBranchPicker, closeToyShareOverlay, phase, showSceneBranchPicker, toyShareOverlayOpen]);
+
+    useEffect(() => {
+        const assemblyActive =
+            phase !== 'theater'
+            && (
+                storyPhase === 'assembling_movie'
+                || storyPhase === 'remake'
+                || storyPhase === 'ending_story'
+                || Boolean(storybookStatus)
+            );
+        if (!assemblyActive && !isEndingStory) {
+            return;
+        }
+        if (toyShareOverlayOpen) {
+            closeToyShareOverlay({ notifyBackend: false });
+        }
+        if (showSceneBranchPicker) {
+            closeSceneBranchPicker();
+        }
+    }, [
+        closeSceneBranchPicker,
+        closeToyShareOverlay,
+        isEndingStory,
+        phase,
+        showSceneBranchPicker,
+        storyPhase,
+        storybookStatus,
+        toyShareOverlayOpen,
+    ]);
 
     const handleSpyglassCancel = useCallback(() => {
         closeToyShareOverlay({ notifyBackend: true });
@@ -3092,16 +3211,23 @@ export default function StorytellerLive() {
         const micLevel = audioState === 'listening'
             ? Math.min(1, Math.max(0, (voiceRms - 0.002) / 0.02))
             : 0;
-        const permissionLabel = micPermissionState === 'granted'
-            ? 'Mic allowed'
-            : micPermissionState === 'denied'
-                ? 'Mic blocked'
-                : 'Permission needed';
-        const permissionCopy = micPermissionState === 'granted'
-            ? 'Great. Say “Hi Amelia!” and watch the level bar move.'
-            : micPermissionState === 'denied'
-                ? 'Your browser blocked microphone access. Reopen the mic prompt or site settings, then try again.'
-                : 'Tap the button below. Your browser will still show the microphone prompt, and you should choose Allow.';
+        const micCheckReady = micPermissionState === 'granted'
+            && audioState === 'listening'
+            && micSetupHeardVoice;
+        const permissionLabel = micCheckReady
+            ? 'Mic ready'
+            : micPermissionState === 'granted'
+                ? 'Mic allowed'
+                : micPermissionState === 'denied'
+                    ? 'Mic blocked'
+                    : 'Permission needed';
+        const permissionCopy = micCheckReady
+            ? 'We heard you. The start button is unlocked, so you can begin the story now.'
+            : micPermissionState === 'granted'
+                ? 'Great. Say “Hi Amelia!” and watch the level bar move.'
+                : micPermissionState === 'denied'
+                    ? 'Your browser blocked microphone access. Reopen the mic prompt or site settings, then try again.'
+                    : 'Tap the button below. Your browser will still show the microphone prompt, and you should choose Allow.';
         return (
             <main className="storyteller-main mic-check-stage" aria-label="Microphone check">
                 <div className="mic-setup-card" role="status" aria-live="polite">
@@ -3185,7 +3311,7 @@ export default function StorytellerLive() {
                             <button
                                 className="mic-setup-primary"
                                 onClick={() => {
-                                    playUiSound('magic');
+                                    // Keep this tap focused on the browser mic prompt.
                                     void requestMicSetupTest(selectedMicDeviceIdRef.current || null);
                                 }}
                                 disabled={micSetupBusy}
@@ -3198,17 +3324,24 @@ export default function StorytellerLive() {
                                         : 'Allow & test microphone'}
                             </button>
                             <button
-                                className="mic-setup-secondary"
+                                className={`mic-setup-secondary ${micCheckReady ? 'is-ready' : ''}`}
                                 onClick={() => {
                                     playUiSound('tap');
-                                    void completeMicCheckRef.current('skip');
+                                    void completeMicCheckRef.current(micSetupHeardVoice ? 'heard' : 'skip');
                                 }}
-                                disabled={micSetupBusy || (micPermissionState !== 'granted' && audioState !== 'listening')}
+                                disabled={!micCheckReady || micSetupBusy}
                                 aria-label="Start the story"
                             >
                                 Start the story
                             </button>
                         </div>
+                        <p className={`mic-setup-ready-hint ${micCheckReady ? 'is-visible' : ''}`} aria-live="polite">
+                            {micCheckReady
+                                ? 'Mic check passed. Start the story whenever you are ready.'
+                                : audioState === 'listening'
+                                    ? 'Say "Hi Amelia!" or count to three to unlock the start button.'
+                                    : 'Run the microphone test first to unlock the story.'}
+                        </p>
                     </section>
                 </div>
             </main>
@@ -3267,19 +3400,37 @@ export default function StorytellerLive() {
             : userSpeaking
                 ? 'user-speaking'
                 : 'idle';
-    const sceneBranchReady = phase === 'story' && !isEndingStory && !isStorybookAssembling && !sceneLoading && sceneHistory.length > 1;
-    const rewindButtonReady = phase === 'story' && !isEndingStory && !isStorybookAssembling && !sceneLoading && Boolean(sessionId) && (sceneBranchReady || hasScene);
+    const sceneBranchReady = ENABLE_SCENE_BRANCH_UI
+        && phase === 'story'
+        && !isEndingStory
+        && !isStorybookAssembling
+        && !sceneLoading
+        && sceneHistory.length > 1;
+    const rewindButtonReady = ENABLE_SCENE_BRANCH_UI
+        && phase === 'story'
+        && !isEndingStory
+        && !isStorybookAssembling
+        && !sceneLoading
+        && Boolean(sessionId)
+        && (sceneBranchReady || hasScene);
     const canReadCurrentPage = Boolean(
         currentSceneCaptionText
         && phase === 'story'
         && !isStorybookAssembling
         && !sceneError
     );
-    const pageReadAloudBusy = isSpeaking || isThinking || userSpeaking || sceneLoading;
+    const hasCommittedSceneVisual = Boolean(
+        currentSceneVideoUrl
+        || (
+            currentSceneImageUrl
+            && !currentSceneImageUrl.startsWith('data:image/svg+xml')
+        )
+    );
+    const pageReadAloudBusy = isSpeaking || isThinking || userSpeaking || (sceneLoading && !hasCommittedSceneVisual);
     const captionTokens = currentSceneCaptionText
         ? tokenizeStoryCaption(currentSceneCaptionText)
         : [];
-    const toySharingReady = phase === 'story' && Boolean(sessionId);
+    const toySharingReady = isToyShareAllowedForState(phase, storyPhase, isEndingStory, storybookStatus) && Boolean(sessionId);
     const toyShareLabel = toyShareState === 'uploading'
         ? 'Adding Toy...'
         : toyShareState === 'success'
@@ -3305,6 +3456,7 @@ export default function StorytellerLive() {
             : isThinking
                 ? 'Amelia is peeking and thinking.'
                 : 'Talk to Amelia while you show your toy.';
+
     const isYoungChildMode = childAge <= 5;
     const showInlineHudControls = !isYoungChildMode;
     const selectedScene = sceneHistory.find((scene) => scene.scene_number === selectedSceneNumber) ?? null;
@@ -3325,6 +3477,14 @@ export default function StorytellerLive() {
     );
     const activeAssemblyMission = pickAssemblyMission(storybookWaitElapsedSeconds, assemblyRecentActivities);
     const assemblyMissionBusy = isSpeaking || agentThinking;
+    const assemblyHelperText = connectionState === 'connected'
+        ? 'Amelia can still chat while the movie gets ready.'
+        : connectionState === 'reconnecting'
+            ? 'Amelia is reconnecting so she can keep chatting.'
+            : 'Amelia is getting her voice link ready.';
+    const connectionBadgeText = connectionState === 'reconnecting'
+        ? (isStorybookAssembling ? '🔄 Reconnecting to Amelia...' : '🔄 Reconnecting...')
+        : (isStorybookAssembling ? '⚡ Connecting Amelia...' : '⚡ Connecting...');
     const orbStatusText = isStorybookAssembling
         ? isSpeaking
             ? 'Amelia is chatting while the movie is being made'
@@ -3622,7 +3782,7 @@ export default function StorytellerLive() {
                             ))}
                         </div>
                         <div className="storybook-assembling-helper">
-                            Amelia can still chat while the movie gets ready.
+                            {assemblyHelperText}
                         </div>
                         <div className="storybook-assembling-mission">
                             <div className="storybook-assembling-mission-kicker">
@@ -3911,7 +4071,7 @@ export default function StorytellerLive() {
             {/* Connection status badge */}
             {connectionState !== 'connected' && (
                 <div className="connection-badge" role="status" aria-live="polite">
-                    {connectionState === 'reconnecting' ? '🔄 Reconnecting...' : '⚡ Connecting...'}
+                    {connectionBadgeText}
                 </div>
             )}
 
@@ -4064,7 +4224,7 @@ export default function StorytellerLive() {
                 </div>
             )}
 
-            {showSceneBranchPicker && (
+            {ENABLE_SCENE_BRANCH_UI && showSceneBranchPicker && (
                 <div className="scene-branch-overlay" role="dialog" aria-modal="true" aria-label="Choose a story scene">
                     <div className="scene-branch-card">
                         <div className="scene-branch-header">

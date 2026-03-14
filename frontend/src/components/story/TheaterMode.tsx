@@ -54,6 +54,63 @@ function buildMovieFileName(childName?: string): string {
     return `${safeChildName}-story.mp4`;
 }
 
+function clampLightingBrightness(value: number | undefined, fallback: number = 180): number {
+    const resolved = Number.isFinite(value) ? Math.round(Number(value)) : fallback;
+    return Math.max(18, Math.min(255, resolved));
+}
+
+function clampLightingIntervalMs(value: number | undefined, fallback: number): number {
+    const resolved = Number.isFinite(value) ? Math.round(Number(value)) : fallback;
+    return Math.max(180, Math.min(3600, resolved));
+}
+
+function parseRgbFromHex(hexColor?: string): [number, number, number] | null {
+    const normalized = String(hexColor ?? '').trim().replace(/^#/, '');
+    if (!/^[0-9a-fA-F]{6}$/.test(normalized)) {
+        return null;
+    }
+    return [
+        Number.parseInt(normalized.slice(0, 2), 16),
+        Number.parseInt(normalized.slice(2, 4), 16),
+        Number.parseInt(normalized.slice(4, 6), 16),
+    ];
+}
+
+function cueRgbColor(cue: TheaterLightingCue): [number, number, number] | null {
+    if (Array.isArray(cue.rgb_color) && cue.rgb_color.length === 3) {
+        return [cue.rgb_color[0], cue.rgb_color[1], cue.rgb_color[2]];
+    }
+    return parseRgbFromHex(cue.hex_color);
+}
+
+function blendRgb(
+    base: [number, number, number],
+    target: [number, number, number],
+    amount: number,
+): [number, number, number] {
+    const weight = Math.max(0, Math.min(1, amount));
+    return [
+        Math.round(base[0] + ((target[0] - base[0]) * weight)),
+        Math.round(base[1] + ((target[1] - base[1]) * weight)),
+        Math.round(base[2] + ((target[2] - base[2]) * weight)),
+    ];
+}
+
+function buildCueVariant(
+    cue: TheaterLightingCue,
+    overrides: Partial<TheaterLightingCue>,
+): TheaterLightingCue {
+    const nextRgb = overrides.rgb_color ?? cue.rgb_color;
+    return {
+        ...cue,
+        ...overrides,
+        rgb_color: Array.isArray(nextRgb) && nextRgb.length === 3
+            ? [nextRgb[0], nextRgb[1], nextRgb[2]]
+            : undefined,
+        hex_color: overrides.rgb_color ? undefined : overrides.hex_color ?? cue.hex_color,
+    };
+}
+
 export default function TheaterMode({
     mp4Url,
     tradingCardUrl,
@@ -77,6 +134,8 @@ export default function TheaterMode({
     const videoRef = useRef<HTMLVideoElement>(null);
     const audioProbeTimerRef = useRef<number | null>(null);
     const lastLightingCueIndexRef = useRef<number | null>(null);
+    const lightingEffectIntervalRef = useRef<number | null>(null);
+    const lightingEffectTimeoutsRef = useRef<number[]>([]);
     const onTheaterOpenedRef = useRef(onTheaterOpened);
     const [videoError, setVideoError] = useState(false);
     const [isPlaying, setIsPlaying] = useState(false);
@@ -115,6 +174,126 @@ export default function TheaterMode({
         if (audioProbeTimerRef.current !== null) {
             window.clearTimeout(audioProbeTimerRef.current);
             audioProbeTimerRef.current = null;
+        }
+    };
+
+    const clearLightingEffectTimers = () => {
+        if (lightingEffectIntervalRef.current !== null) {
+            window.clearInterval(lightingEffectIntervalRef.current);
+            lightingEffectIntervalRef.current = null;
+        }
+        if (lightingEffectTimeoutsRef.current.length) {
+            lightingEffectTimeoutsRef.current.forEach((timerId) => window.clearTimeout(timerId));
+            lightingEffectTimeoutsRef.current = [];
+        }
+    };
+
+    const queueLightingEffectTimeout = (callback: () => void, delayMs: number) => {
+        const timerId = window.setTimeout(() => {
+            lightingEffectTimeoutsRef.current = lightingEffectTimeoutsRef.current.filter((value) => value !== timerId);
+            callback();
+        }, delayMs);
+        lightingEffectTimeoutsRef.current.push(timerId);
+        return timerId;
+    };
+
+    const startLightingEffectLoop = (cue: TheaterLightingCue) => {
+        if (!onLightingCueChange) {
+            return;
+        }
+        clearLightingEffectTimers();
+        const effect = cue.effect ?? 'steady';
+        if (effect === 'steady') {
+            return;
+        }
+
+        const baseBrightness = clampLightingBrightness(cue.brightness);
+        const baseRgb = cueRgbColor(cue);
+
+        if (effect === 'pulse') {
+            const intervalMs = clampLightingIntervalMs(cue.effect_interval_ms, 960);
+            let rising = false;
+            lightingEffectIntervalRef.current = window.setInterval(() => {
+                rising = !rising;
+                onLightingCueChange(
+                    buildCueVariant(cue, {
+                        brightness: rising
+                            ? clampLightingBrightness(Math.round((baseBrightness * 1.06) + 6), baseBrightness)
+                            : clampLightingBrightness(Math.round(baseBrightness * 0.68), baseBrightness),
+                        rgb_color: baseRgb
+                            ? blendRgb(baseRgb, [255, 244, 224], rising ? 0.12 : 0.03)
+                            : undefined,
+                        transition: rising ? 0.42 : 0.68,
+                    })
+                );
+            }, intervalMs);
+            return;
+        }
+
+        if (effect === 'flicker') {
+            const intervalMs = clampLightingIntervalMs(cue.effect_interval_ms, 380);
+            const brightnessPattern = [0.88, 0.58, 0.96, 0.72, 1.0, 0.64];
+            let step = 0;
+            lightingEffectIntervalRef.current = window.setInterval(() => {
+                const multiplier = brightnessPattern[step % brightnessPattern.length];
+                step += 1;
+                onLightingCueChange(
+                    buildCueVariant(cue, {
+                        brightness: clampLightingBrightness(Math.round(baseBrightness * multiplier), baseBrightness),
+                        rgb_color: baseRgb
+                            ? blendRgb(baseRgb, [255, 236, 196], step % 3 === 0 ? 0.1 : 0.04)
+                            : undefined,
+                        transition: 0.12,
+                    })
+                );
+            }, intervalMs);
+            return;
+        }
+
+        if (effect === 'flash') {
+            const intervalMs = clampLightingIntervalMs(cue.effect_interval_ms, 2400);
+            const flashRgb: [number, number, number] = baseRgb
+                ? blendRgb(baseRgb, [255, 250, 255], 0.82)
+                : [244, 248, 255];
+            const runFlashSequence = () => {
+                onLightingCueChange(
+                    buildCueVariant(cue, {
+                        brightness: clampLightingBrightness(baseBrightness + 78, baseBrightness),
+                        rgb_color: flashRgb,
+                        transition: 0.08,
+                    })
+                );
+                queueLightingEffectTimeout(() => {
+                    onLightingCueChange(
+                        buildCueVariant(cue, {
+                            brightness: baseBrightness,
+                            rgb_color: baseRgb ?? cue.rgb_color,
+                            transition: 0.18,
+                        })
+                    );
+                }, 120);
+                queueLightingEffectTimeout(() => {
+                    onLightingCueChange(
+                        buildCueVariant(cue, {
+                            brightness: clampLightingBrightness(baseBrightness + 36, baseBrightness),
+                            rgb_color: baseRgb ? blendRgb(baseRgb, [255, 250, 255], 0.48) : flashRgb,
+                            transition: 0.06,
+                        })
+                    );
+                }, 260);
+                queueLightingEffectTimeout(() => {
+                    onLightingCueChange(
+                        buildCueVariant(cue, {
+                            brightness: baseBrightness,
+                            rgb_color: baseRgb ?? cue.rgb_color,
+                            transition: Math.min(0.5, Math.max(0.18, Number(cue.transition ?? 0.34))),
+                        })
+                    );
+                }, 390);
+            };
+
+            queueLightingEffectTimeout(runFlashSequence, Math.min(620, Math.round(intervalMs * 0.35)));
+            lightingEffectIntervalRef.current = window.setInterval(runFlashSequence, intervalMs);
         }
     };
 
@@ -164,6 +343,7 @@ export default function TheaterMode({
         setHeroCardModalOpen(false);
         lastLightingCueIndexRef.current = null;
         clearAudioProbe();
+        clearLightingEffectTimers();
         video.pause();
         video.load();
         video.currentTime = 0;
@@ -207,15 +387,18 @@ export default function TheaterMode({
     useEffect(() => {
         return () => {
             clearAudioProbe();
+            clearLightingEffectTimers();
         };
     }, []);
 
     const emitLightingCueForCurrentTime = (force: boolean = false) => {
         if (!onLightingCueChange || !lightingCues?.length) {
+            clearLightingEffectTimers();
             return;
         }
         const video = videoRef.current;
         if (!video) {
+            clearLightingEffectTimers();
             return;
         }
         const currentTime = Math.max(0, Number(video.currentTime || 0));
@@ -241,7 +424,13 @@ export default function TheaterMode({
             return;
         }
         lastLightingCueIndexRef.current = cueIndex;
-        onLightingCueChange(lightingCues[cueIndex]);
+        const activeCue = lightingCues[cueIndex];
+        onLightingCueChange(activeCue);
+        if (!calmMode && !video.paused && !video.ended) {
+            startLightingEffectLoop(activeCue);
+        } else {
+            clearLightingEffectTimers();
+        }
     };
 
     useEffect(() => {
@@ -249,10 +438,15 @@ export default function TheaterMode({
             videoRef.current.muted = calmMode;
             videoRef.current.volume = calmMode ? 0 : 1;
         }
+        if (videoRef.current && lightingCues?.length && onLightingCueChange) {
+            emitLightingCueForCurrentTime(true);
+        } else if (calmMode) {
+            clearLightingEffectTimers();
+        }
         if (calmMode) {
             clearAudioProbe();
         }
-    }, [calmMode]);
+    }, [calmMode, lightingCues, onLightingCueChange]);
 
     useEffect(() => {
         if (!shareNotice) {
@@ -559,12 +753,14 @@ export default function TheaterMode({
                                         onPause={() => {
                                             setIsPlaying(false);
                                             clearAudioProbe();
+                                            clearLightingEffectTimers();
                                             onPlaybackPause?.();
                                         }}
                                         onEnded={() => {
                                             setIsPlaying(false);
                                             setHasVideoEnded(true);
                                             clearAudioProbe();
+                                            clearLightingEffectTimers();
                                             onPlaybackEnded?.();
                                         }}
                                         onSeeked={() => {

@@ -59,8 +59,11 @@ class AssemblyWaitModeTests(unittest.TestCase):
         self.assertIn("Do NOT use phrases like 'then we', 'next we', 'let's go', 'we find', 'we open', or 'now we'.", prompt)
         self.assertIn("Do NOT ask what happens next in the story or adventure.", prompt)
         self.assertIn("Do NOT ask where to go next, what to do next, what happens next, what the next page is", prompt)
+        self.assertIn("Do NOT ask the child to show you anything", prompt)
+        self.assertIn("Keep the interaction audio-first, calm, quiet-friendly, and bedtime-safe.", prompt)
         self.assertIn("Do NOT say the movie is ready, done, finished, starting now, opening now, or ready to watch.", prompt)
         self.assertIn("Do NOT say phrases like 'enjoy the movie', 'enjoy the show', 'the movie is done'", prompt)
+        self.assertIn("you may use the room-light tool once", prompt)
 
     def test_assembly_activity_prompt_stays_in_waiting_room_mode(self) -> None:
         prompt = ws_router._assembly_activity_prompt(
@@ -74,7 +77,31 @@ class AssemblyWaitModeTests(unittest.TestCase):
         self.assertIn("Do NOT continue the plot.", prompt)
         self.assertIn("Do NOT narrate any new action, movement, discovery, location change, or next page.", prompt)
         self.assertIn("Do NOT ask what happens next in the story or adventure.", prompt)
+        self.assertIn("Do NOT ask the child to show you anything", prompt)
         self.assertIn("Do NOT say the movie is ready, done, finished, starting now, opening now, or ready to watch.", prompt)
+
+    def test_assembly_recent_activity_aliases_normalize_old_movement_keys(self) -> None:
+        state = {
+            "assembly_recent_activities": ["sparkle_wiggle", "helper_pose", "tiny_joke"],
+        }
+
+        self.assertEqual(
+            ws_router._assembly_recent_activity_keys(state),
+            ["soft_echo", "cozy_breath", "tiny_joke"],
+        )
+
+    def test_assembly_intro_prefers_quiet_audio_first_activity(self) -> None:
+        activity = ws_router._choose_assembly_wait_activity({}, intro=True)
+
+        self.assertIn(activity, {"tiny_joke", "favorite_sound", "counting_game"})
+
+    def test_assembly_wait_light_request_chooses_light_color_activity(self) -> None:
+        activity = ws_router._choose_assembly_wait_activity(
+            {},
+            child_utterance="Can you turn the lights blue while we wait?",
+        )
+
+        self.assertEqual(activity, "light_color")
 
 
 if __name__ == "__main__":

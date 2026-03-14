@@ -10,7 +10,7 @@ _PROJECT_ROOT = Path(__file__).resolve().parents[2]
 if str(_PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(_PROJECT_ROOT))
 
-from agent.tools import _storybook_state_cache, _sync_room_lights_impl, sync_room_lights
+from agent.tools import _storybook_state_cache, _sync_room_lights_impl, set_room_lights, sync_room_lights
 from shared.storybook_lighting import heuristic_storybook_lighting_command
 
 
@@ -67,6 +67,50 @@ class StorybookLightingTests(unittest.TestCase):
         self.assertEqual(story_pages[0]["hex_color"], "#6FA8FF")
         self.assertEqual(story_pages[0]["rgb_color"], [111, 168, 255])
         self.assertEqual(story_pages[0]["cue_source"], "tool_sync")
+
+    def test_set_room_lights_maps_named_color_without_touching_story_scene_metadata(self) -> None:
+        tool_context = _FakeToolContext(
+            "session-lighting",
+            {
+                "assembly_status": "assembling",
+                "current_scene_description": "Santa sits by the fireplace.",
+                "story_pages": [
+                    {
+                        "scene_number": 4,
+                        "request_id": "scene-4",
+                        "scene_description": "Santa sits by the fireplace.",
+                    }
+                ],
+            },
+        )
+
+        with mock.patch("agent.tools._update_storybook_firestore"):
+            with mock.patch("agent.tools._sync_room_lights_impl", new=mock.AsyncMock(return_value="System: Room lights synced to #B388FF.")) as mocked_sync:
+                message = asyncio.run(
+                    set_room_lights(
+                        "Please make the lights soft purple",
+                        tool_context=tool_context,
+                    )
+                )
+
+        self.assertIn("#B388FF", message)
+        kwargs = mocked_sync.await_args.kwargs
+        self.assertEqual(kwargs["hex_color"], "#B388FF")
+        self.assertEqual(kwargs["brightness"], 132)
+        self.assertFalse(kwargs["record_scene_metadata"])
+        self.assertEqual(kwargs["cue_source"], "manual_child_request")
+        story_pages = tool_context.state.get("story_pages")
+        self.assertIsInstance(story_pages, list)
+        self.assertNotIn("hex_color", story_pages[0])
+        self.assertIsNone(tool_context.state.get("scene_lighting_cues"))
+
+    def test_set_room_lights_supports_slow_named_color_request(self) -> None:
+        with mock.patch("agent.tools._sync_room_lights_impl", new=mock.AsyncMock(return_value="ok")) as mocked_sync:
+            asyncio.run(set_room_lights("turn the lights blue slowly"))
+
+        kwargs = mocked_sync.await_args.kwargs
+        self.assertEqual(kwargs["hex_color"], "#6FA8FF")
+        self.assertEqual(kwargs["transition"], 2.6)
 
     def test_same_color_updates_new_page_metadata_even_when_live_command_is_skipped(self) -> None:
         tool_context = _FakeToolContext(
@@ -149,6 +193,23 @@ class StorybookLightingTests(unittest.TestCase):
         self.assertEqual(cue["hex_color"], "#FFC78A")
         self.assertEqual(cue["rgb_color"], [255, 199, 138])
         self.assertEqual(cue["cue_source"], "heuristic_scene")
+        self.assertEqual(cue["effect"], "steady")
+
+    def test_spooky_scene_prefers_flicker_effect(self) -> None:
+        cue = heuristic_storybook_lighting_command(
+            "A spooky haunted castle hallway flickers while friendly ghosts peek from the shadows."
+        )
+
+        self.assertEqual(cue["effect"], "flicker")
+        self.assertGreaterEqual(cue["effect_interval_ms"], 180)
+
+    def test_lightning_scene_prefers_flash_effect(self) -> None:
+        cue = heuristic_storybook_lighting_command(
+            "A thunder storm cracks overhead and bright lightning flashes across the moonlit clouds."
+        )
+
+        self.assertEqual(cue["effect"], "flash")
+        self.assertGreaterEqual(cue["effect_interval_ms"], 1500)
 
 
 if __name__ == "__main__":

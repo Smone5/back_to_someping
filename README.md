@@ -4,6 +4,19 @@ Voxitale is a voice-first storytelling app for young children. A child talks to 
 
 This repo contains the app code, Docker build definitions, and Google Cloud Terraform needed to reproduce the project.
 
+## Prototype Notice
+
+This project was developed quickly to explore real-time storytelling using Gemini Live and multiple AI tools.
+
+Things that may still be rough:
+
+- reconnect logic for Gemini Live sessions
+- error handling around WebSocket streaming
+- parts of the media generation pipeline
+- documentation and repo structure
+
+The goal of this repo is to demonstrate the architecture and ideas behind Voxitale rather than provide a production-ready system.
+
 ## What It Does
 
 - Streams microphone audio from the browser to a live backend over `/ws/story`

@@ -7,7 +7,6 @@ from __future__ import annotations
 
 import asyncio
 import base64
-from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import html
 import io
@@ -79,6 +78,7 @@ from shared.storybook_movie_quality import (
 )
 from shared.story_continuity import (
     ensure_story_continuity_state,
+    is_meaningful_prop_label,
     record_continuity_scene,
     should_render_new_scene_page,
     validate_live_scene_request,
@@ -95,6 +95,12 @@ from shared.storybook_studio_workflow import (
     build_storybook_studio_plan_from_workflow_state,
     build_storybook_studio_summary,
     run_storybook_studio_workflow,
+)
+from shared.storybook_titles import (
+    build_storybook_title_prompt as shared_build_storybook_title_prompt,
+    clean_storybook_title as shared_clean_storybook_title,
+    heuristic_storybook_title as shared_heuristic_storybook_title,
+    validate_storybook_title as shared_validate_storybook_title,
 )
 
 from backend.event_bus import get_session_iot_config, publish_session_event, schedule_background_task
@@ -139,19 +145,6 @@ _VISUAL_MEMORY_TRAIT_WORDS = {
 _VISUAL_MEMORY_ACCESSORY_WORDS = {
     "backpack", "book", "cape", "crown", "glasses", "hat", "key", "lantern", "scarf",
     "wand", "wings",
-}
-_VISUAL_MEMORY_SPECIES_HINTS = {
-    "dragon": "dragon",
-    "ghost": "ghost",
-    "wizard": "wizard",
-    "witch": "witch",
-    "elf": "elf",
-    "reindeer": "reindeer",
-    "princess": "princess",
-    "prince": "prince",
-    "queen": "queen",
-    "king": "king",
-    "sidekick": "sidekick",
 }
 _DEFAULT_VISUAL_CONTINUITY_PLAN = VisualContinuityPlan().model_dump(exclude_none=True)
 _DEFAULT_SCENE_VISUAL_AUDIT = SceneVisualAuditRecord().model_dump(exclude_none=True)
@@ -383,6 +376,12 @@ class LightArgs(BaseModel):
     scene_description: str = ""
 
 
+class RoomLightRequestArgs(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+    color_request: str
+    scene_description: str = ""
+
+
 class PostMovieIssue(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
@@ -481,6 +480,76 @@ def _rgb_from_hex(hex_color: str) -> tuple[int, int, int]:
         int(hex_clean[2:4], 16),
         int(hex_clean[4:6], 16),
     )
+
+
+_NAMED_ROOM_LIGHT_COLORS: dict[str, str] = {
+    "warm white": "#FFD8A8",
+    "soft white": "#F3E7D3",
+    "cozy gold": "#FFC78A",
+    "candlelight": "#FFC78A",
+    "moonlight": "#B8C9FF",
+    "sky blue": "#8FD3FF",
+    "aqua": "#57D6FF",
+    "cyan": "#57D6FF",
+    "teal": "#4FD1C5",
+    "mint": "#8EF0C8",
+    "green": "#7ED957",
+    "yellow": "#FFD84D",
+    "gold": "#FFC857",
+    "orange": "#FF9B42",
+    "red": "#FF6B6B",
+    "blue": "#6FA8FF",
+    "purple": "#B388FF",
+    "violet": "#A084FF",
+    "pink": "#FF8CC8",
+    "rose": "#FF7EB6",
+    "white": "#F6F1E8",
+}
+
+
+def _resolve_named_room_light_request(raw_request: str) -> tuple[str, int, float]:
+    request = re.sub(r"[^a-z0-9#\s]", " ", str(raw_request or "").strip().lower())
+    request = re.sub(r"\s+", " ", request).strip()
+    if not request:
+        raise ValueError("Please pick a light color like blue, pink, purple, green, gold, or white.")
+
+    try:
+        return _normalize_hex_color(request), 200, 1.4
+    except ValueError:
+        pass
+
+    matched_hex = ""
+    for phrase in sorted(_NAMED_ROOM_LIGHT_COLORS, key=len, reverse=True):
+        if phrase in request:
+            matched_hex = _NAMED_ROOM_LIGHT_COLORS[phrase]
+            break
+
+    if not matched_hex:
+        tokens = set(request.split())
+        for phrase, hex_color in _NAMED_ROOM_LIGHT_COLORS.items():
+            phrase_tokens = set(phrase.split())
+            if phrase_tokens & tokens:
+                matched_hex = hex_color
+                break
+
+    if not matched_hex:
+        raise ValueError(
+            "I can change the lights to a simple color like blue, pink, purple, green, gold, orange, red, or white."
+        )
+
+    brightness = 200
+    if any(marker in request for marker in ("dim", "soft", "gentle", "cozy", "calm", "sleepy", "bedtime", "warm")):
+        brightness = 132
+    elif any(marker in request for marker in ("bright", "brighter", "sunny", "glow")):
+        brightness = 230
+
+    transition = 1.4
+    if any(marker in request for marker in ("slow", "slowly", "softly", "gently", "fade", "fading")):
+        transition = 2.6
+    elif any(marker in request for marker in ("quick", "quickly", "fast", "now")):
+        transition = 0.7
+
+    return matched_hex, brightness, transition
 
 
 def _session_light_cooldown_key(session_id: str | None) -> str:
@@ -898,6 +967,16 @@ def _pending_child_utterance(state: dict[str, Any] | None) -> str:
     ).strip()
 
 
+def _scene_render_already_started(state: dict[str, Any] | None) -> bool:
+    if not isinstance(state, dict):
+        return False
+    return bool(
+        state.get("scene_render_pending", False)
+        or str(state.get("pending_scene_description", "") or "").strip()
+        or str(state.get("pending_scene_base_description", "") or "").strip()
+    )
+
+
 def _stale_turn_tool_call(session_id: str, tool_context: ToolContext | None) -> bool:
     if not session_id:
         return False
@@ -916,7 +995,10 @@ def _stale_turn_tool_call(session_id: str, tool_context: ToolContext | None) -> 
         latest_child = _pending_child_utterance(latest_state)
         if live_child and latest_child and live_child != latest_child:
             return False
-        return True
+        # The websocket can occasionally seal the turn a beat before ADK delivers
+        # the first scene tool call. If no render was actually started for that turn,
+        # still accept the late call so the child gets the page they just asked for.
+        return _scene_render_already_started(latest_state)
     if not latest_state and not live_state:
         return False
     return True
@@ -1242,6 +1324,14 @@ def _using_vertex_ai_backend() -> bool:
     return os.environ.get("GOOGLE_GENAI_USE_VERTEXAI", "").strip().upper() == "TRUE"
 
 
+def _vertex_ai_location() -> str:
+    return (
+        os.environ.get("VERTEX_AI_LOCATION")
+        or os.environ.get("GOOGLE_CLOUD_LOCATION")
+        or "us-central1"
+    ).strip() or "us-central1"
+
+
 def _default_live_image_model() -> str:
     return _DEFAULT_VERTEX_IMAGE_MODEL if _using_vertex_ai_backend() else _DEFAULT_API_KEY_IMAGE_MODEL
 
@@ -1254,7 +1344,7 @@ def _is_supported_image_generation_model(model_name: str) -> bool:
 def _build_google_genai_client() -> google_genai.Client:
     if _using_vertex_ai_backend():
         project = os.environ.get("GOOGLE_CLOUD_PROJECT", "").strip()
-        location = os.environ.get("GOOGLE_CLOUD_LOCATION", "us-central1").strip() or "us-central1"
+        location = _vertex_ai_location()
         if not project:
             raise ValueError("Missing GOOGLE_CLOUD_PROJECT for Vertex AI image generation.")
         return google_genai.Client(vertexai=True, project=project, location=location)
@@ -1667,14 +1757,6 @@ def _dedupe_preserving_order(items: list[str], *, limit: int) -> list[str]:
     return cleaned[:limit]
 
 
-def _infer_character_species(label: str) -> str:
-    lowered = _normalize_text_fragment(label, limit=120).lower()
-    for token, species in _VISUAL_MEMORY_SPECIES_HINTS.items():
-        if token in lowered:
-            return species
-    return lowered.split()[-1] if lowered else ""
-
-
 def _infer_character_role(state: Mapping[str, Any], character_key: str, label: str) -> str:
     sidekick_description = _normalize_text_fragment(state.get("sidekick_description", ""), limit=180).lower()
     lowered_label = _normalize_text_fragment(label, limit=120).lower()
@@ -1686,10 +1768,56 @@ def _infer_character_role(state: Mapping[str, Any], character_key: str, label: s
             active_keys = list(world.get("active_character_keys", []) or [])
             if active_keys and active_keys[0] == character_key:
                 return "sidekick"
-    species = _infer_character_species(label)
-    if species in {"dragon", "ghost", "reindeer"}:
-        return "recurring_creature"
     return "story_character"
+
+
+def _character_fact_texts_for_identity(state: Mapping[str, Any], label: str, toy_name_hint: str = "") -> list[str]:
+    lowered_label = _normalize_text_fragment(label, limit=120).lower()
+    lowered_toy_name = _normalize_text_fragment(toy_name_hint, limit=120).lower()
+    fact_texts: list[str] = []
+    for entry in list(state.get("character_facts_list", []) or []):
+        if not isinstance(entry, Mapping):
+            continue
+        name = _normalize_text_fragment(entry.get("character_name", ""), limit=120)
+        fact = _normalize_text_fragment(entry.get("fact", ""), limit=220)
+        lowered_name = name.lower()
+        if not fact:
+            continue
+        if lowered_label and (lowered_name == lowered_label or lowered_label in lowered_name or lowered_name in lowered_label):
+            fact_texts.append(f"{name}: {fact}" if name else fact)
+            continue
+        if lowered_toy_name and (lowered_name == lowered_toy_name or lowered_toy_name in lowered_name or lowered_name in lowered_toy_name):
+            fact_texts.append(f"{name}: {fact}" if name else fact)
+    return fact_texts[:3]
+
+
+def _character_identity_anchor(
+    state: Mapping[str, Any],
+    character_key: str,
+    label: str,
+    *texts: str,
+) -> str:
+    role = _infer_character_role(state, character_key, label)
+    toy_name_hint = _normalize_text_fragment(state.get("toy_reference_name_hint", ""), limit=120)
+    identity_bits: list[str] = []
+    if role == "sidekick":
+        if toy_name_hint:
+            identity_bits.append(f"name: {toy_name_hint}")
+        for field in (
+            state.get("toy_reference_visual_summary", ""),
+            state.get("sidekick_description", ""),
+        ):
+            cleaned = _normalize_text_fragment(field, limit=220)
+            if cleaned:
+                identity_bits.append(cleaned)
+    identity_bits.extend(_character_fact_texts_for_identity(state, label, toy_name_hint))
+    identity_bits.extend(
+        _normalize_text_fragment(text, limit=220)
+        for text in texts
+        if _normalize_text_fragment(text, limit=220)
+    )
+    joined = _dedupe_preserving_order(identity_bits, limit=3)
+    return " | ".join(joined)
 
 
 def _extract_character_visual_traits(label: str, *texts: str) -> list[str]:
@@ -1871,7 +1999,7 @@ def _remember_character_visual_references(
                 **existing_payload,
                 "character_key": character_key,
                 "label": _normalize_text_fragment(existing_payload.get("label") or label, limit=120),
-                "species": _normalize_text_fragment(existing_payload.get("species") or _infer_character_species(label), limit=80),
+                "species": _normalize_text_fragment(existing_payload.get("species"), limit=80),
                 "role": _normalize_text_fragment(existing_payload.get("role") or _infer_character_role(state, character_key, label), limit=80)
                 or "story_character",
                 "canonical_visual_traits": visual_traits,
@@ -1899,7 +2027,6 @@ def _character_bible_entries_for_keys(
             raw_entry = {
                 "character_key": key,
                 "label": label,
-                "species": _infer_character_species(label),
                 "role": _infer_character_role(state, key, label),
             }
         try:
@@ -1907,6 +2034,7 @@ def _character_bible_entries_for_keys(
                 {
                     **dict(raw_entry),
                     "character_key": str(raw_entry.get("character_key") or key or "").strip(),
+                    "species": _normalize_text_fragment(raw_entry.get("species"), limit=80),
                 }
             )
         except Exception:
@@ -1999,11 +2127,14 @@ def _build_visual_continuity_plan(
         )
         if str(item).strip()
     ][:4]
-    required_prop_labels = [
-        _registry_entity_label(state, "props", item)
-        for item in required_prop_keys
-        if _registry_entity_label(state, "props", item)
-    ][:4]
+    filtered_required_props: list[tuple[str, str]] = []
+    for item in required_prop_keys:
+        label = _registry_entity_label(state, "props", item)
+        if not label or not is_meaningful_prop_label(label):
+            continue
+        filtered_required_props.append((item, label))
+    required_prop_keys = [item for item, _label in filtered_required_props][:4]
+    required_prop_labels = [label for _item, label in filtered_required_props][:4]
 
     forbidden_drift: list[str] = []
     if current_location and target_location and current_location.lower() == target_location.lower():
@@ -2013,9 +2144,27 @@ def _build_visual_continuity_plan(
             f"Do not teleport away from {current_location}; keep the next scene directly connected to that space."
         )
     for entry in _character_bible_entries_for_keys(state, active_character_keys):
+        character_key = _normalize_text_fragment(entry.get("character_key", ""), limit=120)
         label = _normalize_text_fragment(entry.get("label", ""), limit=120)
+        role = _normalize_text_fragment(entry.get("role", ""), limit=80)
         traits = list(entry.get("canonical_visual_traits", []) or [])
         accessories = list(entry.get("outfit_accessories", []) or [])
+        latest_visual_summary = _normalize_text_fragment(entry.get("latest_visual_summary", ""), limit=180)
+        identity_anchor = _character_identity_anchor(
+            state,
+            character_key,
+            label,
+            latest_visual_summary,
+        )
+        if label and identity_anchor:
+            if role == "sidekick":
+                forbidden_drift.append(
+                    f"Do not identity-swap {label}; keep the same toy sidekick identity and body type from this anchor: {identity_anchor}."
+                )
+            else:
+                forbidden_drift.append(
+                    f"Do not identity-swap {label}; keep the same body type, face, silhouette, and overall identity from this anchor: {identity_anchor}."
+                )
         if traits or accessories:
             detail_bits = []
             if traits:
@@ -2025,6 +2174,8 @@ def _build_visual_continuity_plan(
             forbidden_drift.append(f"Keep {label} visually consistent ({'; '.join(detail_bits)}).")
         elif label:
             forbidden_drift.append(f"Do not redesign {label}.")
+        if label and latest_visual_summary:
+            forbidden_drift.append(f"Match {label}'s recent look: {latest_visual_summary}.")
 
     continuity_notes = _dedupe_preserving_order(
         [
@@ -2089,7 +2240,9 @@ def _continuity_plan_prompt(
     for entry in list(active_character_bible or [])[:3]:
         if not isinstance(entry, Mapping):
             continue
+        character_key = _normalize_text_fragment(entry.get("character_key", ""), limit=120)
         label = _normalize_text_fragment(entry.get("label", ""), limit=120)
+        role = _normalize_text_fragment(entry.get("role", ""), limit=80)
         traits = [
             _normalize_text_fragment(item, limit=100)
             for item in list(entry.get("canonical_visual_traits", []) or [])
@@ -2100,8 +2253,19 @@ def _continuity_plan_prompt(
             for item in list(entry.get("outfit_accessories", []) or [])
             if _normalize_text_fragment(item, limit=80)
         ]
+        latest_visual_summary = _normalize_text_fragment(entry.get("latest_visual_summary", ""), limit=160)
         if not label:
             continue
+        identity_anchor = latest_visual_summary
+        if identity_anchor and role == "sidekick":
+            bits.append(
+                f"{label} is the recurring toy sidekick. Keep the same body type, face, silhouette, colors, and toy identity from this anchor: {identity_anchor}."
+            )
+        elif identity_anchor:
+            bits.append(
+                f"{label} must keep the same physical identity from this anchor: {identity_anchor}. "
+                f"Do not turn {label} into a different animal, person, or toy."
+            )
         detail_bits: list[str] = []
         if traits:
             detail_bits.append(", ".join(traits[:2]))
@@ -2111,6 +2275,8 @@ def _continuity_plan_prompt(
             bits.append(f"Keep {label} recognizable with the same look cues: {'; '.join(detail_bits)}.")
         else:
             bits.append(f"Keep {label} recognizable as the same recurring character.")
+        if latest_visual_summary:
+            bits.append(f"Recent look for {label}: {latest_visual_summary}.")
     forbidden_drift = [
         _normalize_text_fragment(item, limit=160)
         for item in list(continuity_plan.get("forbidden_drift", []) or [])
@@ -2164,6 +2330,19 @@ def _encode_storage_image(image_bytes: bytes) -> tuple[bytes, str]:
             return out.getvalue(), "image/jpeg"
     except Exception:
         return image_bytes, _sniff_mime_type(image_bytes)
+
+
+def _should_persist_uploaded_scene_asset(
+    *,
+    session_id: str | None,
+    superseded_render: bool,
+    preview_published: bool,
+) -> bool:
+    if not session_id:
+        return False
+    if not superseded_render and session_id not in _session_cancel_current:
+        return True
+    return preview_published
 
 
 def _persist_uploaded_scene_asset(
@@ -2507,6 +2686,101 @@ def _build_fallback_scene_svg_data_url(description: str) -> str:
     return "data:image/svg+xml;base64," + base64.b64encode(svg.encode("utf-8")).decode("ascii")
 
 
+def _build_fallback_scene_card_data_url(description: str) -> str:
+    caption = str(description or "A magical story scene").strip()[:220] or "A magical story scene"
+    try:
+        from PIL import Image, ImageDraw, ImageFont
+
+        width, height = 1280, 720
+        image = Image.new("RGB", (width, height), "#1b0b3b")
+        draw = ImageDraw.Draw(image, "RGBA")
+
+        top_color = (27, 11, 59)
+        mid_color = (63, 28, 115)
+        bottom_color = (11, 45, 91)
+        for y in range(height):
+            progress = y / max(1, height - 1)
+            if progress < 0.55:
+                blend = progress / 0.55
+                color = tuple(
+                    int(top_color[idx] + (mid_color[idx] - top_color[idx]) * blend)
+                    for idx in range(3)
+                )
+            else:
+                blend = (progress - 0.55) / 0.45
+                color = tuple(
+                    int(mid_color[idx] + (bottom_color[idx] - mid_color[idx]) * blend)
+                    for idx in range(3)
+                )
+            draw.line((0, y, width, y), fill=color, width=1)
+
+        draw.ellipse((120, 430, 470, 780), fill=(255, 127, 190, 96))
+        draw.ellipse((430, 380, 930, 880), fill=(124, 248, 207, 78))
+        draw.ellipse((860, 420, 1180, 740), fill=(126, 201, 255, 88))
+        draw.ellipse((430, 75, 850, 470), fill=(255, 209, 102, 48))
+        draw.rounded_rectangle(
+            (160, 215, 1120, 505),
+            radius=48,
+            fill=(16, 8, 40, 152),
+            outline=(248, 241, 220, 86),
+            width=4,
+        )
+
+        try:
+            title_font = ImageFont.truetype("DejaVuSans.ttf", 46)
+            body_font = ImageFont.truetype("DejaVuSans.ttf", 30)
+        except Exception:
+            title_font = ImageFont.load_default()
+            body_font = ImageFont.load_default()
+
+        title = "Amelia is still drawing this page"
+        title_bbox = draw.textbbox((0, 0), title, font=title_font)
+        title_x = (width - (title_bbox[2] - title_bbox[0])) // 2
+        draw.text((title_x + 2, 245), title, font=title_font, fill=(16, 8, 40, 180))
+        draw.text((title_x, 243), title, font=title_font, fill=(255, 247, 214, 245))
+
+        wrapped_lines: list[str] = []
+        current_line = ""
+        for word in caption.split():
+            candidate = f"{current_line} {word}".strip()
+            bbox = draw.textbbox((0, 0), candidate, font=body_font)
+            if current_line and (bbox[2] - bbox[0]) > 820:
+                wrapped_lines.append(current_line)
+                current_line = word
+            else:
+                current_line = candidate
+        if current_line:
+            wrapped_lines.append(current_line)
+        wrapped_lines = wrapped_lines[:4] or [caption]
+
+        line_gap = 16
+        line_heights: list[int] = []
+        for line in wrapped_lines:
+            bbox = draw.textbbox((0, 0), line, font=body_font)
+            line_heights.append(max(1, bbox[3] - bbox[1]))
+        total_height = sum(line_heights) + line_gap * max(0, len(line_heights) - 1)
+        current_y = 335 - total_height // 2 + 55
+        for line, line_height in zip(wrapped_lines, line_heights):
+            bbox = draw.textbbox((0, 0), line, font=body_font)
+            line_width = bbox[2] - bbox[0]
+            x = (width - line_width) // 2
+            draw.text((x + 2, current_y + 2), line, font=body_font, fill=(16, 8, 40, 160))
+            draw.text((x, current_y), line, font=body_font, fill=(255, 247, 214, 238))
+            current_y += line_height + line_gap
+
+        footer = "We hit a short picture-making slowdown, but the story can keep going."
+        footer_bbox = draw.textbbox((0, 0), footer, font=body_font)
+        footer_x = (width - (footer_bbox[2] - footer_bbox[0])) // 2
+        draw.text((footer_x + 1, 555), footer, font=body_font, fill=(16, 8, 40, 150))
+        draw.text((footer_x, 553), footer, font=body_font, fill=(236, 233, 255, 220))
+
+        output = io.BytesIO()
+        image.save(output, format="PNG", optimize=True)
+        return "data:image/png;base64," + base64.b64encode(output.getvalue()).decode("ascii")
+    except Exception:
+        return _build_fallback_scene_svg_data_url(caption)
+
+
 def _upload_scene_still(
     image_bytes: bytes,
     mime_type: str,
@@ -2565,6 +2839,11 @@ def _generate_scene_still(
         "or side characters unless the child clearly asked for them."
     )
     prompt += (
+        "\nRecurring character lock: if a named recurring character or toy sidekick is part of this page, "
+        "show that exact same character clearly in frame. Do not swap it for a generic child, helper, "
+        "different animal, or any other replacement."
+    )
+    prompt += (
         "\nStorybeat text: In the same response, include exactly one short child-friendly storybook caption "
         "that matches the illustration. Use one vivid present-tense sentence, maximum 22 words, with no markdown, labels, or quotation marks."
     )
@@ -2612,13 +2891,22 @@ def _generate_scene_still(
         )
     if has_toy_ref:
         toy_summary = _normalize_text_fragment(state.get("toy_reference_visual_summary", ""), limit=220) if state else ""
+        toy_name_hint = _normalize_text_fragment(state.get("toy_reference_name_hint", ""), limit=80) if state else ""
         prompt += (
             "\nToy reference priority: the shared toy is a recurring helper or sidekick in the story. "
             "Keep it visibly present when the story beat allows, and match the toy's shape, colors, and overall identity from the reference image."
         )
+        if toy_name_hint:
+            prompt += f"\nShared toy name: {toy_name_hint}."
         if toy_summary:
             prompt += f"\nShared toy details: {toy_summary}."
-        prompt += "\nUse the toy as a recurring companion, not just a loose color reference, and do not replace the whole setting with the toy photo."
+        prompt += (
+            "\nUse the toy as a recurring companion, not just a loose color reference, and do not replace the whole setting with the toy photo. "
+            "Do not turn the toy into a generic dragon, dinosaur, unicorn, or some other new creature unless the child explicitly changes it."
+        )
+        prompt += (
+            "\nDo not identity-swap or body-swap the toy across pages. Preserve the same physical identity shown by the toy reference and shared toy details."
+        )
     if isinstance(continuity_plan, Mapping):
         transition_type = _normalize_text_fragment(continuity_plan.get("transition_type", ""), limit=80).replace("_", " ")
         target_location = _normalize_text_fragment(continuity_plan.get("target_location", ""), limit=120)
@@ -2647,6 +2935,7 @@ def _generate_scene_still(
             if not isinstance(entry, Mapping):
                 continue
             label = _normalize_text_fragment(entry.get("label", ""), limit=120)
+            role = _normalize_text_fragment(entry.get("role", ""), limit=80)
             traits = [
                 _normalize_text_fragment(item, limit=80)
                 for item in list(entry.get("canonical_visual_traits", []) or [])
@@ -2657,17 +2946,28 @@ def _generate_scene_still(
                 for item in list(entry.get("outfit_accessories", []) or [])
                 if _normalize_text_fragment(item, limit=80)
             ]
+            latest_visual_summary = _normalize_text_fragment(entry.get("latest_visual_summary", ""), limit=180)
             if not label:
                 continue
             detail_bits = []
+            if role == "sidekick":
+                detail_bits.append("same toy sidekick identity")
             if traits:
                 detail_bits.append(", ".join(traits[:2]))
             if accessories:
                 detail_bits.append("accessories: " + ", ".join(accessories[:2]))
             if detail_bits:
-                character_notes.append(f"{label} must stay recognizable with {'; '.join(detail_bits)}.")
+                character_notes.append(
+                    f"{label} must stay the exact same recurring character with {'; '.join(detail_bits)}. "
+                    f"Never change {label} into a different animal, toy type, or person."
+                )
             else:
-                character_notes.append(f"{label} must stay recognizable as the same recurring character.")
+                character_notes.append(
+                    f"{label} must stay recognizable as the same recurring character. "
+                    f"Never change {label} into a different animal, toy type, or person."
+                )
+            if latest_visual_summary:
+                character_notes.append(f"Match {label}'s recent look: {latest_visual_summary}.")
         if character_notes:
             prompt += "\nActive character bible: " + " ".join(character_notes)
 
@@ -2719,6 +3019,36 @@ def _scene_visual_audit_enabled() -> bool:
     return _env_enabled("ENABLE_SCENE_VISUAL_AUDIT", default=True)
 
 
+_LIVE_SCENE_REPAIR_MAJOR_KINDS = {
+    "location_teleport",
+    "missing_required_character",
+    "identity_swap",
+    "character_identity_swap",
+    "character_missing",
+}
+
+
+def _should_block_live_preview_for_audit_retry(
+    audit_payload: Mapping[str, Any] | None,
+) -> bool:
+    if not isinstance(audit_payload, Mapping):
+        return False
+    if not bool(audit_payload.get("should_retry", False)):
+        return False
+    if _env_enabled("ENABLE_LIVE_SCENE_REPAIR_RETRY", default=False):
+        return True
+    for raw_issue in list(audit_payload.get("issues", []) or []):
+        if not isinstance(raw_issue, Mapping):
+            continue
+        severity = str(raw_issue.get("severity") or "minor").strip().lower()
+        kind = str(raw_issue.get("kind") or "").strip().lower()
+        if severity == "critical":
+            return True
+        if severity == "major" and kind in _LIVE_SCENE_REPAIR_MAJOR_KINDS:
+            return True
+    return False
+
+
 def _repair_visual_args_from_audit(args: VisualArgs, audit_payload: Mapping[str, Any] | None) -> VisualArgs | None:
     if not isinstance(audit_payload, Mapping):
         return None
@@ -2761,7 +3091,8 @@ async def _audit_scene_visual_continuity(
         "You are a strict continuity auditor for a children's story image. "
         "The first image is the newly generated candidate. Remaining images, if any, are continuity references. "
         "Check whether the candidate preserves the intended location transition, recurring characters, carried props, and spatial logic. "
-        "Fail if the image teleports to an unrelated place, drops a required recurring character, or visibly redesigns the established cast. "
+        "Fail if the image teleports to an unrelated place, drops a required recurring character, visibly redesigns the established cast, "
+        "or changes a recurring character into a different animal, toy type, or person than the continuity references imply. "
         "Use repair only when one stronger retry prompt can likely fix the issue. "
         "Return compact JSON only that matches the schema.\n\n"
         f"Requested scene description: {_normalize_text_fragment(args.description, limit=500)}\n"
@@ -2907,6 +3238,11 @@ async def generate_scene_visuals(
             render_in_flight=bool(session_id and session_id in _session_generating),
         )
         if not render_decision.should_render:
+            if tool_context and isinstance(getattr(tool_context, "state", None), dict):
+                tool_context.state["scene_render_skipped"] = True
+                tool_context.state["scene_render_pending"] = False
+                tool_context.state["pending_scene_description"] = ""
+                tool_context.state["pending_scene_base_description"] = ""
             logger.info(
                 "[generate_scene_visuals] Staying on current page for %s | reason=%s | location=%s",
                 session_id,
@@ -2993,10 +3329,18 @@ async def generate_scene_visuals(
                 using_toy_reference = True
 
         if using_toy_reference:
-            visual_description = (
-                f"{visual_description} The sidekick should match the toy reference image "
-                "and feel like a soft, kid-friendly toy (no brand logos)."
-            )
+            toy_name_hint = _normalize_text_fragment(state.get("toy_reference_name_hint", ""), limit=80)
+            if toy_name_hint:
+                visual_description = (
+                    f"{visual_description} The sidekick should still be {toy_name_hint}, "
+                    "match the toy reference image, keep the same identity/colors/silhouette, "
+                    "and feel like a soft, kid-friendly toy (no brand logos)."
+                )
+            else:
+                visual_description = (
+                    f"{visual_description} The sidekick should match the toy reference image "
+                    "and feel like a soft, kid-friendly toy (no brand logos)."
+                )
 
         request_id = uuid.uuid4().hex
 
@@ -3079,6 +3423,7 @@ async def generate_scene_visuals(
         # Keep the requested next page separate from the currently visible page
         # until an actual preview image lands.
         if tool_context:
+            tool_context.state["scene_render_skipped"] = False
             tool_context.state["previous_scene_description"] = tool_context.state.get(
                 "current_scene_description", ""
             )
@@ -3191,13 +3536,14 @@ async def _run_visual_pipeline(
     """Internal async pipeline: fast still image first, optional Veo clip second."""
     _pipeline_t0 = time.monotonic()
     project = os.environ["GOOGLE_CLOUD_PROJECT"]
-    location = os.environ.get("GOOGLE_CLOUD_LOCATION", "us-central1")
+    location = _vertex_ai_location()
     image_bytes: bytes | None = None
     image_mime = "image/jpeg"
     gcs_uri: str | None = None
     storybeat_text = _fallback_storybeat_text(args.base_description or args.description)
     public_scene_description = _public_scene_description(args)
     superseded_render = False
+    preview_published = False
     audit_payload: dict[str, Any] | None = None
     audit_history: list[dict[str, Any]] = []
     audit_learning_prompt_text = args.base_description or args.description
@@ -3320,8 +3666,15 @@ async def _run_visual_pipeline(
                     if accepted_render is not None:
                         accepted_render["audit_payload"] = dict(audit_payload) if isinstance(audit_payload, Mapping) else audit_payload
                         accepted_render["audit_history"] = [dict(item) for item in audit_history]
+                    should_block_for_repair = _should_block_live_preview_for_audit_retry(audit_payload)
                     repaired_args = _repair_visual_args_from_audit(render_args, audit_payload)
                     if repaired_args is None or repair_attempt >= 1:
+                        break
+                    if not should_block_for_repair:
+                        logger.info(
+                            "Scene visual audit noted live repair ideas for session %s, but skipped the blocking retry to keep page turns responsive.",
+                            session_id,
+                        )
                         break
                     logger.info(
                         "Scene visual audit requested one repair retry for session %s: %s",
@@ -3437,6 +3790,7 @@ async def _run_visual_pipeline(
                             },
                         },
                     )
+                    preview_published = True
                     _gen_publish_total = int((time.monotonic() - _pipeline_t0) * 1000)
                     logger.info("⏱️ TIMING [pipeline] PUBLISHED (Base64) | total_ms=%d | session=%s", _gen_publish_total, session_id)
         except Exception as b64_exc:
@@ -3493,7 +3847,11 @@ async def _run_visual_pipeline(
             )
             if cloud_still_url:
                 still_url = cloud_still_url
-            if session_id and (cloud_still_url or gcs_uri):
+            if session_id and (cloud_still_url or gcs_uri) and _should_persist_uploaded_scene_asset(
+                session_id=session_id,
+                superseded_render=superseded_render,
+                preview_published=preview_published,
+            ):
                 _persist_uploaded_scene_asset(
                     session_id=session_id,
                     description=public_scene_description,
@@ -3507,12 +3865,21 @@ async def _run_visual_pipeline(
                     request_id=args.request_id,
                     preview_image_url=still_url,
                 )
+            elif session_id and (cloud_still_url or gcs_uri):
+                logger.info(
+                    "Skipping scene asset persistence for session %s because a newer page replaced it before this still was shown.",
+                    session_id,
+                )
             _upload_ms = int((time.monotonic() - _upload_t0) * 1000)
             logger.info("⏱️ TIMING [pipeline] GCS UPLOAD COMPLETE | upload_ms=%d | session=%s", _upload_ms, session_id)
         except Exception as exc:
             _upload_ms = int((time.monotonic() - _upload_t0) * 1000)
             logger.warning("⏱️ TIMING [pipeline] GCS UPLOAD FAILED after %dms: %s", _upload_ms, exc)
-            if session_id and still_url:
+            if session_id and still_url and _should_persist_uploaded_scene_asset(
+                session_id=session_id,
+                superseded_render=superseded_render,
+                preview_published=preview_published,
+            ):
                 _persist_uploaded_scene_asset(
                     session_id=session_id,
                     description=public_scene_description,
@@ -3525,6 +3892,11 @@ async def _run_visual_pipeline(
                     focused_character_references=focused_character_references,
                     request_id=args.request_id,
                     preview_image_url=still_url,
+                )
+            elif session_id and still_url:
+                logger.info(
+                    "Skipping fallback scene asset persistence for session %s because a newer page replaced it before this still was shown.",
+                    session_id,
                 )
 
         if not still_url:
@@ -3565,6 +3937,20 @@ async def _run_visual_pipeline(
                 _session_pending[session_id] = args.model_copy(
                     update={"quota_retry_count": args.quota_retry_count + 1}
                 )
+                publish_session_event(
+                    session_id,
+                    {
+                        "type": "video_ready",
+                        "payload": {
+                            "url": _build_fallback_scene_svg_data_url(public_scene_description or args.description),
+                            "description": public_scene_description,
+                            "storybeat_text": storybeat_text,
+                            "media_type": "image",
+                            "is_placeholder": True,
+                            "request_id": args.request_id,
+                        },
+                    },
+                )
                 logger.warning(
                     "Deferring scene generation after quota backpressure for session %s; retry #%d scheduled after %.1fs",
                     session_id,
@@ -3590,7 +3976,7 @@ async def _run_visual_pipeline(
         )
         if session_id and session_id not in _session_cancel_current and not retry_scheduled:
             payload = {
-                "url": _build_fallback_scene_svg_data_url(public_scene_description or args.description),
+                "url": _build_fallback_scene_card_data_url(public_scene_description or args.description),
                 "description": public_scene_description,
                 "storybeat_text": storybeat_text,
                 "media_type": "image",
@@ -4042,37 +4428,7 @@ def _render_storybook_cinematic_segment(
 
 
 def _clean_storybook_title(raw: str) -> str:
-    title = (raw or "").strip()
-    if not title or title.lower() == "auto":
-        return ""
-    if "sdk_http_response" in title.lower() or "candidates=[" in title.lower():
-        return ""
-    title = re.sub(r"^(title|story)\s*[:\-]\s*", "", title, flags=re.IGNORECASE)
-    title = title.strip().strip("\"'`")
-    title = re.sub(r"\s+", " ", title).strip()
-    if re.search(r"reading\s+rainbow", title, re.IGNORECASE):
-        return ""
-    weak_leads = {"what", "where", "when", "why", "how", "let", "lets", "can"}
-    generic_nouns = {
-        "drawing", "image", "picture", "illustration", "scene", "page", "story", "book", "adventure"
-    }
-    words = title.split()
-    if len(words) > 8:
-        title = " ".join(words[:8])
-        words = title.split()
-    lowered_words = [
-        re.sub(r"[^a-z']", "", word.lower())
-        for word in words
-        if re.sub(r"[^a-z']", "", word.lower())
-    ]
-    content_words = [word for word in lowered_words if word not in {"a", "an", "the", "and", "of"}]
-    if not content_words:
-        return ""
-    if content_words[0] in weak_leads and all(word in generic_nouns or word in weak_leads for word in content_words[1:]):
-        return ""
-    if all(word in generic_nouns or word in weak_leads for word in content_words):
-        return ""
-    return title
+    return shared_clean_storybook_title(raw)
 
 
 def _heuristic_storybook_title(
@@ -4080,44 +4436,54 @@ def _heuristic_storybook_title(
     story_summary: str,
     child_name: str,
 ) -> str:
-    text = " ".join(scene_descriptions) + " " + (story_summary or "")
-    words = re.findall(r"[A-Za-z']{4,}", text)
-    stopwords = {
-        "this", "that", "with", "from", "they", "them", "were", "where", "when", "then",
-        "there", "their", "your", "have", "into", "over", "under", "across", "about",
-        "story", "book", "books", "child", "little", "gentle", "glowing", "bright",
-        "light", "magic", "magical", "soft", "warm", "night", "cloud", "clouds",
-        "reading", "rainbow", "disney", "pixar", "friend", "what", "where", "when",
-        "why", "how", "drawing", "image", "picture", "illustration", "scene", "page",
-        "pages", "show", "shows",
-    }
-    counts = Counter(w.lower() for w in words if w.lower() not in stopwords)
-    top = [w.title() for w, _ in counts.most_common(3)]
-    if len(top) >= 2:
-        return f"{top[0]} and the {top[1]}"
-    if len(top) == 1:
-        return f"The {top[0]} Story"
-    clean_child_name = (child_name or "").strip()
-    if clean_child_name and clean_child_name.lower() != "friend":
-        suffix = "'" if clean_child_name.endswith(("s", "S")) else "'s"
-        return f"{clean_child_name}{suffix} Story"
-    return "A Storybook Adventure"
+    return shared_heuristic_storybook_title(scene_descriptions, story_summary, child_name)
+
+
+def _generate_storybook_title(
+    scene_descriptions: list[str],
+    story_summary: str,
+    child_name: str,
+) -> str:
+    if not _env_enabled("ENABLE_STORYBOOK_TITLE_LLM", default=True):
+        return _heuristic_storybook_title(scene_descriptions, story_summary, child_name)
+
+    model = os.environ.get("STORYBOOK_TITLE_MODEL", "").strip() or "gemini-2.5-flash"
+    prompt = shared_build_storybook_title_prompt(scene_descriptions, story_summary, child_name)
+    try:
+        client = _build_google_genai_client()
+        response = client.models.generate_content(
+            model=model,
+            contents=[prompt],
+            config=google_genai.types.GenerateContentConfig(
+                temperature=0.7,
+                max_output_tokens=16,
+            ),
+        )
+    except Exception as exc:
+        logger.warning("Storybook title generation failed: %s", exc)
+        return _heuristic_storybook_title(scene_descriptions, story_summary, child_name)
+
+    text = _extract_response_text(response)
+    title = shared_validate_storybook_title(text, scene_descriptions, story_summary, child_name)
+    if title:
+        return title
+    return _heuristic_storybook_title(scene_descriptions, story_summary, child_name)
 
 
 def _resolve_storybook_title(state: dict[str, Any]) -> str:
+    scene_descriptions = list(state.get("scene_descriptions", []) or [])
+    story_summary = str(state.get("story_summary", "")).strip()
+    child_name = str(state.get("child_name", "")).strip()
     raw_title = str(
         state.get("story_title")
         or state.get("title")
         or os.environ.get("STORYBOOK_TITLE", "")
     ).strip()
-    title = _clean_storybook_title(raw_title)
-    if title:
-        return title
-    return _heuristic_storybook_title(
-        list(state.get("scene_descriptions", []) or []),
-        str(state.get("story_summary", "")).strip(),
-        str(state.get("child_name", "")).strip(),
-    )
+    title = shared_validate_storybook_title(raw_title, scene_descriptions, story_summary, child_name)
+    if not title:
+        title = _generate_storybook_title(scene_descriptions, story_summary, child_name)
+    state["story_title"] = title
+    return title
 
 
 def _storybook_title_overlay_filters(title: str) -> list[str]:
@@ -5582,7 +5948,7 @@ def _lyria_generate_music_sync(
     seed: int | None = None,
 ) -> tuple[bytes, str] | None:
     project = os.environ.get("GOOGLE_CLOUD_PROJECT", "").strip()
-    location = os.environ.get("GOOGLE_CLOUD_LOCATION", "us-central1").strip() or "us-central1"
+    location = _vertex_ai_location()
     if not project or not prompt:
         return None
     try:
@@ -7624,6 +7990,44 @@ async def sync_room_lights(
         tool_context=tool_context,
         enforce_cooldown=True,
         remember_last_color=True,
+        record_scene_metadata=True,
+    )
+
+
+async def set_room_lights(
+    color_request: str,
+    scene_description: str = "",
+    tool_context: ToolContext | None = None,
+) -> str:
+    """Sets room lights from a kid-friendly color phrase without touching story scene metadata."""
+    args = RoomLightRequestArgs(
+        color_request=str(color_request or "").strip(),
+        scene_description=str(scene_description or "").strip(),
+    )
+    try:
+        hex_color, brightness, transition = _resolve_named_room_light_request(args.color_request)
+    except ValueError as exc:
+        return f"System: {exc}"
+
+    tool_state = _load_tool_state(tool_context)
+    assembly_status = str(tool_state.get("assembly_status", "") or "").strip().lower()
+    manual_scene_description = args.scene_description
+    if not manual_scene_description:
+        if assembly_status in {"assembling", "reviewing_storyboard"}:
+            manual_scene_description = f"Manual waiting-room light request: {args.color_request}"
+        else:
+            manual_scene_description = f"Manual light request: {args.color_request}"
+
+    return await _sync_room_lights_impl(
+        hex_color=hex_color,
+        scene_description=manual_scene_description,
+        tool_context=tool_context,
+        enforce_cooldown=True,
+        remember_last_color=True,
+        brightness=brightness,
+        transition=transition,
+        cue_source="manual_child_request",
+        record_scene_metadata=False,
     )
 
 
@@ -7637,6 +8041,7 @@ async def _sync_room_lights_impl(
     brightness: Any | None = None,
     transition: Any | None = None,
     cue_source: str = "tool_sync",
+    record_scene_metadata: bool = True,
 ) -> str:
     """Internal light-sync helper so heuristic scene cues can bypass cooldown."""
     args = LightArgs(hex_color=hex_color.strip(), scene_description=scene_description.strip())
@@ -7666,7 +8071,7 @@ async def _sync_room_lights_impl(
             resolved_transition = 2.0
     resolved_transition = max(0.4, min(resolved_transition, 3.0))
 
-    if session_id or tool_context is not None:
+    if record_scene_metadata and (session_id or tool_context is not None):
         _remember_scene_lighting_command(
             tool_context,
             session_id,

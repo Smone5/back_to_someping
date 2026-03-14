@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import html
 import re
 import unicodedata
 from typing import Any
 
 _CTRL_TOKEN_RE = re.compile(r"<ctrl\d+>", flags=re.IGNORECASE)
+_HTML_TAG_RE = re.compile(r"<[^>]+>")
 _LABEL_RE = re.compile(r"^(caption|storybeat|scene)\s*:\s*", flags=re.IGNORECASE)
 _DECORATIVE_RE = re.compile(r"[✨🌟💫🎵🎶🪄🔊⏹️▶️]+")
 _CHOICE_PROMPT_RE = re.compile(
@@ -17,6 +19,8 @@ _PLACEHOLDER_STORYBEAT_RE = re.compile(
     r"^(?:"
     r"(?:(?:sure|okay|ok|great|wonderful)[!,. ]+\s*)?here(?:'s| is)\s+(?:the\s+)?(?:illustration|image|picture|page|caption)\b.*"
     r"|(?:(?:sure|okay|ok|great|wonderful)[!,. ]+\s*)?here(?:'s| is)\s+(?:(?:a|an|the)\s+)?(?:(?:[\w']+(?:-[\w']+)?\s+){0,6})?(?:illustration|image|picture|page|caption)\s*[.!?]?"
+    r"|(?:(?:sure|okay|ok|great|wonderful)[!,. ]+\s*)?here(?:'s| is)\s+(?:(?:a|an|the)\s+)?(?:(?:[\w']+(?:-[\w']+)?\s+){0,8})?(?:you|we)\s+(?:described|imagined|asked(?:\s+for)?|requested|wanted)\b.*"
+    r"|(?:(?:sure|okay|ok|great|wonderful)[!,. ]+\s*)?here(?:'s| is)\s+what\s+you\s+(?:described|imagined|asked(?:\s+for)?|requested|wanted)\b.*"
     r"|this\s+(?:illustration|image|picture|page)\s+(?:shows|has|is)\b.*"
     r"|.*\bfor\s+your\s+story\b.*"
     r")$",
@@ -28,6 +32,19 @@ _META_STORY_PREFIX_RE = re.compile(
     r"(?:(?:a|an|the)\s+)?"
     r"(?:(?:[\w']+(?:-[\w']+)?\s+){0,6})?"
     r"(?:illustration|image|picture|page|caption)\s*(?::|-)\s*",
+    flags=re.IGNORECASE,
+)
+_META_REQUEST_PREFIX_RE = re.compile(
+    r"^(?:(?:sure|okay|ok|great|wonderful)[!,. ]+\s*)?"
+    r"here(?:'s| is)\s+"
+    r"(?:(?:a|an|the)\s+)?"
+    r"(?:(?:[\w']+(?:-[\w']+)?\s+){0,8})?"
+    r"(?:you|we)\s+(?:described|imagined|asked(?:\s+for)?|requested|wanted)\s*(?::|-)\s*",
+    flags=re.IGNORECASE,
+)
+_META_WHAT_YOU_PREFIX_RE = re.compile(
+    r"^(?:(?:sure|okay|ok|great|wonderful)[!,. ]+\s*)?"
+    r"here(?:'s| is)\s+what\s+you\s+(?:described|imagined|asked(?:\s+for)?|requested|wanted)\s*(?::|-)\s*",
     flags=re.IGNORECASE,
 )
 _CONVERSATIONAL_STORYBEAT_RE = re.compile(
@@ -330,12 +347,18 @@ def _finalize_storybeat_candidate(candidate: str, *, max_chars: int) -> str:
 
 
 def clean_story_text(text: Any) -> str:
-    normalized = unicodedata.normalize("NFKC", str(text or "")).translate(_PUNCT_TRANSLATION)
+    normalized = html.unescape(
+        unicodedata.normalize("NFKC", str(text or "")).translate(_PUNCT_TRANSLATION)
+    )
     normalized = _strip_invisible_and_odd_chars(normalized)
     if not normalized:
         return ""
     normalized = _CTRL_TOKEN_RE.sub(" ", normalized)
+    normalized = _HTML_TAG_RE.sub(" ", normalized)
     normalized = _LABEL_RE.sub("", normalized.strip())
+    normalized = _META_STORY_PREFIX_RE.sub("", normalized)
+    normalized = _META_REQUEST_PREFIX_RE.sub("", normalized)
+    normalized = _META_WHAT_YOU_PREFIX_RE.sub("", normalized)
     normalized = _DECORATIVE_RE.sub(" ", normalized)
     normalized = _CHOICE_PROMPT_RE.sub("", normalized)
     normalized = re.sub(r"\s+", " ", normalized)

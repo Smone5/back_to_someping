@@ -78,6 +78,20 @@ class StoryContinuityTests(unittest.TestCase):
         self.assertIn("Santa's workshop", state["continuity_registry_text"])
         self.assertIn("Current place: Santa's workshop", state["continuity_world_state_text"])
 
+    def test_voice_toy_request_does_not_create_conversational_prop_label(self) -> None:
+        state: dict[str, object] = {}
+        ensure_story_continuity_state(state)
+
+        update_continuity_from_child_utterance(
+            state,
+            "Can my toy come with us along the journey? His name's Lion-O from Thundercats. Can he come, too?",
+        )
+
+        world = state["continuity_world_state"]
+        self.assertEqual(list(world.get("pending_prop_keys", []) or []), [])
+        self.assertNotIn("Can my toy", state["continuity_registry_text"])
+        self.assertNotIn("like Can my toy", state["continuity_world_state_text"])
+
     def test_focus_request_stays_inside_current_room(self) -> None:
         state: dict[str, object] = {
             "current_scene_visual_summary": (
@@ -151,6 +165,94 @@ class StoryContinuityTests(unittest.TestCase):
         self.assertFalse(decision.should_render)
         self.assertEqual(decision.reason, "same_location_minor_beat")
 
+    def test_initial_placeholder_scene_still_allows_first_page_render(self) -> None:
+        state: dict[str, object] = {
+            "current_scene_description": "No image yet — the story is just beginning!"
+        }
+        ensure_story_continuity_state(state)
+
+        update_continuity_from_child_utterance(
+            state,
+            "Can we go on an adventure to Candyland?",
+        )
+        result = validate_live_scene_request(
+            state,
+            "A whimsical Candyland forest with lollipop trees, candy-cane paths, and a chocolate river.",
+        )
+        decision = should_render_new_scene_page(
+            state,
+            result.resolved_description,
+            target_location_label=result.location_label,
+        )
+
+        self.assertTrue(decision.should_render)
+        self.assertEqual(decision.reason, "first_page")
+
+    def test_same_location_new_character_and_presents_force_new_page(self) -> None:
+        state: dict[str, object] = {}
+        ensure_story_continuity_state(state)
+        record_continuity_scene(
+            state,
+            description=(
+                "Inside the secret room of the licorice castle, a winding candy staircase ends beside "
+                "a cozy white couch and swirly wallpaper."
+            ),
+            storybeat_text="The secret room waits at the top of the winding candy staircase.",
+            scene_number=1,
+        )
+        world = state["continuity_world_state"]
+        world["current_location_key"] = "secret_room"
+        world["current_location_label"] = "secret room"
+
+        update_continuity_from_child_utterance(
+            state,
+            "Can we see Santa in the secret room with presents?",
+        )
+        result = validate_live_scene_request(
+            state,
+            "Inside the secret room of the licorice castle, Santa smiles beside a pile of wrapped presents.",
+        )
+        decision = should_render_new_scene_page(
+            state,
+            result.resolved_description,
+            target_location_label=result.location_label,
+        )
+
+        self.assertIn("Santa", result.resolved_description)
+        self.assertTrue(decision.should_render)
+        self.assertEqual(decision.reason, "new_character_reveal_same_location")
+
+    def test_current_scene_detail_question_stays_on_current_page(self) -> None:
+        state: dict[str, object] = {
+            "current_scene_visual_summary": (
+                "In Candy Land, giant frosted cupcakes sit beside the chocolate river while the rainbow path curls onward."
+            )
+        }
+        ensure_story_continuity_state(state)
+        record_continuity_scene(
+            state,
+            description=(
+                "In Candy Land, giant frosted cupcakes sit beside the chocolate river while the rainbow path curls onward."
+            ),
+            storybeat_text="Big frosted cupcakes rise beside the chocolate river.",
+            visual_summary=str(state["current_scene_visual_summary"]),
+            scene_number=1,
+        )
+
+        update_continuity_from_child_utterance(state, "What are the cupcakes like on this page?")
+        result = validate_live_scene_request(
+            state,
+            "A close-up of giant pink-frosted cupcakes with sprinkles beside the chocolate river in Candy Land.",
+        )
+        decision = should_render_new_scene_page(
+            state,
+            result.resolved_description,
+            target_location_label=result.location_label,
+        )
+
+        self.assertFalse(decision.should_render)
+        self.assertEqual(decision.reason, "current_scene_detail_chat")
+
     def test_explicit_visual_request_allows_same_location_redraw(self) -> None:
         state: dict[str, object] = {}
         ensure_story_continuity_state(state)
@@ -174,6 +276,67 @@ class StoryContinuityTests(unittest.TestCase):
 
         self.assertTrue(decision.should_render)
         self.assertEqual(decision.reason, "explicit_visual_request")
+        self.assertEqual(decision.reason, "explicit_visual_request")
+
+    def test_what_does_it_look_like_is_not_automatic_redraw_without_visual_ask(self) -> None:
+        state: dict[str, object] = {
+            "current_scene_description": (
+                "Inside Candy Land, giant cupcakes sparkle under a sunny sky beside a chocolate river."
+            ),
+            "current_scene_visual_summary": (
+                "Inside Candy Land, giant cupcakes sparkle under a sunny sky beside a chocolate river."
+            )
+        }
+        ensure_story_continuity_state(state)
+        record_continuity_scene(
+            state,
+            description="Inside Candy Land, giant cupcakes sparkle under a sunny sky beside a chocolate river.",
+            storybeat_text="The cupcake hills sparkle in Candy Land.",
+            visual_summary=str(state["current_scene_visual_summary"]),
+            scene_number=1,
+        )
+
+        update_continuity_from_child_utterance(state, "What do the cupcakes look like?")
+        result = validate_live_scene_request(
+            state,
+            "A close-up of the same giant cupcakes in Candy Land beside the chocolate river.",
+        )
+        decision = should_render_new_scene_page(
+            state,
+            result.resolved_description,
+            target_location_label=result.location_label,
+        )
+
+        self.assertFalse(decision.should_render)
+        self.assertEqual(decision.reason, "current_scene_detail_chat")
+
+    def test_same_room_get_closer_request_still_allows_new_page(self) -> None:
+        state: dict[str, object] = {
+            "current_scene_visual_summary": (
+                "Inside Santa's workshop, Santa's chair sits beside wrapped gifts and glowing lanterns."
+            )
+        }
+        ensure_story_continuity_state(state)
+        record_continuity_scene(
+            state,
+            description="Inside Santa's workshop, Santa's chair sits beside wrapped gifts and glowing lanterns.",
+            storybeat_text="Santa's chair glows warmly in the workshop.",
+            visual_summary=str(state["current_scene_visual_summary"]),
+            scene_number=1,
+        )
+
+        update_continuity_from_child_utterance(state, "Can I get closer to Santa's chair?")
+        result = validate_live_scene_request(
+            state,
+            "A closer view of Santa's chair in the same warm workshop beside wrapped gifts and lanterns.",
+        )
+        decision = should_render_new_scene_page(
+            state,
+            result.resolved_description,
+            target_location_label=result.location_label,
+        )
+
+        self.assertTrue(decision.should_render)
 
     def test_structural_transition_allows_new_page_in_same_place(self) -> None:
         state: dict[str, object] = {}
@@ -251,6 +414,56 @@ class StoryContinuityTests(unittest.TestCase):
         self.assertTrue(decision.should_render)
         self.assertEqual(decision.reason, "pending_location_change")
         self.assertNotIn("Treat this as the same place from a new angle", result.prompt_suffix)
+
+    def test_generic_destination_phrase_captures_unlisted_fantasy_place(self) -> None:
+        state: dict[str, object] = {}
+        ensure_story_continuity_state(state)
+
+        update_continuity_from_child_utterance(
+            state,
+            "Can we go to a Candy Land with a chocolate river?",
+        )
+
+        self.assertEqual(
+            state["continuity_world_state"]["pending_location_label"],
+            "Candy Land",
+        )
+
+    def test_generic_destination_phrase_forces_new_scene_for_chocolate_ocean(self) -> None:
+        state: dict[str, object] = {}
+        ensure_story_continuity_state(state)
+        update_continuity_from_child_utterance(
+            state,
+            "Can we go to a Candy Land with a chocolate river?",
+        )
+        record_continuity_scene(
+            state,
+            description=(
+                "In Candy Land, a little candy swirl boat floats along a sparkling chocolate river "
+                "past lollipop trees and gummy bear bushes."
+            ),
+            storybeat_text="The candy swirl boat floats gently down the sparkling chocolate river.",
+            scene_number=1,
+        )
+
+        update_continuity_from_child_utterance(state, "Let's go to the chocolate ocean.")
+        result = validate_live_scene_request(
+            state,
+            "At the edge of a wide chocolate ocean, candy waves shimmer under caramel clouds.",
+        )
+        decision = should_render_new_scene_page(
+            state,
+            result.resolved_description,
+            target_location_label=result.location_label,
+        )
+
+        self.assertEqual(
+            state["continuity_world_state"]["pending_location_label"],
+            "chocolate ocean",
+        )
+        self.assertEqual(result.location_label, "chocolate ocean")
+        self.assertTrue(decision.should_render)
+        self.assertEqual(decision.reason, "pending_location_change")
 
     def test_opposite_direction_request_forces_new_page_even_if_castle_is_still_mentioned(self) -> None:
         state: dict[str, object] = {"child_age_band": "4-5"}

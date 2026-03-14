@@ -77,12 +77,14 @@ class LiveImageQueueTests(unittest.TestCase):
         tools._session_generating.clear()
         tools._session_cancel_current.clear()
         tools._session_image_backoff_until.clear()
+        ws_router._pending_image_events.clear()
 
     def tearDown(self) -> None:
         tools._session_pending.clear()
         tools._session_generating.clear()
         tools._session_cancel_current.clear()
         tools._session_image_backoff_until.clear()
+        ws_router._pending_image_events.clear()
 
     def test_detects_newer_pending_scene_request(self) -> None:
         tools._session_pending["session-a"] = tools.VisualArgs(
@@ -104,6 +106,28 @@ class LiveImageQueueTests(unittest.TestCase):
             request_id="queued-request",
         )
         self.assertTrue(tools._queued_newer_scene_request("session-a", ""))
+
+    def test_unshown_superseded_scene_does_not_persist_to_movie(self) -> None:
+        tools._session_cancel_current.add("session-a")
+
+        self.assertFalse(
+            tools._should_persist_uploaded_scene_asset(
+                session_id="session-a",
+                superseded_render=True,
+                preview_published=False,
+            )
+        )
+
+    def test_visible_scene_can_still_persist_after_follow_up_queue(self) -> None:
+        tools._session_cancel_current.add("session-a")
+
+        self.assertTrue(
+            tools._should_persist_uploaded_scene_asset(
+                session_id="session-a",
+                superseded_render=True,
+                preview_published=True,
+            )
+        )
 
     def test_queue_latest_scene_follow_up_request_keeps_latest_child_wish(self) -> None:
         state = {}
@@ -151,6 +175,39 @@ class LiveImageQueueTests(unittest.TestCase):
 
         self.assertEqual(queued, "")
         self.assertEqual(state["queued_scene_child_utterance"], "Let's climb up to the dragon.")
+
+    def test_scene_render_still_in_flight_after_tool_call_tracks_event_state(self) -> None:
+        state = {
+            "pending_scene_description": "A dark licorice castle rises above the candy path.",
+            "pending_scene_base_description": "A dark licorice castle rises above the candy path.",
+        }
+        ws_router._pending_image_events["session-a"] = asyncio.Event()
+
+        self.assertTrue(
+            ws_router._scene_render_still_in_flight_after_tool_call("session-a", state)
+        )
+
+        ws_router._pending_image_events["session-a"].set()
+
+        self.assertFalse(
+            ws_router._scene_render_still_in_flight_after_tool_call("session-a", state)
+        )
+
+    def test_scene_render_still_in_flight_after_tool_call_falls_back_to_pending_scene_metadata(self) -> None:
+        state = {
+            "pending_scene_description": "A dark licorice castle rises above the candy path.",
+            "pending_scene_base_description": "",
+        }
+
+        self.assertTrue(
+            ws_router._scene_render_still_in_flight_after_tool_call("session-a", state)
+        )
+
+        state["pending_scene_description"] = ""
+
+        self.assertFalse(
+            ws_router._scene_render_still_in_flight_after_tool_call("session-a", state)
+        )
 
     def test_promote_pending_scene_request_to_current_updates_visible_scene(self) -> None:
         state = {
@@ -269,6 +326,97 @@ class LiveImageQueueTests(unittest.TestCase):
         self.assertEqual(state["pending_scene_base_description"], "")
         self.assertFalse(state["scene_render_pending"])
 
+    def test_fallback_scene_request_can_promote_finished_image_to_current_scene(self) -> None:
+        state = {
+            "current_scene_description": "Candy Land with lollipop trees.",
+            "current_scene_base_description": "Candy Land with lollipop trees.",
+            "current_scene_storybeat_text": "We walk along the candy path.",
+            "pending_scene_description": "",
+            "pending_scene_base_description": "",
+            "scene_render_pending": True,
+        }
+
+        ws_router._prime_pending_scene_request(
+            state,
+            request_id="req-castle",
+            description="A dark castle with lightning above the hills.",
+        )
+        ws_router._apply_nonpersistent_scene_ready_to_state(
+            state,
+            request_id="req-castle",
+            looks_like_image=True,
+            is_fallback=False,
+            description="A dark castle with lightning above the hills.",
+            storybeat_text="A dark castle crackles ahead in the stormy sky.",
+        )
+
+        self.assertEqual(state["active_scene_request_id"], "req-castle")
+        self.assertEqual(state["current_scene_description"], "A dark castle with lightning above the hills.")
+        self.assertEqual(state["current_scene_base_description"], "A dark castle with lightning above the hills.")
+        self.assertEqual(state["current_scene_storybeat_text"], "A dark castle crackles ahead in the stormy sky.")
+        self.assertEqual(state["pending_scene_description"], "")
+        self.assertEqual(state["pending_scene_base_description"], "")
+        self.assertFalse(state["scene_render_pending"])
+
+    def test_apply_nonpersistent_scene_ready_appends_preview_page_history(self) -> None:
+        state = {
+            "active_scene_request_id": "req-castle",
+            "current_scene_description": "Candy path winding toward a licorice castle.",
+            "current_scene_base_description": "Candy path winding toward a licorice castle.",
+            "current_scene_storybeat_text": "We follow the candy path toward the spooky castle.",
+            "pending_scene_description": "Inside the licorice castle, a glowing candy hall.",
+            "pending_scene_base_description": "Inside the licorice castle, a glowing candy hall.",
+            "story_pages": [
+                {
+                    "scene_number": 1,
+                    "request_id": "req-path",
+                    "scene_description": "Candy path winding toward a licorice castle.",
+                    "storybeat_text": "We follow the candy path toward the spooky castle.",
+                    "image_url": "https://example.com/candy-path.png",
+                    "gcs_uri": "gs://storybook/candy-path.png",
+                },
+            ],
+            "scene_branch_points": [
+                {
+                    "scene_number": 1,
+                    "request_id": "req-path",
+                    "label": "We follow the candy path toward the spooky castle.",
+                    "scene_description": "Candy path winding toward a licorice castle.",
+                    "storybeat_text": "We follow the candy path toward the spooky castle.",
+                    "image_url": "https://example.com/candy-path.png",
+                    "gcs_uri": "gs://storybook/candy-path.png",
+                },
+            ],
+            "scene_render_pending": True,
+        }
+
+        ws_router._apply_nonpersistent_scene_ready_to_state(
+            state,
+            request_id="req-castle",
+            looks_like_image=True,
+            is_fallback=False,
+            description="Inside the licorice castle, a glowing candy hall.",
+            storybeat_text="Inside the licorice castle, the candy hall glows with warm lanterns.",
+        )
+
+        self.assertEqual(len(state["story_pages"]), 2)
+        self.assertEqual(state["story_pages"][-1]["scene_number"], 2)
+        self.assertEqual(state["story_pages"][-1]["request_id"], "req-castle")
+        self.assertEqual(state["story_pages"][-1]["image_url"], "")
+        self.assertEqual(
+            state["story_pages"][-1]["storybeat_text"],
+            "Inside the licorice castle, the candy hall glows with warm lanterns.",
+        )
+        self.assertEqual(len(state["scene_branch_points"]), 2)
+        self.assertEqual(state["scene_branch_points"][-1]["scene_number"], 2)
+        self.assertEqual(state["scene_branch_points"][-1]["request_id"], "req-castle")
+        self.assertEqual(state["current_scene_description"], "Inside the licorice castle, a glowing candy hall.")
+        self.assertEqual(
+            state["current_scene_storybeat_text"],
+            "Inside the licorice castle, the candy hall glows with warm lanterns.",
+        )
+        self.assertFalse(state["scene_render_pending"])
+
     def test_public_scene_description_prefers_base_description(self) -> None:
         args = tools.VisualArgs(
             description=(
@@ -349,6 +497,139 @@ class LiveImageQueueTests(unittest.TestCase):
         payload = published_events[0]["payload"]
         self.assertEqual(payload["description"], "Moon. Aaron stands on a glowing sugar-cookie moon.")
         self.assertFalse(bool(payload.get("is_fallback")))
+
+    def test_run_visual_pipeline_skips_blocking_retry_for_noncritical_live_audit(self) -> None:
+        published_events: list[dict[str, object]] = []
+        generate_call_count = 0
+
+        def _fake_generate_scene_still(*args, **kwargs):
+            nonlocal generate_call_count
+            generate_call_count += 1
+            return (b"good-image", "image/jpeg", "Aaron stands by the licorice castle.")
+
+        def _schedule_background_task(coro):
+            try:
+                coro.close()
+            except Exception:
+                pass
+
+        with (
+            patch.dict(os.environ, {"GOOGLE_CLOUD_PROJECT": "test-project"}, clear=False),
+            patch.object(tools, "_generate_scene_still", side_effect=_fake_generate_scene_still),
+            patch.object(
+                tools,
+                "_audit_scene_visual_continuity",
+                new=AsyncMock(
+                    return_value={
+                        "status": "repair",
+                        "should_retry": True,
+                        "repair_prompt_suffix": "Make the black licorice towers and candy sky more obvious.",
+                        "issues": [
+                            {
+                                "severity": "major",
+                                "kind": "character_palette_drift",
+                                "issue": "The colors drifted a little from the established palette.",
+                            }
+                        ],
+                    }
+                ),
+            ),
+            patch.object(tools, "_encode_transport_image", return_value=(b"encoded-image", "image/jpeg")),
+            patch.object(tools, "_describe_scene_image_for_continuity", new=AsyncMock(return_value="Licorice castle under a candy sky.")),
+            patch.object(tools, "_detect_character_reference_crops", new=AsyncMock(return_value=[])),
+            patch.object(tools, "_upload_scene_still", return_value=("https://example.com/castle.jpg", "gs://storybook/castle.jpg")),
+            patch.object(tools, "_persist_uploaded_scene_asset"),
+            patch.object(tools, "_make_thumbnail_b64", return_value=None),
+            patch.object(tools, "build_scene_visual_audit_feedback_signal", return_value=None),
+            patch.object(tools, "record_prompt_feedback"),
+            patch.object(tools, "publish_session_event", side_effect=lambda session_id, event: published_events.append(event)),
+            patch.object(tools, "schedule_background_task", side_effect=_schedule_background_task),
+            patch.object(tools, "_veo_enabled", return_value=False),
+        ):
+            asyncio.run(
+                tools._run_visual_pipeline(
+                    args=tools.VisualArgs(
+                        description=(
+                            "Licorice castle. Aaron stands by a big black licorice castle under a swirling candy sky. "
+                            "Story continuity target: keep this page in or directly connected to licorice castle."
+                        ),
+                        base_description="Licorice castle. Aaron stands by a big black licorice castle under a swirling candy sky.",
+                        request_id="req-castle",
+                    ),
+                    session_id="session-a",
+                )
+            )
+
+        self.assertEqual(generate_call_count, 1)
+        self.assertTrue(published_events)
+        self.assertEqual(published_events[0]["type"], "video_ready")
+
+    def test_run_visual_pipeline_republishes_placeholder_when_quota_retry_is_scheduled(self) -> None:
+        published_events: list[dict[str, object]] = []
+        scheduled_coroutines: list[object] = []
+
+        def _schedule_background_task(coro):
+            scheduled_coroutines.append(coro)
+            try:
+                coro.close()
+            except Exception:
+                pass
+
+        with (
+            patch.dict(os.environ, {"GOOGLE_CLOUD_PROJECT": "test-project"}, clear=False),
+            patch.object(tools, "_generate_scene_still", side_effect=RuntimeError("429 RESOURCE_EXHAUSTED")),
+            patch.object(tools, "record_prompt_feedback"),
+            patch.object(tools, "publish_session_event", side_effect=lambda session_id, event: published_events.append(event)),
+            patch.object(tools, "schedule_background_task", side_effect=_schedule_background_task),
+        ):
+            asyncio.run(
+                tools._run_visual_pipeline(
+                    args=tools.VisualArgs(
+                        description="A dark licorice castle under a swirling candy sky.",
+                        base_description="A dark licorice castle under a swirling candy sky.",
+                        request_id="req-backpressure",
+                    ),
+                    session_id="session-a",
+                )
+            )
+
+        self.assertTrue(published_events)
+        self.assertEqual(published_events[0]["type"], "video_ready")
+        self.assertTrue(bool(published_events[0]["payload"].get("is_placeholder")))
+        self.assertEqual(published_events[0]["payload"].get("request_id"), "req-backpressure")
+        self.assertIn("session-a", tools._session_image_backoff_until)
+        self.assertTrue(scheduled_coroutines)
+
+    def test_run_visual_pipeline_publishes_raster_fallback_after_terminal_quota_failure(self) -> None:
+        published_events: list[dict[str, object]] = []
+
+        with (
+            patch.dict(os.environ, {"GOOGLE_CLOUD_PROJECT": "test-project"}, clear=False),
+            patch.object(tools, "_generate_scene_still", side_effect=RuntimeError("429 RESOURCE_EXHAUSTED")),
+            patch.object(tools, "_build_fallback_scene_card_data_url", return_value="data:image/png;base64,abc123"),
+            patch.object(tools, "record_prompt_feedback"),
+            patch.object(tools, "publish_session_event", side_effect=lambda session_id, event: published_events.append(event)),
+            patch.object(tools, "schedule_background_task"),
+        ):
+            asyncio.run(
+                tools._run_visual_pipeline(
+                    args=tools.VisualArgs(
+                        description="Inside the castle door, Santa waits with presents and candy.",
+                        base_description="Inside the castle door, Santa waits with presents and candy.",
+                        request_id="req-santa-room",
+                        quota_retry_count=1,
+                    ),
+                    session_id="session-a",
+                )
+            )
+
+        self.assertTrue(published_events)
+        self.assertEqual(published_events[0]["type"], "video_ready")
+        payload = published_events[0]["payload"]
+        self.assertTrue(bool(payload.get("is_fallback")))
+        self.assertFalse(bool(payload.get("is_placeholder")))
+        self.assertEqual(payload.get("request_id"), "req-santa-room")
+        self.assertEqual(payload.get("url"), "data:image/png;base64,abc123")
 
 
 if __name__ == "__main__":

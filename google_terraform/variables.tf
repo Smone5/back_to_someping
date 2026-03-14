@@ -11,6 +11,12 @@ variable "region" {
   default     = "us-central1"
 }
 
+variable "vertex_ai_location" {
+  description = "Vertex AI model endpoint location. Use global on pay-as-you-go to reduce shared-capacity 429s."
+  type        = string
+  default     = "global"
+}
+
 variable "domain_name" {
   description = "The custom domain for the Global Load Balancer (e.g. storyteller.example.com)."
   type        = string
@@ -185,6 +191,18 @@ variable "storybook_studio_max_revisions" {
   description = "Maximum studio revision rounds for FFmpeg job planning."
   type        = number
   default     = 1
+}
+
+variable "storybook_scene_render_concurrency" {
+  description = "Maximum parallel scene renders inside the FFmpeg worker. Lower is slower but gentler on shared Vertex capacity."
+  type        = number
+  default     = 1
+}
+
+variable "storybook_tts_concurrency" {
+  description = "Maximum parallel TTS generations inside the FFmpeg worker."
+  type        = number
+  default     = 2
 }
 
 variable "elevenlabs_voice_id" {
