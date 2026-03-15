@@ -138,6 +138,21 @@ _VISUAL_MEMORY_COLOR_WORDS = {
     "orange", "pink", "purple", "rainbow", "red", "silver", "teal", "violet", "white",
     "yellow",
 }
+
+
+def supersede_scene_render(session_id: str | None) -> None:
+    """Marks the current in-flight scene render as stale before a replacement turn."""
+    normalized_session_id = str(session_id or "").strip()
+    if not normalized_session_id:
+        return
+    stale_pending = _session_pending.pop(normalized_session_id, None)
+    if stale_pending is not None:
+        logger.info(
+            "Discarding queued stale scene request for session %s because a replacement turn superseded it.",
+            normalized_session_id,
+        )
+    if normalized_session_id in _session_generating:
+        _session_cancel_current.add(normalized_session_id)
 _VISUAL_MEMORY_TRAIT_WORDS = {
     "brave", "friendly", "glowing", "happy", "little", "playful", "shiny", "silly",
     "sleepy", "smiling", "soft", "sparkly", "tiny", "warm",
@@ -2337,9 +2352,31 @@ def _should_persist_uploaded_scene_asset(
     session_id: str | None,
     superseded_render: bool,
     preview_published: bool,
+    request_id: str | None = None,
 ) -> bool:
     if not session_id:
         return False
+    state = load_storybook_resume_state(session_id)
+    normalized_request_id = str(request_id or "").strip()
+    if normalized_request_id:
+        if str(state.get("pending_scene_replacement_text", "") or "").strip():
+            return False
+        active_request_id = str(state.get("active_scene_request_id", "") or "").strip()
+        if active_request_id and active_request_id == normalized_request_id:
+            pass
+        else:
+            page_match = any(
+                str(page.get("request_id", "") or "").strip() == normalized_request_id
+                for page in _story_pages_from_state(state)
+                if isinstance(page, dict)
+            )
+            branch_match = any(
+                str(point.get("request_id", "") or "").strip() == normalized_request_id
+                for point in list(state.get("scene_branch_points", []) or [])
+                if isinstance(point, dict)
+            )
+            if not page_match and not branch_match:
+                return False
     if not superseded_render and session_id not in _session_cancel_current:
         return True
     return preview_published
@@ -2365,8 +2402,20 @@ def _persist_uploaded_scene_asset(
     state = load_storybook_resume_state(session_id)
     ensure_story_continuity_state(state)
     _ensure_visual_memory_state(state)
-    pages = _story_pages_from_state(state)
     normalized_request_id = str(request_id or "").strip()
+    if not _should_persist_uploaded_scene_asset(
+        session_id=session_id,
+        superseded_render=False,
+        preview_published=True,
+        request_id=normalized_request_id,
+    ):
+        logger.info(
+            "Skipping persisted scene asset for session %s because request %s is no longer current.",
+            session_id,
+            normalized_request_id or "<none>",
+        )
+        return
+    pages = _story_pages_from_state(state)
     target_index = -1
     if normalized_request_id:
         for idx, page in enumerate(pages):
@@ -3218,6 +3267,17 @@ async def generate_scene_visuals(
             state = merged_state
         ensure_story_continuity_state(state)
         _ensure_visual_memory_state(state)
+        pending_replacement_text = str(state.get("pending_scene_replacement_text", "") or "").strip()
+        pending_replacement_phase = str(state.get("pending_scene_replacement_phase", "") or "").strip()
+        if pending_replacement_text and pending_replacement_phase == "awaiting_ack":
+            logger.info(
+                "generate_scene_visuals ignored while waiting for pending replacement acknowledgment for session %s",
+                session_id,
+            )
+            return (
+                "System: Ignore this stale scene tool call. The child already changed destinations and "
+                "the system is waiting for the short spoken acknowledgment before starting the new picture."
+            )
         story_tone = _story_tone_from_state(state)
         base_description = description.strip()
         continuity_validation = validate_live_scene_request(state, base_description)
@@ -3238,11 +3298,18 @@ async def generate_scene_visuals(
             render_in_flight=bool(session_id and session_id in _session_generating),
         )
         if not render_decision.should_render:
+            preserve_inflight_render = bool(session_id and session_id in _session_generating)
             if tool_context and isinstance(getattr(tool_context, "state", None), dict):
-                tool_context.state["scene_render_skipped"] = True
-                tool_context.state["scene_render_pending"] = False
-                tool_context.state["pending_scene_description"] = ""
-                tool_context.state["pending_scene_base_description"] = ""
+                if preserve_inflight_render:
+                    # A stray follow-up tool call can arrive while an earlier page is
+                    # still genuinely drawing. Keep the original pending page intact
+                    # so live interruption/replacement logic can still see it.
+                    tool_context.state["scene_render_skipped"] = False
+                else:
+                    tool_context.state["scene_render_skipped"] = True
+                    tool_context.state["scene_render_pending"] = False
+                    tool_context.state["pending_scene_description"] = ""
+                    tool_context.state["pending_scene_base_description"] = ""
             logger.info(
                 "[generate_scene_visuals] Staying on current page for %s | reason=%s | location=%s",
                 session_id,
@@ -3851,6 +3918,7 @@ async def _run_visual_pipeline(
                 session_id=session_id,
                 superseded_render=superseded_render,
                 preview_published=preview_published,
+                request_id=args.request_id,
             ):
                 _persist_uploaded_scene_asset(
                     session_id=session_id,
@@ -3879,6 +3947,7 @@ async def _run_visual_pipeline(
                 session_id=session_id,
                 superseded_render=superseded_render,
                 preview_published=preview_published,
+                request_id=args.request_id,
             ):
                 _persist_uploaded_scene_asset(
                     session_id=session_id,
@@ -3923,7 +3992,10 @@ async def _run_visual_pipeline(
         logger.info("Skipping stale scene publish for session %s: %s", session_id, exc)
     except Exception as exc:
         retry_scheduled = False
-        if session_id and _is_resource_exhausted_error(exc):
+        superseded_during_failure = bool(
+            session_id and (superseded_render or session_id in _session_cancel_current)
+        )
+        if session_id and _is_resource_exhausted_error(exc) and not superseded_during_failure:
             cooldown_seconds = 2.5
             _session_image_backoff_until[session_id] = time.monotonic() + cooldown_seconds
             if _queued_newer_scene_request(session_id, args.request_id):
@@ -3957,6 +4029,11 @@ async def _run_visual_pipeline(
                     args.quota_retry_count + 1,
                     cooldown_seconds,
                 )
+        elif session_id and _is_resource_exhausted_error(exc) and superseded_during_failure:
+            logger.info(
+                "Skipping quota retry for superseded scene render in session %s because a newer replacement already took over.",
+                session_id,
+            )
         logger.warning("Still image generation failed gracefully: %s", exc, exc_info=True)
         schedule_background_task(
             asyncio.to_thread(

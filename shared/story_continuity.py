@@ -99,6 +99,10 @@ _GENERIC_LOCATION_TRAILING_RE = re.compile(
     r"\b(?:today|tonight|now|next|first|please|instead|again)\b\s*$",
     flags=re.IGNORECASE,
 )
+_NAMED_LOCATION_SUFFIX_RE = re.compile(
+    r"^\s+(?:land|world|kingdom|realm|city|town|village|valley|island|planet|place|park|gardens?)\b",
+    flags=re.IGNORECASE,
+)
 _GENERIC_NON_LOCATION_WORDS = {
     "top",
     "bottom",
@@ -351,7 +355,12 @@ def _canonical_label(text: str) -> str:
     return cleaned[:_MAX_ENTITY_TEXT]
 
 
-def _extract_phrase_candidates(text: str, terms: list[str]) -> list[str]:
+def _extract_phrase_candidates(
+    text: str,
+    terms: list[str],
+    *,
+    skip_named_location_suffix: bool = False,
+) -> list[str]:
     cleaned = _clean_text(text)
     lowered = cleaned.lower()
     matches: list[str] = []
@@ -363,6 +372,8 @@ def _extract_phrase_candidates(text: str, terms: list[str]) -> list[str]:
             flags=re.IGNORECASE,
         )
         for match in pattern.finditer(cleaned):
+            if skip_named_location_suffix and _NAMED_LOCATION_SUFFIX_RE.search(cleaned[match.end():]):
+                continue
             phrase = _canonical_label(match.group(1))
             if phrase and phrase.lower() not in {item.lower() for item in matches}:
                 matches.append(phrase)
@@ -407,7 +418,11 @@ def _extract_location_candidates(text: str) -> list[str]:
 
 
 def _extract_character_candidates(text: str, state: Mapping[str, Any]) -> list[str]:
-    matches = _extract_phrase_candidates(text, _ANIMATE_TERMS)
+    matches = _extract_phrase_candidates(
+        text,
+        _ANIMATE_TERMS,
+        skip_named_location_suffix=True,
+    )
     facts = state.get("character_facts_list", [])
     if isinstance(facts, list):
         for entry in facts:
@@ -446,7 +461,11 @@ def is_meaningful_prop_label(label: str) -> bool:
 def _extract_prop_candidates(text: str) -> list[str]:
     return [
         candidate
-        for candidate in _extract_phrase_candidates(text, _PROP_TERMS)
+        for candidate in _extract_phrase_candidates(
+            text,
+            _PROP_TERMS,
+            skip_named_location_suffix=True,
+        )
         if is_meaningful_prop_label(candidate)
     ]
 

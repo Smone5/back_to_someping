@@ -19,6 +19,10 @@ class LiveRecoveryTests(unittest.TestCase):
         ws_router._opening_phase_sessions.clear()
         ws_router._ending_story_sessions.clear()
         ws_router._watching_final_video_sessions.clear()
+        ws_router._assistant_speaking_sessions.clear()
+        ws_router._interrupted_turn_sessions.clear()
+        ws_router._page_read_aloud_active_sessions.clear()
+        ws_router._page_read_aloud_suppress_until.clear()
 
     def test_clean_close_resumes_during_opening_phase(self) -> None:
         ws_router._opening_phase_sessions.add("session-a")
@@ -61,6 +65,257 @@ class LiveRecoveryTests(unittest.TestCase):
             )
         )
 
+    def test_page_read_aloud_suppression_is_active_while_marked_active(self) -> None:
+        ws_router._set_page_read_aloud_suppression(
+            "session-a",
+            active=True,
+            suppress_for_ms=2500,
+        )
+        self.assertTrue(ws_router._page_read_aloud_suppression_active("session-a"))
+
+    def test_page_read_aloud_suppression_persists_through_cooldown(self) -> None:
+        with mock.patch.object(ws_router.time, "monotonic", side_effect=[100.0, 100.5, 103.0]):
+            ws_router._set_page_read_aloud_suppression(
+                "session-a",
+                active=False,
+                suppress_for_ms=2000,
+            )
+            self.assertTrue(ws_router._page_read_aloud_suppression_active("session-a"))
+            self.assertFalse(ws_router._page_read_aloud_suppression_active("session-a"))
+
+    def test_pending_scene_replacement_always_forces_live_reset(self) -> None:
+        ws_router._assistant_speaking_sessions.discard("session-a")
+        ws_router._interrupted_turn_sessions.discard("session-a")
+        self.assertTrue(ws_router._should_reset_live_for_pending_scene_replacement("session-a"))
+
+    def test_pending_scene_replacement_forces_reset_when_amelia_is_still_speaking(self) -> None:
+        ws_router._assistant_speaking_sessions.add("session-a")
+        try:
+            self.assertTrue(ws_router._should_reset_live_for_pending_scene_replacement("session-a"))
+        finally:
+            ws_router._assistant_speaking_sessions.discard("session-a")
+
+    def test_pending_scene_replacement_forces_reset_when_interrupted_turn_is_still_hot(self) -> None:
+        ws_router._interrupted_turn_sessions.add("session-a")
+        try:
+            self.assertTrue(ws_router._should_reset_live_for_pending_scene_replacement("session-a"))
+        finally:
+            ws_router._interrupted_turn_sessions.discard("session-a")
+
+    def test_pending_scene_replacement_only_barge_ins_when_amelia_is_active(self) -> None:
+        self.assertFalse(ws_router._should_activate_barge_in_for_pending_scene_replacement("session-a"))
+        ws_router._assistant_speaking_sessions.add("session-a")
+        try:
+            self.assertTrue(ws_router._should_activate_barge_in_for_pending_scene_replacement("session-a"))
+        finally:
+            ws_router._assistant_speaking_sessions.discard("session-a")
+
+    def test_pending_scene_replacement_allows_barge_in_during_greeting(self) -> None:
+        ws_router._awaiting_greeting_sessions.add("session-a")
+        try:
+            self.assertTrue(ws_router._should_activate_barge_in_for_pending_scene_replacement("session-a"))
+        finally:
+            ws_router._awaiting_greeting_sessions.discard("session-a")
+
+    def test_pending_scene_replacement_follow_up_keeps_live_output_open(self) -> None:
+        self.assertTrue(
+            ws_router._should_keep_live_open_for_pending_scene_replacement_follow_up(
+                {"pending_scene_replacement_text": "Wait no, Bubble Land."}
+            )
+        )
+        self.assertFalse(
+            ws_router._should_keep_live_open_for_pending_scene_replacement_follow_up(
+                {"pending_scene_replacement_text": ""}
+            )
+        )
+
+    def test_toy_share_story_request_auto_resumes_story(self) -> None:
+        self.assertTrue(
+            ws_router._should_resume_story_from_toy_share(
+                "Can we go to the dark castle now?",
+                {"toy_share_active": True},
+            )
+        )
+
+    def test_toy_share_request_does_not_auto_resume_story(self) -> None:
+        self.assertFalse(
+            ws_router._should_resume_story_from_toy_share(
+                "Can I show you my toy?",
+                {"toy_share_active": True},
+            )
+        )
+
+    def test_pending_scene_replacement_ack_turn_detects_ack_phase(self) -> None:
+        self.assertTrue(
+            ws_router._is_pending_scene_replacement_ack_turn(
+                {
+                    "pending_scene_replacement_text": "Wait no, Bubble Land.",
+                    "pending_scene_replacement_phase": "awaiting_ack",
+                },
+                scene_visuals_called_this_turn=False,
+            )
+        )
+        self.assertFalse(
+            ws_router._is_pending_scene_replacement_ack_turn(
+                {
+                    "pending_scene_replacement_text": "Wait no, Bubble Land.",
+                    "pending_scene_replacement_phase": "awaiting_render",
+                },
+                scene_visuals_called_this_turn=False,
+            )
+        )
+
+    def test_pending_scene_replacement_follow_up_turn_allows_render_ready_phase(self) -> None:
+        self.assertTrue(
+            ws_router._is_pending_scene_replacement_follow_up_turn(
+                {
+                    "pending_scene_replacement_text": "Wait no, Bubble Land.",
+                    "pending_scene_replacement_phase": "awaiting_render",
+                },
+                scene_visuals_called_this_turn=False,
+            )
+        )
+        self.assertFalse(
+            ws_router._is_pending_scene_replacement_follow_up_turn(
+                {
+                    "pending_scene_replacement_text": "Wait no, Bubble Land.",
+                    "pending_scene_replacement_phase": "",
+                },
+                scene_visuals_called_this_turn=False,
+            )
+        )
+
+    def test_pending_scene_replacement_ack_retries_only_for_silent_ack_turn(self) -> None:
+        self.assertTrue(
+            ws_router._should_retry_pending_scene_replacement_ack(
+                {
+                    "pending_scene_replacement_text": "Wait no, Bubble Land.",
+                    "pending_scene_replacement_phase": "awaiting_ack",
+                },
+                had_child_input_this_turn=True,
+                model_emitted_meaningful_output=False,
+                scene_visuals_called_this_turn=False,
+            )
+        )
+        self.assertFalse(
+            ws_router._should_retry_pending_scene_replacement_ack(
+                {
+                    "pending_scene_replacement_text": "Wait no, Bubble Land.",
+                    "pending_scene_replacement_phase": "awaiting_ack",
+                },
+                had_child_input_this_turn=True,
+                model_emitted_meaningful_output=True,
+                scene_visuals_called_this_turn=False,
+            )
+        )
+
+    def test_pending_scene_replacement_ack_holds_scene_tools(self) -> None:
+        self.assertTrue(
+            ws_router._should_hold_scene_tools_for_pending_replacement_ack(
+                {
+                    "pending_scene_replacement_text": "Wait no, Bubble Land.",
+                    "pending_scene_replacement_phase": "awaiting_ack",
+                }
+            )
+        )
+        self.assertFalse(
+            ws_router._should_hold_scene_tools_for_pending_replacement_ack(
+                {
+                    "pending_scene_replacement_text": "Wait no, Bubble Land.",
+                    "pending_scene_replacement_phase": "awaiting_render",
+                }
+            )
+        )
+
+    def test_pending_scene_replacement_ack_ignores_stale_turn_complete_without_speech(self) -> None:
+        self.assertTrue(
+            ws_router._should_ignore_turn_complete_while_waiting_for_pending_replacement_ack(
+                {
+                    "pending_scene_replacement_text": "Wait no, Bubble Land.",
+                    "pending_scene_replacement_phase": "awaiting_ack",
+                    "pending_scene_replacement_armed_at_epoch_ms": 1_000,
+                },
+                last_finished_assistant_output_at_epoch_ms=0,
+            )
+        )
+        self.assertFalse(
+            ws_router._should_ignore_turn_complete_while_waiting_for_pending_replacement_ack(
+                {
+                    "pending_scene_replacement_text": "Wait no, Bubble Land.",
+                    "pending_scene_replacement_phase": "awaiting_ack",
+                    "pending_scene_replacement_armed_at_epoch_ms": 1_000,
+                },
+                last_finished_assistant_output_at_epoch_ms=1_250,
+            )
+        )
+
+    def test_pending_scene_replacement_ack_ignores_turn_complete_until_finished_output_is_newer_than_interrupt(self) -> None:
+        state = {
+            "pending_scene_replacement_text": "Wait no, Bubble Land.",
+            "pending_scene_replacement_phase": "awaiting_ack",
+            "pending_scene_replacement_armed_at_epoch_ms": 2_000,
+        }
+        self.assertTrue(
+            ws_router._should_ignore_turn_complete_while_waiting_for_pending_replacement_ack(
+                state,
+                last_finished_assistant_output_at_epoch_ms=1_999,
+            )
+        )
+        self.assertFalse(
+            ws_router._should_ignore_turn_complete_while_waiting_for_pending_replacement_ack(
+                state,
+                last_finished_assistant_output_at_epoch_ms=2_001,
+            )
+        )
+
+    def test_named_destination_scene_descriptions_stay_location_focused(self) -> None:
+        prompt_description, base_description = ws_router._named_destination_scene_descriptions(
+            "Bubble Land"
+        )
+        self.assertIn("Bubble Land", prompt_description)
+        self.assertIn("Bubble Land", base_description)
+        self.assertNotIn("what kind of adventure", prompt_description.lower())
+        self.assertNotIn("what kind of adventure", base_description.lower())
+
+    def test_pending_scene_replacement_ack_text_requires_short_switch_ack(self) -> None:
+        state = {
+            "pending_scene_replacement_text": "No, wait, I want to go to Bubble Land.",
+            "continuity_world_state": {"pending_location_label": "Bubble Land"},
+        }
+        self.assertTrue(
+            ws_router._is_valid_pending_scene_replacement_ack_text(
+                state,
+                "Got it, we'll switch to Bubble Land.",
+            )
+        )
+        self.assertFalse(
+            ws_router._is_valid_pending_scene_replacement_ack_text(
+                state,
+                "AARON, I love that idea! We are going to a magical Candy Land! Is that right?",
+            )
+        )
+
+    def test_pending_scene_replacement_partial_ack_aborts_old_location_narration(self) -> None:
+        state = {
+            "pending_scene_replacement_text": "No, wait, I want to go to Bubble Land.",
+            "continuity_world_state": {
+                "pending_location_label": "Bubble Land",
+                "current_location_label": "Candy Land",
+            },
+        }
+        self.assertTrue(
+            ws_router._should_abort_partial_pending_scene_replacement_ack(
+                state,
+                "Candy Land is just for you, Aaron.",
+            )
+        )
+        self.assertFalse(
+            ws_router._should_abort_partial_pending_scene_replacement_ack(
+                state,
+                "Okay, let's switch to Bubble Land.",
+            )
+        )
+
     def test_scene_refresh_detects_explicit_visual_request(self) -> None:
         self.assertTrue(
             ws_router._child_requested_scene_refresh(
@@ -96,6 +351,20 @@ class LiveRecoveryTests(unittest.TestCase):
             )
         )
 
+    def test_scene_chat_detects_service_connection_question(self) -> None:
+        self.assertTrue(
+            ws_router._child_requested_scene_chat(
+                "Can you hear me right now?"
+            )
+        )
+
+    def test_scene_chat_detects_simple_math_chatter(self) -> None:
+        self.assertTrue(
+            ws_router._child_requested_scene_chat(
+                "3 + 10 = 13"
+            )
+        )
+
     def test_fallback_scene_prompt_prefers_child_scene_request(self) -> None:
         prompt = ws_router._fallback_scene_prompt(
             "Let's tiptoe through the workshop together.",
@@ -127,6 +396,120 @@ class LiveRecoveryTests(unittest.TestCase):
                 },
             )
         )
+
+    def test_service_connection_question_does_not_trigger_fallback_scene_before_first_image(self) -> None:
+        self.assertFalse(
+            ws_router._should_trigger_fallback_scene(
+                assistant_text="Yes, I can hear you just fine, friend.",
+                child_text="Can you hear me?",
+                state={
+                    "scene_asset_urls": [],
+                    "current_scene_description": "No image yet.",
+                },
+            )
+        )
+
+    def test_math_chatter_does_not_trigger_fallback_scene_before_first_image(self) -> None:
+        self.assertFalse(
+            ws_router._should_trigger_fallback_scene(
+                assistant_text="Yes, that's thirteen!",
+                child_text="3 + 10 = 13",
+                state={
+                    "scene_asset_urls": [],
+                    "current_scene_description": "No image yet.",
+                },
+            )
+        )
+
+    def test_low_signal_single_word_is_not_actionable_once_story_is_underway(self) -> None:
+        self.assertFalse(
+            ws_router._is_actionable_child_text(
+                "alle",
+                {
+                    "story_started": True,
+                    "name_confirmed": True,
+                },
+            )
+        )
+
+    def test_single_word_name_like_story_seed_stays_actionable_during_onboarding(self) -> None:
+        self.assertTrue(
+            ws_router._is_actionable_child_text(
+                "Candyland",
+                {
+                    "story_started": False,
+                    "name_confirmed": False,
+                },
+            )
+        )
+
+    def test_pending_render_scene_chat_does_not_trigger_fallback_scene(self) -> None:
+        self.assertFalse(
+            ws_router._should_trigger_fallback_scene(
+                assistant_text="The castle sounds fun! We can go look inside the big, shimmery bubble castle.",
+                child_text="alle",
+                state={
+                    "scene_render_pending": True,
+                    "pending_scene_description": "Bubble Land shimmered with playful bubble details.",
+                    "scene_asset_urls": ["https://example.com/page1.jpg"],
+                    "current_scene_description": "Bubble Land shimmered with playful bubble details.",
+                    "story_started": True,
+                    "name_confirmed": True,
+                },
+            )
+        )
+
+    def test_low_signal_single_word_does_not_trigger_fallback_scene_after_first_image(self) -> None:
+        self.assertFalse(
+            ws_router._should_trigger_fallback_scene(
+                assistant_text="The castle sounds fun! We can go look inside the big, shimmery bubble castle.",
+                child_text="Dharana",
+                state={
+                    "scene_asset_urls": ["https://example.com/page1.jpg"],
+                    "current_scene_description": "Bubble Land shimmered with playful bubble details.",
+                    "story_started": True,
+                    "name_confirmed": True,
+                },
+            )
+        )
+
+    def test_resume_pending_child_turn_replays_replacement_prompt_after_reset(self) -> None:
+        runner = mock.Mock()
+        runner.session_service.get_session = mock.AsyncMock(
+            return_value=mock.Mock(
+                state={
+                    "pending_response": True,
+                    "pending_response_interrupted": False,
+                    "last_child_utterance": "Oh, wait, no, I want to go to Bubble Land.",
+                    "pending_scene_replacement_text": "Oh, wait, no, I want to go to Bubble Land.",
+                    "pending_scene_replacement_phase": "awaiting_ack",
+                    "scene_render_pending": True,
+                }
+            )
+        )
+        live_queue = mock.Mock()
+
+        with mock.patch.object(ws_router, "_mutate_state", new=mock.AsyncMock()) as mutate_state:
+            with mock.patch.object(ws_router, "_send_pending_scene_replacement_prompt") as send_replacement_prompt:
+                with mock.patch.object(ws_router, "_send_live_content") as send_live_content:
+                    resumed = asyncio.run(
+                        ws_router._resume_pending_child_turn(
+                            runner,
+                            "user-a",
+                            "session-a",
+                            live_queue,
+                            recovery_reason="hard_reset_1",
+                        )
+                    )
+
+        self.assertTrue(resumed)
+        mutate_state.assert_awaited()
+        send_replacement_prompt.assert_called_once_with(
+            "session-a",
+            live_queue,
+            "Oh, wait, no, I want to go to Bubble Land.",
+        )
+        send_live_content.assert_not_called()
 
     def test_storybook_scene_state_payload_uses_public_branch_points(self) -> None:
         payload = ws_router._storybook_scene_state_payload(

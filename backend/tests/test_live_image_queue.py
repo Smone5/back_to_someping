@@ -29,6 +29,13 @@ try:
     import google.adk as google_adk  # type: ignore
 except Exception:  # pragma: no cover - only for stripped local test envs
     google_adk = None
+    google_adk_stub = types.ModuleType("google.adk")
+    google_adk_tools_stub = types.ModuleType("google.adk.tools")
+    google_adk_tools_stub.ToolContext = object
+    google_adk_stub.tools = google_adk_tools_stub
+    sys.modules["google.adk"] = google_adk_stub
+    sys.modules["google.adk.tools"] = google_adk_tools_stub
+    setattr(google, "adk", google_adk_stub)
 
 if "google.cloud.firestore" not in sys.modules:
     firestore_stub = types.ModuleType("google.cloud.firestore")
@@ -59,6 +66,35 @@ if "google.cloud.storage" not in sys.modules:
     sys.modules["google.cloud.storage"] = storage_stub
     setattr(google_cloud, "storage", storage_stub)
 
+if "google.genai" not in sys.modules:
+    google_genai_stub = types.ModuleType("google.genai")
+    sys.modules["google.genai"] = google_genai_stub
+    setattr(google, "genai", google_genai_stub)
+
+if "httpx" not in sys.modules:
+    httpx_stub = types.ModuleType("httpx")
+    httpx_stub.AsyncClient = object
+    httpx_stub.Client = object
+    httpx_stub.Response = object
+    httpx_stub.Timeout = object
+    httpx_stub.HTTPError = Exception
+    httpx_stub.RequestError = Exception
+    sys.modules["httpx"] = httpx_stub
+
+if "tenacity" not in sys.modules:
+    tenacity_stub = types.ModuleType("tenacity")
+
+    def _identity_decorator(*args, **kwargs):
+        def _wrap(fn):
+            return fn
+        return _wrap
+
+    tenacity_stub.retry = _identity_decorator
+    tenacity_stub.stop_after_attempt = lambda *args, **kwargs: None
+    tenacity_stub.wait_exponential = lambda *args, **kwargs: None
+    tenacity_stub.retry_if_exception_type = lambda *args, **kwargs: None
+    sys.modules["tenacity"] = tenacity_stub
+
 if google_adk is not None and "google.adk.utils" not in sys.modules:
     adk_utils_stub = types.ModuleType("google.adk.utils")
     instructions_utils_stub = types.ModuleType("google.adk.utils.instructions_utils")
@@ -77,6 +113,7 @@ class LiveImageQueueTests(unittest.TestCase):
         tools._session_generating.clear()
         tools._session_cancel_current.clear()
         tools._session_image_backoff_until.clear()
+        tools._storybook_state_cache.clear()
         ws_router._pending_image_events.clear()
 
     def tearDown(self) -> None:
@@ -84,6 +121,7 @@ class LiveImageQueueTests(unittest.TestCase):
         tools._session_generating.clear()
         tools._session_cancel_current.clear()
         tools._session_image_backoff_until.clear()
+        tools._storybook_state_cache.clear()
         ws_router._pending_image_events.clear()
 
     def test_detects_newer_pending_scene_request(self) -> None:
@@ -109,25 +147,124 @@ class LiveImageQueueTests(unittest.TestCase):
 
     def test_unshown_superseded_scene_does_not_persist_to_movie(self) -> None:
         tools._session_cancel_current.add("session-a")
+        tools.cache_storybook_state(
+            "session-a",
+            {
+                "active_scene_request_id": "req-candy",
+                "pending_scene_replacement_text": "",
+                "story_pages": [],
+                "scene_branch_points": [],
+            },
+        )
 
         self.assertFalse(
             tools._should_persist_uploaded_scene_asset(
                 session_id="session-a",
                 superseded_render=True,
                 preview_published=False,
+                request_id="req-candy",
             )
         )
 
     def test_visible_scene_can_still_persist_after_follow_up_queue(self) -> None:
         tools._session_cancel_current.add("session-a")
+        tools.cache_storybook_state(
+            "session-a",
+            {
+                "active_scene_request_id": "req-candy",
+                "pending_scene_replacement_text": "",
+                "story_pages": [
+                    {
+                        "scene_number": 1,
+                        "request_id": "req-candy",
+                        "scene_description": "Candy Land",
+                        "storybeat_text": "",
+                        "image_url": "https://example.com/candy.png",
+                        "gcs_uri": "",
+                    }
+                ],
+                "scene_branch_points": [],
+            },
+        )
 
         self.assertTrue(
             tools._should_persist_uploaded_scene_asset(
                 session_id="session-a",
                 superseded_render=True,
                 preview_published=True,
+                request_id="req-candy",
             )
         )
+
+    def test_superseded_scene_does_not_persist_while_replacement_is_armed(self) -> None:
+        tools._session_cancel_current.add("session-a")
+        tools.cache_storybook_state(
+            "session-a",
+            {
+                "active_scene_request_id": "req-candy",
+                "pending_scene_replacement_text": "No, wait, Bubble Land.",
+                "story_pages": [
+                    {
+                        "scene_number": 1,
+                        "request_id": "req-candy",
+                        "scene_description": "Candy Land",
+                        "storybeat_text": "",
+                        "image_url": "https://example.com/candy.png",
+                        "gcs_uri": "",
+                    }
+                ],
+                "scene_branch_points": [],
+            },
+        )
+
+        self.assertFalse(
+            tools._should_persist_uploaded_scene_asset(
+                session_id="session-a",
+                superseded_render=True,
+                preview_published=True,
+                request_id="req-candy",
+            )
+        )
+
+    def test_superseded_scene_does_not_persist_after_active_request_changes(self) -> None:
+        tools._session_cancel_current.add("session-a")
+        tools.cache_storybook_state(
+            "session-a",
+            {
+                "active_scene_request_id": "req-bubble",
+                "pending_scene_replacement_text": "",
+                "story_pages": [
+                    {
+                        "scene_number": 1,
+                        "request_id": "req-bubble",
+                        "scene_description": "Bubble Land",
+                        "storybeat_text": "",
+                        "image_url": "https://example.com/bubble.png",
+                        "gcs_uri": "",
+                    }
+                ],
+                "scene_branch_points": [],
+            },
+        )
+
+        self.assertFalse(
+            tools._should_persist_uploaded_scene_asset(
+                session_id="session-a",
+                superseded_render=True,
+                preview_published=True,
+                request_id="req-candy",
+            )
+        )
+
+    def test_supersede_scene_render_discards_queued_scene_request(self) -> None:
+        tools._session_pending["session-a"] = tools.VisualArgs(
+            description="Candy castle",
+            request_id="req-candy-castle",
+        )
+
+        tools.supersede_scene_render("session-a")
+
+        self.assertNotIn("session-a", tools._session_pending)
 
     def test_queue_latest_scene_follow_up_request_keeps_latest_child_wish(self) -> None:
         state = {}
@@ -141,6 +278,239 @@ class LiveImageQueueTests(unittest.TestCase):
         self.assertGreaterEqual(int(state.get("queued_scene_child_utterance_at_epoch_ms", 0) or 0), first_timestamp)
         self.assertEqual(state["partial_child_utterance"], "No, go behind the waterfall instead.")
         self.assertTrue(state["partial_child_utterance_finished"])
+
+    def test_classify_pending_scene_interrupt_prefers_replace_for_wait_instead(self) -> None:
+        self.assertEqual(
+            ws_router._classify_pending_scene_interrupt("No wait, go inside the castle instead."),
+            "replace",
+        )
+
+    def test_classify_pending_scene_interrupt_allows_explicit_next_page_queue(self) -> None:
+        self.assertEqual(
+            ws_router._classify_pending_scene_interrupt("Then after that, let's go upstairs next."),
+            "queue",
+        )
+
+    def test_classify_pending_scene_interrupt_defaults_to_replace_before_first_paint(self) -> None:
+        self.assertEqual(
+            ws_router._classify_pending_scene_interrupt("Can we go inside the castle?"),
+            "replace",
+        )
+
+    def test_arm_pending_scene_replacement_marks_new_child_turn(self) -> None:
+        state = {
+            "queued_scene_child_utterance": "Let's go to the castle door.",
+            "queued_scene_child_utterance_at_epoch_ms": 123,
+            "pending_response": False,
+            "scene_tool_turn_open": False,
+        }
+
+        replacement = ws_router._arm_pending_scene_replacement(
+            state,
+            "No wait, go inside the castle instead.",
+        )
+
+        self.assertEqual(replacement, "No wait, go inside the castle instead.")
+        self.assertEqual(state["queued_scene_child_utterance"], "")
+        self.assertEqual(state["queued_scene_child_utterance_at_epoch_ms"], 0)
+        self.assertEqual(
+            state["pending_scene_replacement_text"],
+            "No wait, go inside the castle instead.",
+        )
+        self.assertTrue(state["pending_response"])
+        self.assertFalse(state["pending_response_interrupted"])
+        self.assertTrue(state["scene_tool_turn_open"])
+        self.assertEqual(state["last_child_utterance"], "No wait, go inside the castle instead.")
+        self.assertEqual(state["partial_child_utterance"], "No wait, go inside the castle instead.")
+        self.assertTrue(state["partial_child_utterance_finished"])
+        self.assertTrue(str(state.get("pending_response_token", "")).strip())
+
+    def test_arm_pending_scene_replacement_reuses_unshown_page_slot(self) -> None:
+        state = {
+            "active_scene_request_id": "req-candy",
+            "pending_scene_description": "Candy Land with lollipop trees.",
+            "pending_scene_base_description": "Candy Land with lollipop trees.",
+            "scene_branch_points": [
+                {
+                    "scene_number": 1,
+                    "request_id": "req-candy",
+                    "label": "Candy Land",
+                    "scene_description": "Candy Land with lollipop trees.",
+                    "storybeat_text": "",
+                    "image_url": "",
+                    "gcs_uri": "",
+                }
+            ],
+            "story_pages": [
+                {
+                    "scene_number": 1,
+                    "request_id": "req-candy",
+                    "scene_description": "Candy Land with lollipop trees.",
+                    "storybeat_text": "",
+                    "image_url": "",
+                    "gcs_uri": "",
+                }
+            ],
+            "pending_response": False,
+            "scene_tool_turn_open": False,
+        }
+
+        ws_router._arm_pending_scene_replacement(
+            state,
+            "Wait. No. I want to go to Bubble Land.",
+        )
+
+        self.assertEqual(state["scene_branch_points"], [])
+        self.assertEqual(state["story_pages"], [])
+        self.assertEqual(state["active_scene_request_id"], "")
+        self.assertEqual(state["pending_scene_description"], "")
+        self.assertEqual(state["pending_scene_base_description"], "")
+        self.assertEqual(state["last_child_utterance"], "Wait. No. I want to go to Bubble Land.")
+        self.assertEqual(
+            state["pending_scene_replacement_text"],
+            "Wait. No. I want to go to Bubble Land.",
+        )
+
+    def test_publish_quick_ack_emits_interruptible_ack_event(self) -> None:
+        with patch.object(ws_router, "publish_session_event") as publish_event:
+            ws_router._publish_quick_ack("session-a", text="Okay, let's change it.")
+
+        publish_event.assert_called_once_with(
+            "session-a",
+            {
+                "type": "quick_ack",
+                "payload": {
+                    "text": "Okay, let's change it.",
+                    "interrupt_audio": True,
+                },
+            },
+        )
+
+    def test_discard_unshown_pending_scene_slot_keeps_visible_page_history(self) -> None:
+        state = {
+            "active_scene_request_id": "req-candy",
+            "scene_branch_points": [
+                {
+                    "scene_number": 1,
+                    "request_id": "req-start",
+                    "label": "Starting meadow",
+                    "scene_description": "A starting meadow.",
+                    "storybeat_text": "We begin in a meadow.",
+                    "image_url": "https://example.com/meadow.png",
+                    "gcs_uri": "gs://storybook/meadow.png",
+                },
+                {
+                    "scene_number": 2,
+                    "request_id": "req-candy",
+                    "label": "Candy Land",
+                    "scene_description": "Candy Land with lollipop trees.",
+                    "storybeat_text": "",
+                    "image_url": "",
+                    "gcs_uri": "",
+                },
+            ],
+        }
+
+        ws_router._discard_unshown_pending_scene_slot(state)
+
+        self.assertEqual(len(state["scene_branch_points"]), 1)
+        self.assertEqual(state["scene_branch_points"][0]["request_id"], "req-start")
+
+    def test_mark_pending_scene_wait_response_keeps_small_talk_out_of_story_continuity(self) -> None:
+        state = {
+            "pending_response": False,
+            "scene_tool_turn_open": False,
+            "child_delight_anchors": ["Let's go to the castle."],
+        }
+
+        ws_router._mark_pending_scene_wait_response(
+            state,
+            child_utterance="Tell me a joke while the picture draws.",
+        )
+
+        self.assertTrue(state["pending_response"])
+        self.assertFalse(state["pending_response_interrupted"])
+        self.assertTrue(state["scene_tool_turn_open"])
+        self.assertEqual(state["last_child_utterance"], "Tell me a joke while the picture draws.")
+        self.assertEqual(state["partial_child_utterance"], "Tell me a joke while the picture draws.")
+        self.assertEqual(state["child_delight_anchors"], ["Let's go to the castle."])
+
+    def test_should_preserve_pending_scene_render_when_image_still_in_flight(self) -> None:
+        state = {
+            "scene_render_pending": True,
+            "pending_scene_description": "Inside the castle, a glowing candy hall.",
+            "pending_scene_base_description": "Inside the castle, a glowing candy hall.",
+        }
+
+        self.assertTrue(
+            ws_router._should_preserve_pending_scene_render("session-a", state)
+        )
+
+    def test_should_not_preserve_pending_scene_render_when_nothing_is_in_flight(self) -> None:
+        state = {
+            "scene_render_pending": False,
+            "pending_scene_description": "",
+            "pending_scene_base_description": "",
+        }
+
+        self.assertFalse(
+            ws_router._should_preserve_pending_scene_render("session-a", state)
+        )
+
+    def test_can_interact_with_pending_scene_render_even_before_story_started(self) -> None:
+        state = {
+            "story_started": False,
+            "scene_render_pending": True,
+            "pending_scene_description": "Candy Land with lollipop trees.",
+            "pending_scene_base_description": "Candy Land with lollipop trees.",
+            "assembly_status": "",
+        }
+
+        self.assertTrue(
+            ws_router._can_interact_with_pending_scene_render("session-a", state)
+        )
+
+    def test_can_interact_with_pending_scene_render_stops_during_movie_assembly(self) -> None:
+        state = {
+            "story_started": True,
+            "scene_render_pending": True,
+            "pending_scene_description": "Candy Land with lollipop trees.",
+            "pending_scene_base_description": "Candy Land with lollipop trees.",
+            "assembly_status": "assembling",
+        }
+
+        self.assertFalse(
+            ws_router._can_interact_with_pending_scene_render("session-a", state)
+        )
+
+    def test_extract_child_name_ignores_im_going_scene_change_phrase(self) -> None:
+        self.assertIsNone(
+            ws_router._extract_child_name("Wait. No, I'm going to go to Bubble Land.")
+        )
+
+    def test_extract_child_name_keeps_valid_im_name_plus_story_request(self) -> None:
+        self.assertEqual(
+            ws_router._extract_child_name("I'm Eric and can we go to Candy Land?"),
+            "Eric",
+        )
+
+    def test_story_shortcircuit_auto_confirms_explicit_name_intro_for_young_child(self) -> None:
+        self.assertTrue(
+            ws_router._should_auto_confirm_name_on_story_shortcircuit(
+                "Hi, my name is Aaron. Can we go to Candy Land?",
+                "Aaron",
+                4,
+            )
+        )
+
+    def test_story_shortcircuit_keeps_conservative_name_flow_for_ambiguous_young_child_intro(self) -> None:
+        self.assertFalse(
+            ws_router._should_auto_confirm_name_on_story_shortcircuit(
+                "Aaron and can we go to Candy Land?",
+                "Aaron",
+                4,
+            )
+        )
 
     def test_arm_queued_scene_follow_up_after_render_promotes_latest_request(self) -> None:
         state = {
@@ -325,6 +695,35 @@ class LiveImageQueueTests(unittest.TestCase):
         self.assertEqual(state["pending_scene_description"], "")
         self.assertEqual(state["pending_scene_base_description"], "")
         self.assertFalse(state["scene_render_pending"])
+
+    def test_apply_nonpersistent_scene_ready_ignores_stale_preview_while_replacement_is_armed(self) -> None:
+        state = {
+            "active_scene_request_id": "",
+            "current_scene_description": "Candy Land with lollipop trees.",
+            "current_scene_base_description": "Candy Land with lollipop trees.",
+            "pending_scene_description": "",
+            "pending_scene_base_description": "",
+            "pending_scene_replacement_text": "Wait. No. I want to go to Bubble Land.",
+            "pending_scene_replacement_phase": "awaiting_ack",
+            "scene_render_pending": True,
+        }
+
+        ws_router._apply_nonpersistent_scene_ready_to_state(
+            state,
+            request_id="req-candy",
+            looks_like_image=True,
+            is_fallback=False,
+            description="Candy Land with lollipop trees and a chocolate river.",
+            storybeat_text="The candy path glows in the sun.",
+        )
+
+        self.assertEqual(state["current_scene_description"], "Candy Land with lollipop trees.")
+        self.assertEqual(
+            state["pending_scene_replacement_text"],
+            "Wait. No. I want to go to Bubble Land.",
+        )
+        self.assertEqual(state["pending_scene_replacement_phase"], "awaiting_ack")
+        self.assertTrue(state["scene_render_pending"])
 
     def test_fallback_scene_request_can_promote_finished_image_to_current_scene(self) -> None:
         state = {
@@ -598,6 +997,42 @@ class LiveImageQueueTests(unittest.TestCase):
         self.assertTrue(bool(published_events[0]["payload"].get("is_placeholder")))
         self.assertEqual(published_events[0]["payload"].get("request_id"), "req-backpressure")
         self.assertIn("session-a", tools._session_image_backoff_until)
+        self.assertTrue(scheduled_coroutines)
+
+    def test_run_visual_pipeline_does_not_retry_quota_for_superseded_scene(self) -> None:
+        published_events: list[dict[str, object]] = []
+        scheduled_coroutines: list[object] = []
+
+        def _schedule_background_task(coro):
+            scheduled_coroutines.append(coro)
+            try:
+                coro.close()
+            except Exception:
+                pass
+
+        tools._session_cancel_current.add("session-a")
+
+        with (
+            patch.dict(os.environ, {"GOOGLE_CLOUD_PROJECT": "test-project"}, clear=False),
+            patch.object(tools, "_generate_scene_still", side_effect=RuntimeError("429 RESOURCE_EXHAUSTED")),
+            patch.object(tools, "record_prompt_feedback"),
+            patch.object(tools, "publish_session_event", side_effect=lambda session_id, event: published_events.append(event)),
+            patch.object(tools, "schedule_background_task", side_effect=_schedule_background_task),
+        ):
+            asyncio.run(
+                tools._run_visual_pipeline(
+                    args=tools.VisualArgs(
+                        description="Candy Land with lollipop trees.",
+                        base_description="Candy Land with lollipop trees.",
+                        request_id="req-candy",
+                    ),
+                    session_id="session-a",
+                )
+            )
+
+        self.assertEqual(published_events, [])
+        self.assertNotIn("session-a", tools._session_pending)
+        self.assertNotIn("session-a", tools._session_image_backoff_until)
         self.assertTrue(scheduled_coroutines)
 
     def test_run_visual_pipeline_publishes_raster_fallback_after_terminal_quota_failure(self) -> None:

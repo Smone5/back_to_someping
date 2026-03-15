@@ -129,7 +129,6 @@ const STORYBOOK_ASSEMBLY_STORAGE_PREFIX = 'storyteller_assembly_ui:';
 const STORYBOOK_ASSEMBLY_STORAGE_TTL_MS = 15 * 60 * 1000;
 const STORYBOOK_ASSEMBLY_REHYDRATION_GRACE_MS = STORYBOOK_ASSEMBLY_STORAGE_TTL_MS;
 const SCENE_PLACEHOLDER_TIMEOUT_MS = 45 * 1000;
-const QUICK_ACK_AUDIO_URL = '/audio/got-it-lets-go.mp3';
 const ENABLE_SCENE_BRANCH_UI = false;
 
 type PersistedStorybookAssemblyState = {
@@ -860,6 +859,7 @@ export default function StorytellerLive() {
     const stopPageReadAloudRef = useRef<(options?: { resumeMic?: boolean }) => void>(() => { });
     const pageReadAloudStartLockUntilRef = useRef(0);
     const pageReadAloudInterruptIgnoreUntilRef = useRef(0);
+    const pageReadAloudResumeMicTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
     const pageReadAloudShouldResumeMicRef = useRef(false);
     const pageReadAloudAbortControllerRef = useRef<AbortController | null>(null);
     const pageReadAloudPrefetchAbortControllerRef = useRef<AbortController | null>(null);
@@ -999,6 +999,36 @@ export default function StorytellerLive() {
             }
         };
     }, []);
+
+    const clearAgentSpeechUi = useCallback(() => {
+        if (typewriterTimerRef.current) {
+            clearInterval(typewriterTimerRef.current);
+            typewriterTimerRef.current = null;
+        }
+        if (agentClearTimerRef.current) {
+            clearTimeout(agentClearTimerRef.current);
+            agentClearTimerRef.current = null;
+        }
+        agentWordsRef.current = [];
+        revealedCountRef.current = 0;
+        agentFinishedRef.current = false;
+        lastAgentTranscriptRef.current = '';
+        setDisplayedAgentText('');
+    }, []);
+
+    const showTransientAgentCue = useCallback((text: string, durationMs = 1600) => {
+        const cue = text.trim();
+        if (!cue) {
+            return;
+        }
+        clearAgentSpeechUi();
+        setDisplayedAgentText(cue);
+        setHasHeardAgent(true);
+        agentClearTimerRef.current = setTimeout(() => {
+            setDisplayedAgentText('');
+            agentClearTimerRef.current = null;
+        }, durationMs);
+    }, [clearAgentSpeechUi]);
 
     useEffect(() => {
         phaseRef.current = phase;
@@ -1279,9 +1309,11 @@ export default function StorytellerLive() {
     // Solution: use refs that are updated synchronously after each hook call.
     const playPcmChunkRef = useRef<(data: ArrayBuffer) => void>(() => { });
     const flushPlaybackBufferRef = useRef<() => void>(() => { });
+    const interruptPlaybackRef = useRef<() => void>(() => { });
     const enqueueSfxRef = useRef<(url: string, label?: string) => void>(() => { });
     const sendJsonRef = useRef<(msg: Record<string, unknown>) => void>(() => { });
     const sessionIdRef = useRef<string>('');
+    const previousSessionIdRef = useRef<string>('');
     const wsUrlRef = useRef<string>(resolveFrontendWebSocketUrl());
     const uploadUrlRef = useRef<string>(resolveUploadUrl());
     const pageReadAloudUrlRef = useRef<string>(resolvePageReadAloudUrl());
@@ -1300,6 +1332,7 @@ export default function StorytellerLive() {
         playBufferedClip,
         stopBufferedClip,
         flushPlaybackBuffer,
+        interruptPlayback,
         setNarrationMuted,
     } =
         useAudioWorklet({
@@ -1310,7 +1343,7 @@ export default function StorytellerLive() {
             }, []),
             onVoiceVolume: setVoiceRms,
             onFlushComplete: useCallback(() => {
-                if (!isMicMutedRef.current) {
+                if (phaseRef.current === 'story' && connectionStateRef.current === 'connected' && !isMicMutedRef.current) {
                     startListeningRef.current();
                 }
             }, []),
@@ -1370,6 +1403,7 @@ export default function StorytellerLive() {
     startListeningRef.current = startListening;
     playPcmChunkRef.current = playPcmChunk;
     flushPlaybackBufferRef.current = flushPlaybackBuffer;
+    interruptPlaybackRef.current = interruptPlayback;
     const {
         previewError: storyReaderVoicePreviewError,
         previewLoading: storyReaderVoicePreviewLoading,
@@ -1509,6 +1543,34 @@ export default function StorytellerLive() {
         return payload;
     }, [clearPageReadAloudCache]);
 
+    const schedulePageReadAloudMicResume = useCallback(() => {
+        if (pageReadAloudResumeMicTimerRef.current) {
+            clearTimeout(pageReadAloudResumeMicTimerRef.current);
+            pageReadAloudResumeMicTimerRef.current = null;
+        }
+        pageReadAloudResumeMicTimerRef.current = setTimeout(() => {
+            pageReadAloudResumeMicTimerRef.current = null;
+            if (phaseRef.current === 'story' && !isMicMutedRef.current) {
+                void startListening();
+            }
+        }, 650);
+    }, [startListening]);
+
+    const notifyPageReadAloudState = useCallback((active: boolean, suppressForMs = 0) => {
+        const currentSessionId = sessionIdRef.current;
+        if (!currentSessionId) {
+            return;
+        }
+        sendJsonRef.current({
+            type: 'page_read_aloud' as any,
+            session_id: currentSessionId,
+            payload: {
+                active,
+                suppress_for_ms: Math.max(0, Math.trunc(suppressForMs)),
+            },
+        });
+    }, []);
+
     const finishPageReadAloud = useCallback((runId: number, shouldResumeMic: boolean) => {
         if (pageReadAloudRunIdRef.current !== runId) {
             return;
@@ -1520,15 +1582,20 @@ export default function StorytellerLive() {
         setPageReadAloudHighlightWordIndex(-1);
         pageReadAloudShouldResumeMicRef.current = false;
         pageReadAloudContentKeyRef.current = '';
+        notifyPageReadAloudState(false, shouldResumeMic ? 1800 : 0);
         if (shouldResumeMic && phaseRef.current === 'story' && !isMicMutedRef.current) {
-            void startListening();
+            schedulePageReadAloudMicResume();
         }
-    }, [startListening]);
+    }, [notifyPageReadAloudState, schedulePageReadAloudMicResume]);
 
     const stopPageReadAloud = useCallback((options?: { resumeMic?: boolean }) => {
         const resumeMic = options?.resumeMic ?? true;
         pageReadAloudRunIdRef.current += 1;
         const shouldResumeMic = resumeMic && pageReadAloudShouldResumeMicRef.current;
+        if (pageReadAloudResumeMicTimerRef.current) {
+            clearTimeout(pageReadAloudResumeMicTimerRef.current);
+            pageReadAloudResumeMicTimerRef.current = null;
+        }
         pageReadAloudShouldResumeMicRef.current = false;
         pageReadAloudContentKeyRef.current = '';
         pageReadAloudInterruptIgnoreUntilRef.current = 0;
@@ -1538,10 +1605,11 @@ export default function StorytellerLive() {
         stopBufferedClip();
         setIsPageReadAloudActive(false);
         setPageReadAloudHighlightWordIndex(-1);
+        notifyPageReadAloudState(false, shouldResumeMic ? 1200 : 0);
         if (shouldResumeMic && phaseRef.current === 'story' && !isMicMutedRef.current) {
             void startListening();
         }
-    }, [startListening, stopBufferedClip]);
+    }, [notifyPageReadAloudState, startListening, stopBufferedClip]);
     stopPageReadAloudRef.current = stopPageReadAloud;
 
     const readCurrentPageAloud = useCallback(async () => {
@@ -1570,10 +1638,15 @@ export default function StorytellerLive() {
         const wordBoundaries = buildStoryCaptionWordBoundaries(tokenizeStoryCaption(text));
         const totalWordCount = wordBoundaries.length;
         const shouldResumeMic = phaseRef.current === 'story' && !isMicMutedRef.current;
+        if (pageReadAloudResumeMicTimerRef.current) {
+            clearTimeout(pageReadAloudResumeMicTimerRef.current);
+            pageReadAloudResumeMicTimerRef.current = null;
+        }
         pageReadAloudShouldResumeMicRef.current = shouldResumeMic;
         pageReadAloudContentKeyRef.current = contentKey;
         pageReadAloudInterruptIgnoreUntilRef.current = now + 1500;
         isPageReadAloudActiveRef.current = true;
+        notifyPageReadAloudState(true, 2500);
         setIsPageReadAloudActive(true);
         setPageReadAloudError(null);
         setPageReadAloudHighlightWordIndex(totalWordCount > 0 ? 0 : -1);
@@ -1653,6 +1726,7 @@ export default function StorytellerLive() {
         playBufferedClip,
         playUiSound,
         primeAudio,
+        notifyPageReadAloudState,
         stopListening,
         stopPageReadAloud,
     ]);
@@ -1758,13 +1832,18 @@ export default function StorytellerLive() {
 
     useEffect(() => {
         return () => {
+            notifyPageReadAloudState(false, 0);
             pageReadAloudAbortControllerRef.current?.abort();
             pageReadAloudPrefetchAbortControllerRef.current?.abort();
+            if (pageReadAloudResumeMicTimerRef.current) {
+                clearTimeout(pageReadAloudResumeMicTimerRef.current);
+                pageReadAloudResumeMicTimerRef.current = null;
+            }
             isPageReadAloudActiveRef.current = false;
             stopBufferedClip();
             clearPageReadAloudCache();
         };
-    }, [clearPageReadAloudCache, stopBufferedClip]);
+    }, [clearPageReadAloudCache, notifyPageReadAloudState, stopBufferedClip]);
 
     // ── SFX Ducker (defined SECOND — provides enqueueSfx) ────────────────────────
     const { enqueueSfx } = useSfxDucker(narrationGainNode);
@@ -2069,9 +2148,20 @@ export default function StorytellerLive() {
                     });
                     break;
                 case 'quick_ack':
-                    if (!calmModeRef.current) {
-                        enqueueSfxRef.current(QUICK_ACK_AUDIO_URL, 'quick_ack');
+                    stopPageReadAloudRef.current({ resumeMic: false });
+                    stopStoryReaderVoicePreviewRef.current();
+                    if (Boolean(msg.payload?.interrupt_audio)) {
+                        interruptPlaybackRef.current();
                     }
+                    if (typeof msg.payload?.text === 'string' && msg.payload.text.trim()) {
+                        showTransientAgentCue(msg.payload.text as string);
+                    }
+                    setAgentThinking(true);
+                    setStoryPhase((current) => (
+                        current === 'assembling_movie' || current === 'remake' || current === 'theater'
+                            ? current
+                            : 'drawing_scene'
+                    ));
                     break;
                 case 'rewind_complete':
                     clearPersistedStorybookAssemblyState(sessionIdRef.current);
@@ -2423,6 +2513,22 @@ export default function StorytellerLive() {
     sendJsonRef.current = sendJson;
     sessionIdRef.current = sessionId;
 
+    useEffect(() => {
+        if (!sessionId) {
+            return;
+        }
+        const previousSessionId = previousSessionIdRef.current;
+        if (previousSessionId && previousSessionId !== sessionId) {
+            interruptPlaybackRef.current();
+            stopPageReadAloudRef.current({ resumeMic: false });
+            stopStoryReaderVoicePreviewRef.current();
+            clearAgentSpeechUi();
+            setUserTranscript(null);
+            lastUserTranscriptRef.current = '';
+        }
+        previousSessionIdRef.current = sessionId;
+    }, [clearAgentSpeechUi, sessionId]);
+
     const sendClientReady = useCallback(() => {
         const useCompactLayout = isCompact || isLandscapePhone;
         const viewport = {
@@ -2558,15 +2664,23 @@ export default function StorytellerLive() {
             hasEverConnectedRef.current = false;
             streamAudioRef.current = false;
             setUserSpeaking(false);
+            interruptPlaybackRef.current();
+            stopPageReadAloudRef.current({ resumeMic: false });
+            stopStoryReaderVoicePreviewRef.current();
+            clearAgentSpeechUi();
             stopListening();
         }
         if (connectionState === 'reconnecting') {
             resumeMicOnReconnectRef.current = false;
             streamAudioRef.current = false;
             setUserSpeaking(false);
+            interruptPlaybackRef.current();
+            stopPageReadAloudRef.current({ resumeMic: false });
+            stopStoryReaderVoicePreviewRef.current();
+            clearAgentSpeechUi();
             stopListening();
         }
-    }, [connectionState, stopListening]);
+    }, [clearAgentSpeechUi, connectionState, stopListening]);
 
     const requestMicSetupTest = useCallback(async (deviceIdOverride?: string | null): Promise<boolean> => {
         const requestedDeviceId = deviceIdOverride ?? (selectedMicDeviceIdRef.current || getStoredMicDeviceId() || null);
@@ -2942,6 +3056,9 @@ export default function StorytellerLive() {
     }, []);
 
     const restartStoryNow = useCallback(() => {
+        interruptPlaybackRef.current();
+        stopPageReadAloudRef.current({ resumeMic: false });
+        stopStoryReaderVoicePreviewRef.current();
         if (phaseRef.current === 'theater' && sessionIdRef.current) {
             applyTheaterLightingStage('close');
             sendJson({

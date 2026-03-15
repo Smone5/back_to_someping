@@ -188,6 +188,29 @@ class StoryContinuityTests(unittest.TestCase):
         self.assertTrue(decision.should_render)
         self.assertEqual(decision.reason, "first_page")
 
+    def test_named_location_suffix_beats_prop_or_character_parsing(self) -> None:
+        state: dict[str, object] = {}
+        ensure_story_continuity_state(state)
+
+        update_continuity_from_child_utterance(
+            state,
+            "Oh, wait, no, I want to go to Bubble Land.",
+        )
+
+        world = state["continuity_world_state"]
+        self.assertEqual(world["pending_location_label"], "Bubble Land")
+        self.assertEqual(list(world.get("pending_character_keys", []) or []), [])
+        self.assertEqual(list(world.get("pending_prop_keys", []) or []), [])
+
+        result = validate_live_scene_request(
+            state,
+            "A magical world filled with giant, shimmering bubbles floating gently everywhere.",
+        )
+
+        self.assertEqual(result.location_label, "Bubble Land")
+        self.assertIn("Bubble Land", result.resolved_description)
+        self.assertIn("missing_location_anchor", result.issues)
+
     def test_same_location_new_character_and_presents_force_new_page(self) -> None:
         state: dict[str, object] = {}
         ensure_story_continuity_state(state)

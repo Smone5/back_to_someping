@@ -5203,10 +5203,10 @@ async def _assemble_pipeline(
                 ):
                 normalized_narration_lines.append(llm_line)
                 continue
-            if (
-                not studio_plan_trusted
-                and llm_line
-                and (story_sentence_quality_score(llm_line) >= 2 or llm_line_needs_revision)
+            if llm_line and (
+                studio_plan_trusted
+                or story_sentence_quality_score(llm_line) >= 2
+                or llm_line_needs_revision
             ):
                 rewritten_line = _llm_rewrite_storybook_narration_line(
                     llm_line,
@@ -5241,7 +5241,8 @@ async def _assemble_pipeline(
             if fallback_line and not story_sentence_needs_revision(fallback_line):
                 normalized_narration_lines.append(fallback_line)
                 continue
-            if not studio_plan_trusted:
+            fallback_rewrite = None
+            if studio_plan_trusted or not fallback_line:
                 fallback_rewrite = _llm_rewrite_storybook_narration_line(
                     fallback_description or str(line or "") or fallback_line,
                     scene_description=fallback_description,
@@ -5253,6 +5254,19 @@ async def _assemble_pipeline(
                     previous_line=previous_line,
                     next_line=next_line,
                 )
+            elif not studio_plan_trusted:
+                fallback_rewrite = _llm_rewrite_storybook_narration_line(
+                    fallback_description or str(line or "") or fallback_line,
+                    scene_description=fallback_description,
+                    story_summary=story_summary,
+                    child_age=child_age,
+                    max_words=scene_max_words,
+                    previous_scene_description=previous_scene_description,
+                    next_scene_description=next_scene_description,
+                    previous_line=previous_line,
+                    next_line=next_line,
+                )
+            if fallback_rewrite or not studio_plan_trusted:
                 normalized_narration_lines.append(fallback_rewrite or fallback_line or llm_line)
                 continue
             normalized_narration_lines.append(fallback_line or llm_line)

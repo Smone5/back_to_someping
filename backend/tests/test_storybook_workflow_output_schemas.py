@@ -17,6 +17,7 @@ from shared.storybook_assembly_workflow import (
 from shared.storybook_studio_workflow import (
     StudioAudioCuePlan,
     StudioNarrationPlan,
+    StudioNarrationReviewReport,
     StudioQualityReport,
     _build_workflow_agent as build_studio_workflow_agent,
 )
@@ -90,6 +91,8 @@ class StorybookWorkflowOutputSchemaTests(unittest.TestCase):
         agent = build_studio_workflow_agent(max_revision_rounds=1)
 
         self.assertIs(agent.narration_agent.output_schema, StudioNarrationPlan)
+        self.assertIs(agent.narration_forward_review_agent.output_schema, StudioNarrationReviewReport)
+        self.assertIs(agent.narration_backward_review_agent.output_schema, StudioNarrationReviewReport)
         self.assertIs(agent.audio_agent.output_schema, StudioAudioCuePlan)
         self.assertIs(agent.qa_agent.output_schema, StudioQualityReport)
 
@@ -105,6 +108,7 @@ class StorybookWorkflowOutputSchemaTests(unittest.TestCase):
             AssemblyDirectorSummary,
             StudioNarrationPlan,
             StudioAudioCuePlan,
+            StudioNarrationReviewReport,
             StudioQualityReport,
             PageReadAloudRequest,
             PageReadAloudPlan,

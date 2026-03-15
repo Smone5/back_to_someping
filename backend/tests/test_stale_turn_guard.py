@@ -233,6 +233,69 @@ class StaleTurnGuardTests(unittest.TestCase):
         )
         self.assertFalse(str(cached_state.get("current_scene_base_description", "") or "").strip())
 
+    def test_generate_scene_visuals_preserves_inflight_pending_render_when_skip_decision_arrives(self) -> None:
+        tool_context = _FakeToolContext(
+            {
+                "session_id": "session-a",
+                "child_name": "Aaron",
+                "story_tone": "cozy",
+                "scene_tool_turn_open": True,
+                "pending_response": True,
+                "pending_response_token": "fresh-token",
+                "scene_render_pending": True,
+                "pending_scene_description": "Kiddieland with gentle colorful rides.",
+                "pending_scene_base_description": "Kiddieland with gentle colorful rides.",
+            }
+        )
+        tools._session_generating.add("session-a")
+
+        with (
+            patch.object(tools, "_stale_turn_tool_call", return_value=False),
+            patch.object(tools, "_continuity_anchor_text", return_value=""),
+            patch.object(
+                tools,
+                "validate_live_scene_request",
+                return_value=SimpleNamespace(
+                    resolved_description="Katieland with teacups and ferris wheels.",
+                    location_label="kiddieland",
+                    prompt_suffix="",
+                    issues=[],
+                ),
+            ),
+            patch.object(
+                tools,
+                "_build_visual_continuity_plan",
+                return_value={"active_character_keys": []},
+            ),
+            patch.object(tools, "_character_bible_entries_for_keys", return_value=[]),
+            patch.object(
+                tools,
+                "should_render_new_scene_page",
+                return_value=SimpleNamespace(
+                    should_render=False,
+                    reason="current_scene_detail_chat_while_rendering",
+                ),
+            ),
+        ):
+            result = asyncio.run(
+                tools.generate_scene_visuals(
+                    "Katieland with teacups and ferris wheels.",
+                    tool_context=tool_context,
+                )
+            )
+
+        self.assertIn("Stay on the current storybook page", result)
+        self.assertTrue(tool_context.state["scene_render_pending"])
+        self.assertEqual(
+            tool_context.state["pending_scene_description"],
+            "Kiddieland with gentle colorful rides.",
+        )
+        self.assertEqual(
+            tool_context.state["pending_scene_base_description"],
+            "Kiddieland with gentle colorful rides.",
+        )
+        self.assertFalse(tool_context.state.get("scene_render_skipped", False))
+
 
 if __name__ == "__main__":
     unittest.main()

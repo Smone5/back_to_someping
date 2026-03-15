@@ -15,7 +15,7 @@ import uuid
 from collections import Counter, deque
 from datetime import timedelta
 from io import BytesIO
-from typing import Any
+from typing import Any, Mapping
 from urllib.parse import urlparse
 
 import resource
@@ -35,6 +35,7 @@ from shared.story_continuity import (
     prime_character_carryover,
     record_continuity_scene,
     update_continuity_from_child_utterance,
+    validate_live_scene_request,
 )
 from shared.storybook_movie_quality import (
     child_age_band,
@@ -47,6 +48,7 @@ from agent.tools import (
     cache_storybook_state,
     load_storybook_resume_state,
     reset_storybook_assembly_lock,
+    supersede_scene_render,
     VisualArgs,
     _build_google_genai_client,
     _crop_image_to_thumbnail_b64,
@@ -102,6 +104,8 @@ _live_request_debug: dict[str, deque[dict[str, Any]]] = {}
 _audio_seen_this_turn: set[str] = set()
 _clean_live_reconnect_sessions: set[str] = set()
 _recent_finished_child_transcripts: dict[str, tuple[str, float]] = {}
+_page_read_aloud_active_sessions: set[str] = set()
+_page_read_aloud_suppress_until: dict[str, float] = {}
 # Coordination: downstream loop sets an Event when waiting for image,
 # _forward_session_events signals it when image arrives.
 _pending_image_events: dict[str, asyncio.Event] = {}
@@ -113,6 +117,8 @@ _early_fallback_started: set[str] = set()
 # Track if a session has successfully received at least one image.
 _session_has_any_image: set[str] = set()
 _live_telemetry_counters: Counter[str] = Counter()
+_PENDING_SCENE_REPLACEMENT_PHASE_ACK = "awaiting_ack"
+_PENDING_SCENE_REPLACEMENT_PHASE_RENDER = "awaiting_render"
 _ALLOWED_ORIGINS = {
     origin
     for origin in {
@@ -245,6 +251,9 @@ _SESSION_STATE_DEFAULTS: dict[str, Any] = {
     "assembly_status": "",
     "scene_render_pending": False,
     "scene_render_skipped": False,
+    "pending_scene_replacement_text": "",
+    "pending_scene_replacement_phase": "",
+    "pending_scene_replacement_armed_at_epoch_ms": 0,
     "queued_scene_child_utterance": "",
     "queued_scene_child_utterance_at_epoch_ms": 0,
     "theater_release_ready": False,
@@ -579,6 +588,35 @@ def _mark_client_transport_activity(session_id: str, *, heartbeat: bool = False)
         _last_client_heartbeat_at[session_id] = now
 
 
+def _set_page_read_aloud_suppression(
+    session_id: str,
+    *,
+    active: bool,
+    suppress_for_ms: int = 0,
+) -> None:
+    now = time.monotonic()
+    if active:
+        _page_read_aloud_active_sessions.add(session_id)
+    else:
+        _page_read_aloud_active_sessions.discard(session_id)
+    if suppress_for_ms > 0:
+        _page_read_aloud_suppress_until[session_id] = now + (suppress_for_ms / 1000.0)
+    elif not active:
+        _page_read_aloud_suppress_until.pop(session_id, None)
+
+
+def _page_read_aloud_suppression_active(session_id: str) -> bool:
+    if session_id in _page_read_aloud_active_sessions:
+        return True
+    deadline = _page_read_aloud_suppress_until.get(session_id)
+    if not deadline:
+        return False
+    if time.monotonic() < deadline:
+        return True
+    _page_read_aloud_suppress_until.pop(session_id, None)
+    return False
+
+
 def _send_live_content(session_id: str, live_queue: LiveRequestQueue, text: str) -> None:
     if not text:
         return
@@ -714,6 +752,7 @@ async def _resume_pending_child_turn(
         return False
 
     resume_text = str(state.get("last_child_utterance", "") or "").strip()
+    replacement_resume_text = str(state.get("pending_scene_replacement_text", "") or "").strip()
     if not resume_text:
         return False
 
@@ -725,6 +764,18 @@ async def _resume_pending_child_turn(
         s["scene_tool_turn_open"] = False
 
     await _mutate_state(runner, user_id, session_id, _clear_pending_on_resume)
+
+    if (
+        replacement_resume_text
+        and _pending_scene_replacement_phase(state) == _PENDING_SCENE_REPLACEMENT_PHASE_ACK
+        and _should_preserve_pending_scene_render(session_id, state)
+    ):
+        _send_pending_scene_replacement_prompt(
+            session_id,
+            live_queue,
+            replacement_resume_text,
+        )
+        return True
 
     if interrupted_resume:
         _bump_live_telemetry("child_turn.recovered")
@@ -761,10 +812,96 @@ def _resolve_image_prefs_from_state(state: dict[str, Any]) -> tuple[str, str, st
     return aspect_ratio, image_size, image_model
 
 
-def _fallback_scene_prompt(assistant_text: str, child_text: str, state: dict[str, Any]) -> str:
+_LOCATION_THEME_STOPWORDS = {
+    "land",
+    "world",
+    "kingdom",
+    "castle",
+    "forest",
+    "garden",
+    "park",
+    "town",
+    "village",
+    "city",
+    "island",
+    "planet",
+    "moon",
+    "beach",
+    "mountain",
+    "mountains",
+}
+
+_FALLBACK_DESTINATION_REQUEST_RE = re.compile(
+    r"\b(?:go|going|take|head|travel|visit|fly|walk)\s+to\b"
+    r"|\b(?:want|wanna)\s+to\s+go\s+to\b"
+    r"|\blet'?s\s+go\s+to\b",
+    flags=re.IGNORECASE,
+)
+
+
+def _location_theme_fragment(label: str) -> str:
+    words = [
+        token.lower()
+        for token in re.findall(r"[A-Za-z][A-Za-z'\-]+", str(label or ""))
+        if token.lower() not in _LOCATION_THEME_STOPWORDS
+    ]
+    if not words:
+        return ""
+    return " ".join(words[:3])
+
+
+def _named_destination_scene_descriptions(location_label: str, prompt_suffix: str = "") -> tuple[str, str]:
+    label = re.sub(r"\s+", " ", str(location_label or "")).strip()
+    if not label:
+        return "", ""
+    theme = _location_theme_fragment(label)
+    if theme:
+        base_description = (
+            f"{label} shimmered with playful {theme} details, welcoming paths, and cozy magical landmarks."
+        )
+        prompt_description = (
+            f"{label}. A bright magical children's storybook setting themed around {theme}, "
+            f"with playful landmarks, welcoming paths, and cozy details that make {label} unmistakable."
+        )
+    else:
+        base_description = f"{label} felt bright, magical, and full of playful landmarks and welcoming paths."
+        prompt_description = (
+            f"{label}. A bright magical children's storybook setting with playful landmarks, "
+            f"welcoming paths, and cozy details that make {label} unmistakable."
+        )
+    cleaned_suffix = re.sub(r"\s+", " ", str(prompt_suffix or "")).strip().strip(".")
+    if cleaned_suffix:
+        prompt_description = f"{prompt_description} {cleaned_suffix}."
+    return prompt_description[:600], base_description[:320]
+
+
+def _fallback_scene_prompt_parts(
+    assistant_text: str,
+    child_text: str,
+    state: dict[str, Any],
+) -> tuple[str, str]:
     cleaned_child = _CTRL_TOKEN_RE.sub("", child_text or "").strip()
     cleaned_assistant = _CTRL_TOKEN_RE.sub("", assistant_text or "").strip()
-    text = cleaned_child if cleaned_child and _child_requested_scene_refresh(cleaned_child) else cleaned_assistant
+    child_refresh = bool(cleaned_child and _child_requested_scene_refresh(cleaned_child))
+    if child_refresh and _FALLBACK_DESTINATION_REQUEST_RE.search(cleaned_child):
+        try:
+            ensure_story_continuity_state(state)
+            continuity_validation = validate_live_scene_request(state, cleaned_child)
+        except Exception:
+            continuity_validation = None
+        location_label = ""
+        prompt_suffix = ""
+        if continuity_validation is not None:
+            location_label = str(getattr(continuity_validation, "location_label", "") or "").strip()
+            prompt_suffix = str(getattr(continuity_validation, "prompt_suffix", "") or "").strip()
+        if location_label:
+            prompt_description, base_description = _named_destination_scene_descriptions(
+                location_label,
+                prompt_suffix=prompt_suffix,
+            )
+            if prompt_description:
+                return prompt_description, base_description or prompt_description
+    text = cleaned_child if child_refresh else cleaned_assistant
     if not text:
         text = cleaned_child
     if not text:
@@ -777,16 +914,30 @@ def _fallback_scene_prompt(assistant_text: str, child_text: str, state: dict[str
     if not text:
         text = "A magical story scene"
     continuity = str(state.get("story_summary", "")).strip()
-    if continuity:
+    if continuity and not child_refresh:
         continuity = re.sub(r"\s+", " ", continuity).strip()
         tail = continuity[-260:]
         if tail and tail not in text:
             text = f"{text}. Keep temporal/character continuity with: {tail}."
-    return text[:600]
+    text = text[:600]
+    return text, text
 
 
 _IMAGE_CHAT_RE = re.compile(
     r"\b(what(?:'s| is| are)|why|who(?:'s| is| are)|how(?:'s| is| are| do| does)|tell me about|i see|look at|look!|that's|that is|it's|it is|so pretty|sparkly|cute|funny|what color|where is|do you see|wow|cool|silly)\b",
+    flags=re.IGNORECASE,
+)
+_OFFTOPIC_CHAT_RE = re.compile(
+    r"\b(?:can|could|do)\s+you\s+(?:still\s+)?(?:hear|see|understand|remember)\s+me\b"
+    r"|\bare\s+you\s+there\b"
+    r"|\bare\s+you\s+listening\b"
+    r"|\btell\s+me\s+(?:a\s+)?joke\b"
+    r"|\b(?:what(?:'s| is)|how(?:'s| is))\s+the\s+weather\b"
+    r"|\b(?:stock|stocks|stock\s+price|market)\b",
+    flags=re.IGNORECASE,
+)
+_MATH_CHAT_RE = re.compile(
+    r"^\s*\d+(?:\s*[+\-*/xX]\s*\d+)+(?:\s*=\s*\d+)?\s*$",
     flags=re.IGNORECASE,
 )
 _LAUGH_CHAT_RE = re.compile(
@@ -822,6 +973,23 @@ _SCENE_DETAIL_LOOK_QUESTION_RE = re.compile(
     r"\bwhat\s+(?:do|does)\b.*\blook like\b",
     flags=re.IGNORECASE,
 )
+_PENDING_SCENE_REPLACE_RE = re.compile(
+    r"^(?:no(?:,)?\s*)?wait\b"
+    r"|^actually\b"
+    r"|^not\b"
+    r"|\binstead\b"
+    r"|\bchange\s+(?:it|that|the\s+(?:picture|page|scene))\b"
+    r"|\bdifferent\s+(?:one|picture|page|scene)\b",
+    flags=re.IGNORECASE,
+)
+_PENDING_SCENE_SEQUENCE_RE = re.compile(
+    r"\bafter\s+(?:that|this|we)\b"
+    r"|\band\s+then\b"
+    r"|\bthen\b"
+    r"|\bnext(?:\s+page)?\b"
+    r"|\bafterwards\b",
+    flags=re.IGNORECASE,
+)
 _ASSISTANT_NEW_SCENE_RE = re.compile(
     r"\b(arrive|reach|step into|inside|through the|suddenly|now you're|now you are|ahead of you|in front of you|at the edge of|deep in|high above|beneath|beyond|opens into)\b",
     flags=re.IGNORECASE,
@@ -852,7 +1020,12 @@ def _child_requested_scene_chat(text: str) -> bool:
     cleaned = _CTRL_TOKEN_RE.sub("", text or "").strip().lower()
     if not cleaned:
         return False
-    if _READ_PAGE_REQUEST_RE.search(cleaned) or _SCENE_DETAIL_LOOK_QUESTION_RE.search(cleaned):
+    if (
+        _READ_PAGE_REQUEST_RE.search(cleaned)
+        or _SCENE_DETAIL_LOOK_QUESTION_RE.search(cleaned)
+        or _OFFTOPIC_CHAT_RE.search(cleaned)
+        or _MATH_CHAT_RE.fullmatch(cleaned)
+    ):
         return True
     if (
         _SCENE_ACTION_RE.search(cleaned)
@@ -871,6 +1044,254 @@ def _scene_render_in_progress(session_id: str, state: dict[str, Any] | None) -> 
     return bool(state.get("scene_render_pending", False)) or session_id in _pending_image_events
 
 
+def _should_preserve_pending_scene_render(
+    session_id: str,
+    state: dict[str, Any] | None,
+) -> bool:
+    if not isinstance(state, dict):
+        return session_id in _pending_image_events
+    if bool(state.get("scene_render_skipped", False)):
+        return False
+    return bool(
+        state.get("scene_render_pending", False)
+        or str(state.get("pending_scene_description", "") or "").strip()
+        or str(state.get("pending_scene_base_description", "") or "").strip()
+        or session_id in _pending_image_events
+    )
+
+
+def _can_interact_with_pending_scene_render(
+    session_id: str,
+    state: dict[str, Any] | None,
+) -> bool:
+    if _storybook_assembly_in_progress(state):
+        return False
+    return _scene_render_in_progress(session_id, state)
+
+
+def _should_reset_live_for_pending_scene_replacement(session_id: str) -> bool:
+    # Replacement turns are safer when they begin from a fresh Live request queue.
+    # Reusing the current queue lets stale narration/name-confirmation spill into
+    # the acknowledgment turn before the new destination prompt takes effect.
+    return True
+
+
+def _should_activate_barge_in_for_pending_scene_replacement(session_id: str) -> bool:
+    return (
+        session_id in _assistant_speaking_sessions
+        or session_id in _awaiting_greeting_sessions
+    )
+
+
+def _should_keep_live_open_for_pending_scene_replacement_follow_up(
+    state: dict[str, Any] | None,
+) -> bool:
+    if not isinstance(state, dict):
+        return False
+    return bool(str(state.get("pending_scene_replacement_text", "") or "").strip())
+
+
+def _pending_scene_replacement_phase(state: dict[str, Any] | None) -> str:
+    if not isinstance(state, dict):
+        return ""
+    return str(state.get("pending_scene_replacement_phase", "") or "").strip()
+
+
+def _should_ignore_nonpersistent_scene_ready(
+    state: dict[str, Any] | None,
+    *,
+    request_id: str | None,
+) -> bool:
+    if not isinstance(state, dict):
+        return False
+    normalized_request_id = str(request_id or "").strip()
+    pending_replacement_text = str(state.get("pending_scene_replacement_text", "") or "").strip()
+    pending_replacement_phase = _pending_scene_replacement_phase(state)
+    if pending_replacement_text and pending_replacement_phase in {
+        _PENDING_SCENE_REPLACEMENT_PHASE_ACK,
+        _PENDING_SCENE_REPLACEMENT_PHASE_RENDER,
+    }:
+        return True
+    active_request_id = str(state.get("active_scene_request_id", "") or "").strip()
+    if active_request_id and normalized_request_id and normalized_request_id != active_request_id:
+        return True
+    if (
+        active_request_id
+        and not normalized_request_id
+        and (
+            bool(state.get("scene_render_pending", False))
+            or bool(str(state.get("pending_scene_description", "") or "").strip())
+            or bool(str(state.get("pending_scene_base_description", "") or "").strip())
+        )
+    ):
+        return True
+    return False
+
+
+def _pending_scene_replacement_armed_at_epoch_ms(state: dict[str, Any] | None) -> int:
+    if not isinstance(state, dict):
+        return 0
+    try:
+        return int(state.get("pending_scene_replacement_armed_at_epoch_ms", 0) or 0)
+    except Exception:
+        return 0
+
+
+def _has_pending_scene_replacement(state: dict[str, Any] | None) -> bool:
+    if not isinstance(state, dict):
+        return False
+    return bool(str(state.get("pending_scene_replacement_text", "") or "").strip())
+
+
+def _is_pending_scene_replacement_ack_turn(
+    state: dict[str, Any] | None,
+    *,
+    scene_visuals_called_this_turn: bool,
+) -> bool:
+    return (
+        not scene_visuals_called_this_turn
+        and _pending_scene_replacement_phase(state) == _PENDING_SCENE_REPLACEMENT_PHASE_ACK
+        and _has_pending_scene_replacement(state)
+    )
+
+
+def _is_pending_scene_replacement_follow_up_turn(
+    state: dict[str, Any] | None,
+    *,
+    scene_visuals_called_this_turn: bool,
+) -> bool:
+    if scene_visuals_called_this_turn:
+        return False
+    phase = _pending_scene_replacement_phase(state)
+    return phase in {
+        _PENDING_SCENE_REPLACEMENT_PHASE_ACK,
+        _PENDING_SCENE_REPLACEMENT_PHASE_RENDER,
+    } and _has_pending_scene_replacement(state)
+
+
+def _should_retry_pending_scene_replacement_ack(
+    state: dict[str, Any] | None,
+    *,
+    had_child_input_this_turn: bool,
+    model_emitted_meaningful_output: bool,
+    scene_visuals_called_this_turn: bool,
+) -> bool:
+    return (
+        had_child_input_this_turn
+        and not model_emitted_meaningful_output
+        and _is_pending_scene_replacement_ack_turn(
+            state,
+            scene_visuals_called_this_turn=scene_visuals_called_this_turn,
+        )
+    )
+
+
+def _should_hold_scene_tools_for_pending_replacement_ack(
+    state: dict[str, Any] | None,
+) -> bool:
+    return _pending_scene_replacement_phase(state) == _PENDING_SCENE_REPLACEMENT_PHASE_ACK and _has_pending_scene_replacement(state)
+
+
+_PENDING_SCENE_REPLACEMENT_ACK_SIGNAL_RE = re.compile(
+    r"\b(?:okay|ok|got it|sure|alright|all right|switch|change|instead|we(?:'ll| will)|let'?s|hear you|heard you)\b",
+    flags=re.IGNORECASE,
+)
+_PENDING_SCENE_REPLACEMENT_ACK_INVALID_RE = re.compile(
+    r"\b(?:close your eyes|imagine|what kind of story|what story|what adventure|what should we do|what do you want|what would you like|is your name|did i hear|did i get your name|your magical name|is that right)\b",
+    flags=re.IGNORECASE,
+)
+
+
+def _pending_scene_replacement_target_label(state: dict[str, Any] | None) -> str:
+    if not isinstance(state, dict):
+        return ""
+    world = state.get("continuity_world_state", {})
+    if isinstance(world, Mapping):
+        pending_label = str(world.get("pending_location_label", "") or "").strip()
+        if pending_label:
+            return pending_label
+    return ""
+
+
+def _current_scene_location_label(state: dict[str, Any] | None) -> str:
+    if not isinstance(state, dict):
+        return ""
+    world = state.get("continuity_world_state", {})
+    if isinstance(world, Mapping):
+        current_label = str(world.get("current_location_label", "") or "").strip()
+        if current_label:
+            return current_label
+    return ""
+
+
+def _is_valid_pending_scene_replacement_ack_text(
+    state: dict[str, Any] | None,
+    text: str,
+) -> bool:
+    cleaned = _CTRL_TOKEN_RE.sub("", text or "").strip()
+    if not _is_meaningful_text(cleaned):
+        return False
+    if _PENDING_SCENE_REPLACEMENT_ACK_INVALID_RE.search(cleaned):
+        return False
+    if _STORY_PROMPT_RE.search(cleaned):
+        return False
+    if _CAMERA_PROMPT_RE.search(cleaned):
+        return False
+    target_label = _pending_scene_replacement_target_label(state)
+    mentions_target = bool(
+        target_label
+        and re.search(rf"\b{re.escape(target_label)}\b", cleaned, flags=re.IGNORECASE)
+    )
+    ack_signal = bool(_PENDING_SCENE_REPLACEMENT_ACK_SIGNAL_RE.search(cleaned))
+    word_count = len(re.findall(r"[A-Za-z][A-Za-z'\-]+", cleaned))
+    if word_count > 18 and not (ack_signal and mentions_target):
+        return False
+    if mentions_target:
+        return ack_signal or word_count <= 12
+    return ack_signal and word_count <= 12
+
+
+def _should_abort_partial_pending_scene_replacement_ack(
+    state: dict[str, Any] | None,
+    text: str,
+) -> bool:
+    cleaned = _CTRL_TOKEN_RE.sub("", text or "").strip()
+    if not _is_meaningful_text(cleaned):
+        return False
+    if _PENDING_SCENE_REPLACEMENT_ACK_INVALID_RE.search(cleaned):
+        return True
+    target_label = _pending_scene_replacement_target_label(state)
+    current_label = _current_scene_location_label(state)
+    mentions_target = bool(
+        target_label
+        and re.search(rf"\b{re.escape(target_label)}\b", cleaned, flags=re.IGNORECASE)
+    )
+    mentions_current = bool(
+        current_label
+        and re.search(rf"\b{re.escape(current_label)}\b", cleaned, flags=re.IGNORECASE)
+    )
+    ack_signal = bool(_PENDING_SCENE_REPLACEMENT_ACK_SIGNAL_RE.search(cleaned))
+    word_count = len(re.findall(r"[A-Za-z][A-Za-z'\-]+", cleaned))
+    if mentions_current and not mentions_target:
+        return True
+    if word_count >= 5 and not ack_signal and not mentions_target:
+        return True
+    return False
+
+
+def _should_ignore_turn_complete_while_waiting_for_pending_replacement_ack(
+    state: dict[str, Any] | None,
+    *,
+    last_finished_assistant_output_at_epoch_ms: int,
+) -> bool:
+    if not _should_hold_scene_tools_for_pending_replacement_ack(state):
+        return False
+    armed_at = _pending_scene_replacement_armed_at_epoch_ms(state)
+    if armed_at > 0:
+        return int(last_finished_assistant_output_at_epoch_ms or 0) <= armed_at
+    return int(last_finished_assistant_output_at_epoch_ms or 0) <= 0
+
+
 def _queue_latest_scene_follow_up_request(state: dict[str, Any], child_utterance: str) -> None:
     queued_text = str(child_utterance or "").strip()
     if not queued_text:
@@ -880,6 +1301,99 @@ def _queue_latest_scene_follow_up_request(state: dict[str, Any], child_utterance
     state["partial_child_utterance"] = queued_text
     state["partial_child_utterance_finished"] = True
     _capture_child_story_continuity(state, queued_text)
+
+
+def _classify_pending_scene_interrupt(text: str) -> str:
+    cleaned = _CTRL_TOKEN_RE.sub("", text or "").strip().lower()
+    if not cleaned or not _child_requested_scene_refresh(cleaned):
+        return ""
+    if _PENDING_SCENE_REPLACE_RE.search(cleaned):
+        return "replace"
+    if _PENDING_SCENE_SEQUENCE_RE.search(cleaned):
+        return "queue"
+    return "replace"
+
+
+def _discard_unshown_pending_scene_slot(state: dict[str, Any]) -> None:
+    active_request_id = str(state.get("active_scene_request_id", "") or "").strip()
+    if not active_request_id:
+        return
+
+    points = _scene_branch_points(state)
+    kept_points: list[dict[str, Any]] = []
+    removed_point = False
+    for point in points:
+        point_request_id = str(point.get("request_id", "") or "").strip()
+        image_url = str(point.get("image_url", "") or "").strip()
+        gcs_uri = str(point.get("gcs_uri", "") or "").strip()
+        if point_request_id == active_request_id and not image_url and not gcs_uri:
+            removed_point = True
+            continue
+        kept_points.append(point)
+    if removed_point:
+        state["scene_branch_points"] = kept_points[-20:]
+
+    raw_pages = state.get("story_pages", [])
+    if not isinstance(raw_pages, list):
+        return
+    kept_pages: list[dict[str, Any]] = []
+    removed_page = False
+    for page in raw_pages:
+        if not isinstance(page, dict):
+            continue
+        page_request_id = str(page.get("request_id", "") or "").strip()
+        image_url = str(page.get("image_url", "") or "").strip()
+        gcs_uri = str(page.get("gcs_uri", "") or "").strip()
+        if page_request_id == active_request_id and not image_url and not gcs_uri:
+            removed_page = True
+            continue
+        kept_pages.append(dict(page))
+    if removed_page:
+        state["story_pages"] = kept_pages[-40:]
+
+
+def _arm_pending_scene_replacement(state: dict[str, Any], child_utterance: str) -> str:
+    replacement_text = str(child_utterance or "").strip()
+    if not replacement_text:
+        return ""
+    _discard_unshown_pending_scene_slot(state)
+    state["active_scene_request_id"] = ""
+    state["pending_scene_description"] = ""
+    state["pending_scene_base_description"] = ""
+    state["pending_scene_replacement_text"] = replacement_text
+    state["pending_scene_replacement_phase"] = _PENDING_SCENE_REPLACEMENT_PHASE_ACK
+    state["pending_scene_replacement_armed_at_epoch_ms"] = int(time.time() * 1000)
+    state["queued_scene_child_utterance"] = ""
+    state["queued_scene_child_utterance_at_epoch_ms"] = 0
+    state["pending_response"] = True
+    state["pending_response_interrupted"] = False
+    state["scene_tool_turn_open"] = True
+    state["pending_response_token"] = uuid.uuid4().hex
+    state["last_child_utterance"] = replacement_text
+    state["partial_child_utterance"] = replacement_text
+    state["partial_child_utterance_finished"] = True
+    _capture_child_story_continuity(state, replacement_text)
+    return replacement_text
+
+
+def _mark_pending_scene_wait_response(
+    state: dict[str, Any],
+    *,
+    child_utterance: str,
+) -> None:
+    # Keep render-wait chatter out of story continuity so casual small-talk
+    # does not become a new canonical story wish.
+    utterance = str(child_utterance or "").strip()
+    state["pending_scene_replacement_text"] = ""
+    state["pending_scene_replacement_phase"] = ""
+    state["pending_scene_replacement_armed_at_epoch_ms"] = 0
+    state["pending_response"] = True
+    state["pending_response_interrupted"] = False
+    state["scene_tool_turn_open"] = True
+    state["pending_response_token"] = uuid.uuid4().hex
+    state["last_child_utterance"] = utterance
+    state["partial_child_utterance"] = utterance
+    state["partial_child_utterance_finished"] = True
 
 
 def _arm_queued_scene_follow_up_after_render(state: dict[str, Any]) -> str:
@@ -892,6 +1406,9 @@ def _arm_queued_scene_follow_up_after_render(state: dict[str, Any]) -> str:
         return ""
     state["queued_scene_child_utterance"] = ""
     state["queued_scene_child_utterance_at_epoch_ms"] = 0
+    state["pending_scene_replacement_text"] = ""
+    state["pending_scene_replacement_phase"] = ""
+    state["pending_scene_replacement_armed_at_epoch_ms"] = 0
     state["pending_response"] = True
     state["pending_response_interrupted"] = False
     state["scene_tool_turn_open"] = True
@@ -923,21 +1440,81 @@ def _send_queued_scene_follow_up_prompt(
     )
 
 
+def _send_pending_scene_replacement_prompt(
+    session_id: str,
+    live_queue: LiveRequestQueue,
+    replacement_text: str,
+) -> None:
+    cleaned = str(replacement_text or "").strip()
+    if not cleaned:
+        return
+    _send_live_content(
+        session_id,
+        live_queue,
+        (
+            "The child changed their mind before the new page appeared. "
+            "You are in an acknowledgment-only turn. "
+            "Say exactly one short warm out-loud acknowledgment, like "
+            "\"Okay, let's change it\" or \"Got it, we'll switch there.\" "
+            f"The new destination is: \"{cleaned}\". "
+            "Do NOT call any tools in this response. Do NOT describe the old page. "
+            "Do NOT continue the story yet. The system will start the new picture right after you finish this short spoken acknowledgment. "
+            "Do not stay silent, and do not ask the child to repeat it."
+        ),
+    )
+
+
+def _publish_quick_ack(
+    session_id: str,
+    *,
+    text: str = "Okay, let's change it.",
+    interrupt_audio: bool = True,
+) -> None:
+    if not session_id:
+        return
+    publish_session_event(
+        session_id,
+        {
+            "type": "quick_ack",
+            "payload": {
+                "text": str(text or "Okay, let's change it.").strip() or "Okay, let's change it.",
+                "interrupt_audio": bool(interrupt_audio),
+            },
+        },
+    )
+
+
 def _should_trigger_fallback_scene(
     assistant_text: str,
     child_text: str,
     state: dict[str, Any],
 ) -> bool:
-    if not _has_rendered_scene(state):
-        return bool(_CTRL_TOKEN_RE.sub("", assistant_text or "").strip())
-    if _READ_PAGE_REQUEST_RE.search(_CTRL_TOKEN_RE.sub("", child_text or "").strip().lower()):
-        return False
-    if _child_requested_scene_refresh(child_text):
-        return True
     cleaned_child = _CTRL_TOKEN_RE.sub("", child_text or "").strip()
     cleaned_assistant = _CTRL_TOKEN_RE.sub("", assistant_text or "").strip()
     if cleaned_child and _child_requested_scene_chat(cleaned_child):
         return False
+    if (
+        cleaned_child
+        and _is_low_signal_single_word_child_utterance(cleaned_child, state)
+        and not _child_requested_scene_refresh(cleaned_child)
+    ):
+        return False
+    if (
+        (
+            bool(state.get("scene_render_pending", False))
+            or bool(str(state.get("pending_scene_description", "") or "").strip())
+            or bool(str(state.get("pending_scene_base_description", "") or "").strip())
+        )
+        and cleaned_child
+        and not _child_requested_scene_refresh(cleaned_child)
+    ):
+        return False
+    if not _has_rendered_scene(state):
+        return bool(cleaned_child and cleaned_assistant)
+    if _READ_PAGE_REQUEST_RE.search(cleaned_child.lower()):
+        return False
+    if _child_requested_scene_refresh(child_text):
+        return True
     return bool(cleaned_assistant and _ASSISTANT_NEW_SCENE_RE.search(cleaned_assistant))
 
 
@@ -958,13 +1535,14 @@ async def _trigger_fallback_scene(
     except Exception:
         session = None
     state = session.state if session else {}
-    description = _fallback_scene_prompt(assistant_text, child_text, state)
+    description, base_description = _fallback_scene_prompt_parts(assistant_text, child_text, state)
     aspect_ratio, image_size, image_model = _resolve_image_prefs_from_state(state)
     delivery_format, delivery_quality, delivery_max_side = _resolve_delivery_preferences(state, image_size)
     request_id = uuid.uuid4().hex
     try:
         args = VisualArgs(
             description=description,
+            base_description=base_description,
             negative_prompt=VisualArgs.model_fields["negative_prompt"].default,
             aspect_ratio=aspect_ratio,
             image_size=image_size,
@@ -985,6 +1563,7 @@ async def _trigger_fallback_scene(
                 state,
                 request_id=request_id,
                 description=description,
+                base_description=base_description,
             ),
         )
     except Exception:
@@ -1012,6 +1591,46 @@ async def _trigger_fallback_scene(
     _scene_gen_requested_at[session_id] = time.monotonic()
     _record_live_request(session_id, "fallback_scene", {"desc": description[:140]})
     schedule_background_task(_run_visual_pipeline(args=args, session_id=session_id))
+
+
+async def _trigger_pending_scene_replacement_scene(
+    session_id: str,
+    replacement_text: str,
+    runner: Runner,
+    websocket: WebSocket,
+    user_id: str,
+) -> None:
+    cleaned = _CTRL_TOKEN_RE.sub("", replacement_text or "").strip()
+    if not cleaned:
+        return
+    logger.info(
+        "Triggering replacement scene generation for session %s: %s",
+        session_id,
+        cleaned[:100],
+    )
+    await _trigger_fallback_scene(
+        session_id=session_id,
+        assistant_text="",
+        child_text=cleaned,
+        runner=runner,
+        websocket=websocket,
+        user_id=user_id,
+    )
+
+
+def _should_auto_confirm_name_on_story_shortcircuit(
+    utterance_text: str | None,
+    detected_name: str | None,
+    child_age: int,
+) -> bool:
+    if not str(detected_name or "").strip():
+        return False
+    if int(child_age or 0) > 5:
+        return True
+    cleaned = _CTRL_TOKEN_RE.sub("", utterance_text or "").strip()
+    if not cleaned:
+        return False
+    return bool(_NAME_PHRASE_RE.search(cleaned))
 
 
 def _closest_aspect_ratio(width: float, height: float) -> str:
@@ -1550,6 +2169,33 @@ _NAME_REJECT_WORDS = {
     "the", "there", "this", "uh", "um", "we", "well", "what", "who", "why", "will",
     "yes", "you", "your", "here", "there", "their", "they", "them", "he", "her", "him",
 }
+_SELF_INTRO_NAME_PREFIX_RE = re.compile(r"^(?:i am|i['’]m)\b", flags=re.IGNORECASE)
+_SELF_INTRO_NAME_TRAILING_OK_RE = re.compile(
+    r"^(?:"
+    r"[.!?,;:]+"
+    r"|\band\b"
+    r"|\bbut\b"
+    r"|\bso\b"
+    r"|\bcan\b"
+    r"|\bcould\b"
+    r"|\bwill\b"
+    r"|\bwould\b"
+    r"|\bshould\b"
+    r"|\bmay\b"
+    r"|\bdo\b"
+    r"|\bdid\b"
+    r"|\bwe\b"
+    r"|\bwhat\b"
+    r"|\bwhere\b"
+    r"|\bwhen\b"
+    r"|\bwhy\b"
+    r"|\bhow\b"
+    r"|\blet\b"
+    r"|\blet['’]s\b"
+    r"|\bplease\b"
+    r")",
+    flags=re.IGNORECASE,
+)
 _NAME_NEGATION_RE = re.compile(
     r"\b(nope|nah|not|isn't|is not|that's not|that is not|wrong)\b",
     flags=re.IGNORECASE,
@@ -2003,8 +2649,39 @@ def _looks_like_child_speech(text: str | None) -> bool:
     return vowelish_tokens >= 2
 
 
-def _is_actionable_child_text(text: str | None) -> bool:
-    return _is_meaningful_text(text) and _looks_like_child_speech(text)
+def _allows_freeform_single_word_child_turn(state: dict[str, Any] | None) -> bool:
+    if not isinstance(state, dict):
+        return False
+    return (
+        not bool(state.get("story_started", False))
+        or not bool(state.get("name_confirmed", False))
+    )
+
+
+def _is_low_signal_single_word_child_utterance(
+    text: str | None,
+    state: dict[str, Any] | None,
+) -> bool:
+    tokens = _speech_tokens(text)
+    if len(tokens) != 1:
+        return False
+    token = tokens[0].lower()
+    if token in _SHORT_ACTIONABLE_UTTERANCES:
+        return False
+    return not _allows_freeform_single_word_child_turn(state)
+
+
+def _is_actionable_child_text(
+    text: str | None,
+    state: dict[str, Any] | None = None,
+) -> bool:
+    if not _is_meaningful_text(text):
+        return False
+    if not _looks_like_child_speech(text):
+        return False
+    if _is_low_signal_single_word_child_utterance(text, state):
+        return False
+    return True
 
 
 def _partial_child_utterance_is_resumable(text: str | None) -> bool:
@@ -2035,6 +2712,7 @@ def _scene_branch_state_snapshot(state: dict[str, Any]) -> dict[str, Any]:
     snapshot["pending_scene_branch_number"] = 0
     snapshot["pending_scene_branch_label"] = ""
     snapshot["pending_response"] = False
+    snapshot["pending_scene_replacement_phase"] = ""
     return snapshot
 
 
@@ -2104,6 +2782,9 @@ def _storybook_scene_state_payload(state: dict[str, Any]) -> dict[str, Any]:
 def _clear_pending_scene_request_metadata(state: dict[str, Any]) -> None:
     state["pending_scene_description"] = ""
     state["pending_scene_base_description"] = ""
+    state["pending_scene_replacement_text"] = ""
+    state["pending_scene_replacement_phase"] = ""
+    state["pending_scene_replacement_armed_at_epoch_ms"] = 0
     state["scene_render_skipped"] = False
 
 
@@ -2112,14 +2793,19 @@ def _prime_pending_scene_request(
     *,
     request_id: str | None,
     description: str = "",
+    base_description: str = "",
 ) -> None:
     normalized_request_id = str(request_id or "").strip()
     normalized_description = str(description or "").strip()
+    normalized_base_description = str(base_description or "").strip()
     if normalized_request_id:
         state["active_scene_request_id"] = normalized_request_id
     if normalized_description:
         state["pending_scene_description"] = normalized_description
-        state["pending_scene_base_description"] = normalized_description
+        state["pending_scene_base_description"] = normalized_base_description or normalized_description
+    state["pending_scene_replacement_text"] = ""
+    state["pending_scene_replacement_phase"] = ""
+    state["pending_scene_replacement_armed_at_epoch_ms"] = 0
 
 
 def _scene_request_matches_active_request(
@@ -2175,6 +2861,20 @@ def _apply_nonpersistent_scene_ready_to_state(
     description: str = "",
     storybeat_text: str = "",
 ) -> None:
+    if _should_ignore_nonpersistent_scene_ready(state, request_id=request_id):
+        state["scene_render_pending"] = bool(
+            str(state.get("pending_scene_description", "") or "").strip()
+            or str(state.get("pending_scene_base_description", "") or "").strip()
+            or (
+                str(state.get("pending_scene_replacement_text", "") or "").strip()
+                and _pending_scene_replacement_phase(state)
+                in {
+                    _PENDING_SCENE_REPLACEMENT_PHASE_ACK,
+                    _PENDING_SCENE_REPLACEMENT_PHASE_RENDER,
+                }
+            )
+        )
+        return
     if looks_like_image:
         if not _scene_request_matches_active_request(state, request_id=request_id):
             state["scene_render_pending"] = bool(
@@ -2457,6 +3157,21 @@ def _detect_voice_ui_intent(text: str | None, state: dict[str, Any]) -> tuple[st
     return None, {}
 
 
+def _should_resume_story_from_toy_share(text: str | None, state: dict[str, Any]) -> bool:
+    cleaned = _CTRL_TOKEN_RE.sub("", text or "").strip()
+    if not cleaned or not bool(state.get("toy_share_active", False)):
+        return False
+    if _TOY_SHARE_REQUEST_RE.search(cleaned) or _TOY_SHARE_CLOSE_RE.search(cleaned):
+        return False
+    if _child_requested_scene_refresh(cleaned):
+        return True
+    if _is_navigation_page_turn_request(cleaned):
+        return True
+    if _is_explicit_visual_request(cleaned):
+        return True
+    return False
+
+
 _ASSISTANT_TURN_COMPLETE_RE = re.compile(
     r"(?:\?\s*$|\b(?:should we|do you want|which one|what should we do|what do you want to do|where should we go)\b.*\bor\b.*[.?!]*$)",
     flags=re.IGNORECASE,
@@ -2699,6 +3414,11 @@ def _extract_child_name(text: str | None) -> str | None:
         candidate = match.group(1).strip(" .,!?:;").title()
         if candidate.lower() in _NAME_REJECT_WORDS:
             return None
+        matched_prefix = match.group(0).strip()
+        trailing_text = cleaned[match.end():].lstrip()
+        if _SELF_INTRO_NAME_PREFIX_RE.match(matched_prefix):
+            if trailing_text and not _SELF_INTRO_NAME_TRAILING_OK_RE.match(trailing_text):
+                return None
         return candidate
 
     # If the child only says a single token (e.g. "Aaron"), treat it as a name.
@@ -3923,6 +4643,8 @@ async def handle_storyteller_ws(websocket: WebSocket, runner: Runner) -> None:
             _mark_client_transport_activity(session_id)
 
             if "bytes" in raw and raw["bytes"]:
+                if _page_read_aloud_suppression_active(session_id):
+                    continue
                 if agent_task is None or agent_task.done():
                     if agent_task is not None and agent_task.done():
                         await _ensure_agent_started()
@@ -3996,6 +4718,7 @@ async def handle_storyteller_ws(websocket: WebSocket, runner: Runner) -> None:
                             ClientCommandType.CLIENT_READY,
                             ClientCommandType.ACTIVITY_START,
                             ClientCommandType.ACTIVITY_END,
+                            ClientCommandType.PAGE_READ_ALOUD,
                         }:
                             continue
                         if cmd.type == ClientCommandType.ACTIVITY_START and (agent_task is None or agent_task.done()):
@@ -4053,6 +4776,8 @@ async def handle_storyteller_ws(websocket: WebSocket, runner: Runner) -> None:
             _assistant_speaking_sessions.discard(session_id)
             _assistant_speaking_since.pop(session_id, None)
             _interrupted_turn_sessions.discard(session_id)
+            _page_read_aloud_active_sessions.discard(session_id)
+            _page_read_aloud_suppress_until.pop(session_id, None)
             _ending_story_sessions.discard(session_id)
             _ending_story_flush_sessions.discard(session_id)
             _video_generation_started_sessions.discard(session_id)
@@ -4125,6 +4850,7 @@ async def _run_agent(
     silent_recovery_attempts = 0
     last_output_transcription: str = ""
     assistant_finished_utterances_this_turn = 0
+    last_finished_assistant_output_at_epoch_ms = 0
     heard_humanish_speech_this_turn = False
     heard_noise_only_this_turn = False
     reconnect_attempt = 0
@@ -4579,6 +5305,18 @@ async def _run_agent(
                                         session_id,
                                     )
                                     continue
+                                storage_session = _get_storage_session(runner, user_id, session_id)
+                                current_tool_state = (
+                                    dict(storage_session.state)
+                                    if storage_session is not None and isinstance(storage_session.state, dict)
+                                    else {}
+                                )
+                                if _should_hold_scene_tools_for_pending_replacement_ack(current_tool_state):
+                                    logger.info(
+                                        "Ignoring function call while waiting for pending replacement acknowledgment in session %s",
+                                        session_id,
+                                    )
+                                    continue
                                 if turn_output_sealed_until_child_input and session_id not in _ending_story_sessions:
                                     logger.info(
                                         "Dropping stale function call after turn completion for session %s",
@@ -4608,6 +5346,18 @@ async def _run_agent(
                                 if session_id in _ending_story_sessions:
                                     logger.info(
                                         "Dropping tool response during movie assembly for session %s",
+                                        session_id,
+                                    )
+                                    continue
+                                storage_session = _get_storage_session(runner, user_id, session_id)
+                                current_tool_state = (
+                                    dict(storage_session.state)
+                                    if storage_session is not None and isinstance(storage_session.state, dict)
+                                    else {}
+                                )
+                                if _should_hold_scene_tools_for_pending_replacement_ack(current_tool_state):
+                                    logger.info(
+                                        "Ignoring function response while waiting for pending replacement acknowledgment in session %s",
                                         session_id,
                                     )
                                     continue
@@ -4650,6 +5400,13 @@ async def _run_agent(
                         if raw_text:
                             cleaned_text = _normalize_transcript_text(raw_text)
                             scrubbed = await scrub_pii(cleaned_text or raw_text)
+                            if _page_read_aloud_suppression_active(session_id):
+                                logger.info(
+                                    "Ignoring child transcription during page read-aloud suppression for session %s: %s",
+                                    session_id,
+                                    scrubbed[:120],
+                                )
+                                continue
                             logger.info("Child said (scrubbed): %s", scrubbed[:120])
                             input_finished = bool(getattr(event.input_transcription, "finished", False))
                             meta_only_finished_transcription = input_finished and _is_meta_only_transcription(raw_text)
@@ -4669,7 +5426,10 @@ async def _run_agent(
                                 )
                                 # If the live model started a turn from pure placeholder/noise input,
                                 # mark it interrupted so any stray follow-up text is discarded.
-                                if session_id not in _assistant_speaking_sessions:
+                                if (
+                                    session_id in _assistant_speaking_sessions
+                                    or session_id in _awaiting_greeting_sessions
+                                ):
                                     _activate_barge_in(session_id)
                             humanish_child_text = _looks_like_child_speech(cleaned_text)
                             actionable_child_text = _is_actionable_child_text(cleaned_text)
@@ -4767,11 +5527,53 @@ async def _run_agent(
                                     session_id=session_id,
                                 )
                                 state = session.state if session else {}
+                                if actionable_child_text:
+                                    actionable_child_text = _is_actionable_child_text(
+                                        cleaned_text or raw_text,
+                                        state,
+                                    )
+                                    if not actionable_child_text:
+                                        logger.info(
+                                            "Ignoring low-signal finished child transcription for session %s: %s",
+                                            session_id,
+                                            scrubbed[:120],
+                                        )
+                                if (
+                                    actionable_child_text
+                                    and _should_resume_story_from_toy_share(cleaned_text or raw_text, state)
+                                ):
+                                    await _mutate_state(
+                                        runner=runner,
+                                        user_id=user_id,
+                                        session_id=session_id,
+                                        mutator=_finish_toy_share_state,
+                                    )
+                                    state["toy_share_active"] = False
+                                    state["toy_share_turns_remaining"] = 0
+                                    _publish_ui_command(
+                                        session_id,
+                                        "close_toy_share",
+                                        reason="resume_story",
+                                        source="system",
+                                    )
+                                    logger.info(
+                                        "Auto-resuming story from toy share for session %s after child request: %s",
+                                        session_id,
+                                        (cleaned_text or raw_text)[:160],
+                                    )
                                 story_started = bool(state.get("story_started", False))
                                 assembly_wait_mode = (
                                     session_id in _ending_story_sessions
                                     and session_id not in _ending_story_flush_sessions
                                     and _storybook_assembly_in_progress(state)
+                                )
+                                pending_scene_render_mode = (
+                                    actionable_child_text
+                                    and _can_interact_with_pending_scene_render(session_id, state)
+                                )
+                                scene_render_wait_mode = (
+                                    pending_scene_render_mode
+                                    and not _child_requested_scene_refresh(cleaned_text or raw_text)
                                 )
                                 if actionable_child_text and assembly_wait_mode:
                                     wait_activity: dict[str, str] = {"key": ""}
@@ -4794,6 +5596,17 @@ async def _run_agent(
                                         mutator=_mark_pending_assembly,
                                     )
                                     voice_ui_consumed = True
+                                elif actionable_child_text and scene_render_wait_mode:
+                                    await _mutate_state(
+                                        runner=runner,
+                                        user_id=user_id,
+                                        session_id=session_id,
+                                        mutator=lambda s: _mark_pending_scene_wait_response(
+                                            s,
+                                            child_utterance=cleaned_text or raw_text,
+                                        ),
+                                    )
+                                    voice_ui_consumed = True
                                 if actionable_child_text and not voice_ui_consumed:
                                     intent, intent_payload = _detect_voice_ui_intent(cleaned_text or raw_text, state)
                                     if intent:
@@ -4806,6 +5619,89 @@ async def _run_agent(
                                             user_id=user_id,
                                             live_queue=live_queue,
                                         )
+
+                                queued_scene_follow_up = False
+                                immediate_scene_replacement = False
+                                if (
+                                    actionable_child_text
+                                    and input_finished
+                                    and not voice_ui_consumed
+                                    and pending_scene_render_mode
+                                    and _child_requested_scene_refresh(cleaned_text or raw_text)
+                                ):
+                                    interrupt_mode = _classify_pending_scene_interrupt(cleaned_text or raw_text)
+                                    if interrupt_mode == "queue":
+                                        queued_scene_follow_up = True
+
+                                        def _queue_scene_follow_up(s: dict[str, Any]) -> None:
+                                            _queue_latest_scene_follow_up_request(s, cleaned_text or raw_text)
+
+                                        await _mutate_state(runner, user_id, session_id, _queue_scene_follow_up)
+                                        logger.info(
+                                            "Queued latest child scene request after the current pending render for session %s: %s",
+                                            session_id,
+                                            (cleaned_text or raw_text)[:160],
+                                        )
+                                        voice_ui_consumed = True
+                                    elif interrupt_mode == "replace":
+                                        immediate_scene_replacement = True
+
+                                        def _mark_scene_replacement_pending(s: dict[str, Any]) -> None:
+                                            _arm_pending_scene_replacement(s, cleaned_text or raw_text)
+
+                                        await _mutate_state(
+                                            runner,
+                                            user_id,
+                                            session_id,
+                                            _mark_scene_replacement_pending,
+                                        )
+                                        supersede_scene_render(session_id)
+                                        if (
+                                            _barge_in_enabled()
+                                            and _should_activate_barge_in_for_pending_scene_replacement(session_id)
+                                        ):
+                                            _activate_barge_in(session_id)
+                                        _publish_quick_ack(
+                                            session_id,
+                                            text="Okay, let's change it.",
+                                            interrupt_audio=True,
+                                        )
+                                        if _should_reset_live_for_pending_scene_replacement(session_id):
+                                            live_queue.reset(session_id, "pending_scene_replace")
+                                        _send_pending_scene_replacement_prompt(
+                                            session_id,
+                                            live_queue,
+                                            cleaned_text or raw_text,
+                                        )
+                                        # Start a fresh live turn for the spoken acknowledgment instead of
+                                        # carrying forward the old scene turn's tool/output flags.
+                                        child_utterance_this_turn = cleaned_text or raw_text
+                                        last_child_utterance = cleaned_text or raw_text
+                                        last_persisted_partial_child_utterance = cleaned_text or raw_text
+                                        last_persisted_partial_child_utterance_finished = True
+                                        scene_visuals_called_this_turn = False
+                                        model_emitted_meaningful_output = False
+                                        assistant_parts = []
+                                        last_output_transcription = ""
+                                        assistant_output_soft_closed = False
+                                        assistant_output_hard_closed = False
+                                        assistant_audio_closed_after_finish = False
+                                        assistant_finished_utterances_this_turn = 0
+                                        last_finished_assistant_output_at_epoch_ms = 0
+                                        heard_humanish_speech_this_turn = True
+                                        heard_noise_only_this_turn = False
+                                        _audio_seen_this_turn.discard(session_id)
+                                        deferred_opening_turn_complete = False
+                                        _cancel_deferred_opening_finalize()
+                                        _cancel_turn_output_seal()
+                                        turn_output_sealed_until_child_input = False
+                                        _turn_start_t = time.monotonic()
+                                        logger.info(
+                                            "Replacing still-pending scene render for session %s with newest child request: %s",
+                                            session_id,
+                                            (cleaned_text or raw_text)[:160],
+                                        )
+                                        voice_ui_consumed = True
 
                                 if (
                                     actionable_child_text
@@ -4831,16 +5727,20 @@ async def _run_agent(
                                         current_child_age = int(state.get("child_age", 4) or 4)
                                     except Exception:
                                         current_child_age = 4
+                                    auto_confirm_name_story_shortcircuit = _should_auto_confirm_name_on_story_shortcircuit(
+                                        cleaned_text or raw_text,
+                                        detected_name,
+                                        current_child_age,
+                                    )
                                     if (not story_started and detected_name
                                         and _STORY_INTENT_RE.search(cleaned_text or "")
                                         and not bool(state.get("story_shortcircuit", False))):
 
                                         def _mark_name_story_sc(s: dict[str, Any]) -> None:
-                                            # For younger children, be more conservative about
-                                            # auto-locking a name from a combined "name + story"
-                                            # utterance. Save the story wish, but confirm the name
-                                            # once before Amelia starts using it.
-                                            if current_child_age <= 5:
+                                            # For younger children, be conservative unless the
+                                            # child used an explicit self-introduction such as
+                                            # "my name is Aaron" alongside the story request.
+                                            if not auto_confirm_name_story_shortcircuit:
                                                 s["pending_child_name"] = detected_name
                                                 s["name_confirmed"] = False
                                                 s["name_confirmation_prompted"] = False
@@ -4849,7 +5749,9 @@ async def _run_agent(
                                                 s["camera_skipped"] = True
                                                 return
                                             s["child_name"] = detected_name
+                                            s["pending_child_name"] = ""
                                             s["name_confirmed"] = True
+                                            s["name_confirmation_prompted"] = False
                                             s["story_started"] = True
                                             s["story_shortcircuit"] = True
                                             s["pending_story_hint"] = cleaned_text or raw_text
@@ -4898,29 +5800,13 @@ async def _run_agent(
                                                 input_finished=input_finished,
                                             )
 
-                                queued_scene_follow_up = False
+                                # Mark turn as pending so we can resume if disconnected
                                 if (
                                     actionable_child_text
-                                    and input_finished
-                                    and not voice_ui_consumed
-                                    and bool(state.get("story_started", False))
-                                    and _scene_render_in_progress(session_id, state)
-                                    and _child_requested_scene_refresh(cleaned_text or raw_text)
+                                    and not queued_scene_follow_up
+                                    and not immediate_scene_replacement
+                                    and (voice_ui_marks_pending or not voice_ui_consumed)
                                 ):
-                                    queued_scene_follow_up = True
-
-                                    def _queue_scene_follow_up(s: dict[str, Any]) -> None:
-                                        _queue_latest_scene_follow_up_request(s, cleaned_text or raw_text)
-
-                                    await _mutate_state(runner, user_id, session_id, _queue_scene_follow_up)
-                                    logger.info(
-                                        "Queued latest child scene request while render pending for session %s: %s",
-                                        session_id,
-                                        (cleaned_text or raw_text)[:160],
-                                    )
-
-                                # Mark turn as pending so we can resume if disconnected
-                                if actionable_child_text and not queued_scene_follow_up and (voice_ui_marks_pending or not voice_ui_consumed):
                                     def _mark_pending(s: dict[str, Any]) -> None:
                                         s["pending_response"] = True
                                         s["pending_response_interrupted"] = False
@@ -4975,6 +5861,88 @@ async def _run_agent(
                         cleaned_out = _CTRL_TOKEN_RE.sub("", out_text or "").strip()
                         out_finished = bool(getattr(event.output_transcription, "finished", False))
                         if _is_meaningful_text(cleaned_out):
+                                pending_ack_state = {}
+                                storage_session = _get_storage_session(runner, user_id, session_id)
+                                if storage_session is not None and isinstance(storage_session.state, dict):
+                                    pending_ack_state = dict(storage_session.state)
+                                if (
+                                    _should_hold_scene_tools_for_pending_replacement_ack(pending_ack_state)
+                                    and _should_abort_partial_pending_scene_replacement_ack(
+                                        pending_ack_state,
+                                        cleaned_out,
+                                    )
+                                ):
+                                    logger.info(
+                                        "Ignoring invalid partial assistant utterance while waiting for pending replacement acknowledgment in session %s",
+                                        session_id,
+                                    )
+                                    replacement_retry_text = str(
+                                        pending_ack_state.get("pending_scene_replacement_text", "") or ""
+                                    ).strip()
+                                    if replacement_retry_text:
+                                        live_queue.reset(session_id, "pending_scene_replacement_invalid_ack")
+                                        _send_pending_scene_replacement_prompt(
+                                            session_id,
+                                            live_queue,
+                                            replacement_retry_text,
+                                        )
+                                    _assistant_speaking_sessions.discard(session_id)
+                                    _assistant_speaking_since.pop(session_id, None)
+                                    continue
+                                if out_finished:
+                                    if (
+                                        _should_hold_scene_tools_for_pending_replacement_ack(pending_ack_state)
+                                        and not _is_valid_pending_scene_replacement_ack_text(
+                                            pending_ack_state,
+                                            cleaned_out,
+                                        )
+                                    ):
+                                        logger.info(
+                                            "Ignoring non-ack assistant utterance while waiting for pending replacement acknowledgment in session %s",
+                                            session_id,
+                                        )
+                                        replacement_retry_text = str(
+                                            pending_ack_state.get("pending_scene_replacement_text", "") or ""
+                                        ).strip()
+                                        if replacement_retry_text:
+                                            live_queue.reset(session_id, "pending_scene_replacement_invalid_ack")
+                                            _send_pending_scene_replacement_prompt(
+                                                session_id,
+                                                live_queue,
+                                                replacement_retry_text,
+                                        )
+                                        _assistant_speaking_sessions.discard(session_id)
+                                        _assistant_speaking_since.pop(session_id, None)
+                                        continue
+                                    if _should_hold_scene_tools_for_pending_replacement_ack(pending_ack_state):
+                                        replacement_ack_text = str(
+                                            pending_ack_state.get("pending_scene_replacement_text", "") or ""
+                                        ).strip()
+                                        if replacement_ack_text:
+                                            def _mark_pending_scene_replacement_ack_heard(s: dict[str, Any]) -> None:
+                                                if (
+                                                    str(s.get("pending_scene_replacement_text", "") or "").strip()
+                                                    == replacement_ack_text
+                                                    and _pending_scene_replacement_phase(s)
+                                                    == _PENDING_SCENE_REPLACEMENT_PHASE_ACK
+                                                ):
+                                                    s["pending_scene_replacement_phase"] = (
+                                                        _PENDING_SCENE_REPLACEMENT_PHASE_RENDER
+                                                    )
+
+                                            await _mutate_state(
+                                                runner=runner,
+                                                user_id=user_id,
+                                                session_id=session_id,
+                                                mutator=_mark_pending_scene_replacement_ack_heard,
+                                            )
+                                            pending_ack_state["pending_scene_replacement_phase"] = (
+                                                _PENDING_SCENE_REPLACEMENT_PHASE_RENDER
+                                            )
+                                            logger.info(
+                                                "Accepted pending replacement acknowledgment for session %s",
+                                                session_id,
+                                            )
                                 if turn_output_sealed_until_child_input and session_id not in _ending_story_sessions:
                                     if out_finished:
                                         _assistant_speaking_sessions.discard(session_id)
@@ -5039,6 +6007,7 @@ async def _run_agent(
                                 if out_finished:
                                     scrubbed_out = await scrub_pii(cleaned_out)
                                     logger.info("Agent said (scrubbed): %s", scrubbed_out)
+                                    last_finished_assistant_output_at_epoch_ms = int(time.time() * 1000)
                                 # Broadcast agent transcription (Iter 11)
                                 await websocket.send_text(
                                     ServerEvent(
@@ -5112,6 +6081,44 @@ async def _run_agent(
                             _turn_start_t = time.monotonic()
                             continue
                         if session_id in _interrupted_turn_sessions:
+                            storage_session = _get_storage_session(runner, user_id, session_id)
+                            interrupted_state = (
+                                dict(storage_session.state)
+                                if storage_session is not None and isinstance(storage_session.state, dict)
+                                else {}
+                            )
+                            if _should_keep_live_open_for_pending_scene_replacement_follow_up(interrupted_state):
+                                logger.info(
+                                    "Clearing interrupted assistant turn but keeping live output open for pending scene replacement in session %s",
+                                    session_id,
+                                )
+                                _interrupted_turn_sessions.discard(session_id)
+                                assistant_parts = []
+                                last_output_transcription = ""
+                                scene_visuals_called_this_turn = False
+                                model_emitted_meaningful_output = False
+                                assistant_output_soft_closed = False
+                                assistant_output_hard_closed = False
+                                assistant_audio_closed_after_finish = False
+                                assistant_finished_utterances_this_turn = 0
+                                silent_recovery_attempts = 0
+                                _assistant_speaking_sessions.discard(session_id)
+                                _assistant_speaking_since.pop(session_id, None)
+                                _awaiting_greeting_sessions.discard(session_id)
+                                _cancel_turn_output_seal()
+                                turn_output_sealed_until_child_input = False
+                                _turn_start_t = time.monotonic()
+                                if not _is_meaningful_text(child_utterance_this_turn):
+                                    child_utterance_this_turn = ""
+                                last_persisted_partial_child_utterance = ""
+                                last_persisted_partial_child_utterance_finished = False
+                                child_turn_attempted_this_turn = False
+                                child_turn_answered_this_turn = False
+                                heard_humanish_speech_this_turn = False
+                                heard_noise_only_this_turn = False
+                                _audio_seen_this_turn.discard(session_id)
+                                continue
+
                             logger.info("Discarding interrupted assistant turn for session %s", session_id)
                             _interrupted_turn_sessions.discard(session_id)
                             assistant_parts = []
@@ -5142,6 +6149,36 @@ async def _run_agent(
 
                         _tc_t = time.monotonic()
                         _tc_delta = int((_tc_t - _turn_start_t) * 1000)
+
+                        storage_session = _get_storage_session(runner, user_id, session_id)
+                        turn_complete_state = (
+                            dict(storage_session.state)
+                            if storage_session is not None and isinstance(storage_session.state, dict)
+                            else {}
+                        )
+                        if _should_ignore_turn_complete_while_waiting_for_pending_replacement_ack(
+                            turn_complete_state,
+                            last_finished_assistant_output_at_epoch_ms=last_finished_assistant_output_at_epoch_ms,
+                        ):
+                            logger.info(
+                                "Ignoring stale turn_complete while waiting for pending replacement acknowledgment in session %s",
+                                session_id,
+                            )
+                            assistant_parts = []
+                            last_output_transcription = ""
+                            scene_visuals_called_this_turn = False
+                            model_emitted_meaningful_output = False
+                            assistant_output_soft_closed = False
+                            assistant_output_hard_closed = False
+                            assistant_audio_closed_after_finish = False
+                            assistant_finished_utterances_this_turn = 0
+                            silent_recovery_attempts = 0
+                            _assistant_speaking_sessions.discard(session_id)
+                            _assistant_speaking_since.pop(session_id, None)
+                            _cancel_turn_output_seal()
+                            turn_output_sealed_until_child_input = False
+                            _turn_start_t = time.monotonic()
+                            continue
 
                         # Turn is done, no longer pending a response.
                         def _clear_pending(s: dict[str, Any]) -> None:
@@ -5238,6 +6275,7 @@ async def _run_agent(
                             _turn_start_t = time.monotonic()
                             continue
 
+                        completed_pending_scene_replacement_ack_turn = False
                         if model_emitted_meaningful_output or scene_visuals_called_this_turn:
                             deferred_opening_turn_complete = False
                             _cancel_deferred_opening_finalize()
@@ -5261,6 +6299,7 @@ async def _run_agent(
                                 nonlocal completed_story_page_turn
                                 nonlocal completed_scene_render_skipped
                                 nonlocal completed_state_snapshot
+                                nonlocal completed_pending_scene_replacement_ack_turn
                                 nonlocal toy_share_finished_now
                                 toy_share_finished_now = False
                                 _take_snapshot(state)
@@ -5269,15 +6308,20 @@ async def _run_agent(
                                 state["assembly_wait_last_child_utterance"] = ""
                                 state["partial_child_utterance"] = ""
                                 state["partial_child_utterance_finished"] = False
+                                pending_replacement_ack_turn = _is_pending_scene_replacement_follow_up_turn(
+                                    state,
+                                    scene_visuals_called_this_turn=scene_visuals_called_this_turn,
+                                )
                                 if state.get("name_confirmed") or int(state.get("response_turn_number", state.get("turn_number", 1))) >= 3:
                                     _opening_phase_sessions.discard(session_id)
                                 else:
                                     _opening_phase_sessions.add(session_id)
-                                _append_story_summary(state, assistant_text)
+                                if not pending_replacement_ack_turn:
+                                    _append_story_summary(state, assistant_text)
                                 # If a pending name exists and the child just affirmed or repeated it,
                                 # lock in the name to prevent repeated confirmations.
                                 pending_name = str(state.get("pending_child_name", "")).strip()
-                                if pending_name:
+                                if not pending_replacement_ack_turn and pending_name:
                                     utter = (child_utterance_this_turn or "").strip()
                                     if utter:
                                         if (
@@ -5292,7 +6336,11 @@ async def _run_agent(
                                                 state["camera_stage"] = "done"
                                                 state["camera_skipped"] = True
                                 # If name is confirmed but child_name never got set, backfill from pending.
-                                if state.get("name_confirmed") and str(state.get("child_name", "friend")).strip().lower() == "friend":
+                                if (
+                                    not pending_replacement_ack_turn
+                                    and state.get("name_confirmed")
+                                    and str(state.get("child_name", "friend")).strip().lower() == "friend"
+                                ):
                                     if pending_name:
                                         state["child_name"] = pending_name
                                         state["pending_child_name"] = ""
@@ -5305,7 +6353,8 @@ async def _run_agent(
                                         logger.debug(f"   Args: {fc.args}")
 
                                 if (
-                                    assistant_text
+                                    not pending_replacement_ack_turn
+                                    and assistant_text
                                     and str(state.get("pending_child_name", "")).strip()
                                     and not bool(state.get("name_confirmed", False))
                                 ):
@@ -5324,20 +6373,23 @@ async def _run_agent(
                                         state["name_confirmation_prompted"] = True
                                 # If Amelia asks what kind of story to tell, mark that we're awaiting a story choice.
                                 if (
-                                    assistant_text
+                                    not pending_replacement_ack_turn
+                                    and assistant_text
                                     and bool(state.get("name_confirmed", False))
                                     and not bool(state.get("story_started", False))
                                     and _STORY_PROMPT_RE.search(assistant_text)
                                 ):
                                     state["awaiting_story_choice"] = True
-                                elif bool(state.get("story_started", False)):
+                                elif not pending_replacement_ack_turn and bool(state.get("story_started", False)):
                                     state["awaiting_story_choice"] = False
                                 if (
+                                    not pending_replacement_ack_turn
+                                    and
                                     str(state.get("camera_stage", "none")) == "pending"
                                     and _CAMERA_PROMPT_RE.search(assistant_text or "")
                                 ):
                                     state["camera_stage"] = "prompted"
-                                if _CAMERA_PROMPT_RE.search(assistant_text or ""):
+                                if not pending_replacement_ack_turn and _CAMERA_PROMPT_RE.search(assistant_text or ""):
                                     try:
                                         state["camera_prompt_count"] = int(state.get("camera_prompt_count", 0)) + 1
                                     except Exception:
@@ -5362,6 +6414,8 @@ async def _run_agent(
                                     toy_share_turns_remaining = 0
                                 toy_share_active_before = bool(state.get("toy_share_active", False)) and toy_share_turns_remaining > 0
                                 fallback_scene_turn = (
+                                    not pending_replacement_ack_turn
+                                    and
                                     not scene_visuals_called_this_turn
                                     and bool(state.get("story_started", False))
                                     and str(state.get("camera_stage", "none")) not in {"pending", "prompted"}
@@ -5377,6 +6431,8 @@ async def _run_agent(
                                     scene_visuals_called_this_turn and state.get("scene_render_skipped", False)
                                 )
                                 scene_chat_turn = (
+                                    not pending_replacement_ack_turn
+                                    and
                                     bool(state.get("story_started", False))
                                     and _has_rendered_scene(state)
                                     and (
@@ -5387,8 +6443,11 @@ async def _run_agent(
                                     and _child_requested_scene_chat(child_utterance_this_turn)
                                 )
                                 story_page_turn = bool(
-                                    fallback_scene_turn
-                                    or (scene_visuals_called_this_turn and not scene_render_skipped_turn)
+                                    not pending_replacement_ack_turn
+                                    and (
+                                        fallback_scene_turn
+                                        or (scene_visuals_called_this_turn and not scene_render_skipped_turn)
+                                    )
                                 )
                                 current_turn = int(state.get("turn_number", 1))
                                 try:
@@ -5397,6 +6456,7 @@ async def _run_agent(
                                     current_story_page_count = 0
                                 turn_limit_reached = False if (toy_share_active_before or not story_page_turn) else current_story_page_count >= max_turns
                                 state["response_turn_number"] = current_response_turn + 1
+                                completed_pending_scene_replacement_ack_turn = pending_replacement_ack_turn
                                 if toy_share_active_before:
                                     state["toy_share_turns_remaining"] = max(toy_share_turns_remaining - 1, 0)
                                     state["toy_share_active"] = bool(state["toy_share_turns_remaining"])
@@ -5407,8 +6467,14 @@ async def _run_agent(
                                     _clear_pending_scene_request_metadata(state)
                                 elif not story_page_turn:
                                     state["story_turn_limit_reached"] = False
-                                    state["scene_render_pending"] = False
-                                    _clear_pending_scene_request_metadata(state)
+                                    if pending_replacement_ack_turn:
+                                        state["scene_render_pending"] = True
+                                        state["pending_scene_replacement_phase"] = _PENDING_SCENE_REPLACEMENT_PHASE_RENDER
+                                    elif _should_preserve_pending_scene_render(session_id, state):
+                                        state["scene_render_pending"] = True
+                                    else:
+                                        state["scene_render_pending"] = False
+                                        _clear_pending_scene_request_metadata(state)
                                 else:
                                     state["story_started"] = True
                                     state["awaiting_story_choice"] = False
@@ -5554,11 +6620,34 @@ async def _run_agent(
                                     queued_follow_up_after_turn,
                                 )
 
+                            pending_replacement_after_turn = str(
+                                completed_state_snapshot.get("pending_scene_replacement_text", "") or ""
+                            ).strip()
+                            pending_replacement_phase_after_turn = _pending_scene_replacement_phase(
+                                completed_state_snapshot
+                            )
+                            if (
+                                pending_replacement_after_turn
+                                and pending_replacement_phase_after_turn == _PENDING_SCENE_REPLACEMENT_PHASE_RENDER
+                                and not scene_visuals_called_this_turn
+                                and session_id not in _early_fallback_started
+                            ):
+                                await _trigger_pending_scene_replacement_scene(
+                                    session_id=session_id,
+                                    replacement_text=pending_replacement_after_turn,
+                                    runner=runner,
+                                    websocket=websocket,
+                                    user_id=user_id,
+                                )
+                                scene_visuals_called_this_turn = True
+                                _early_fallback_started.add(session_id)
+
                             # ── TURN COMPLETE FALLBACK: if no tool call seen at ALL ──
                             if (
                                 not scene_visuals_called_this_turn
                                 and session_id not in _early_fallback_started
                                 and session_id not in _pending_image_events
+                                and not pending_replacement_after_turn
                             ):
                                 if (
                                     completed_story_started
@@ -5637,6 +6726,50 @@ async def _run_agent(
                                     include_runtime=False,
                                     reason="silent_model_turn",
                                 )
+
+                            storage_session = _get_storage_session(runner, user_id, session_id)
+                            silent_turn_state = (
+                                dict(storage_session.state)
+                                if storage_session is not None and isinstance(storage_session.state, dict)
+                                else {}
+                            )
+                            if _should_retry_pending_scene_replacement_ack(
+                                silent_turn_state,
+                                had_child_input_this_turn=had_child_input_this_turn,
+                                model_emitted_meaningful_output=model_emitted_meaningful_output,
+                                scene_visuals_called_this_turn=scene_visuals_called_this_turn,
+                            ):
+                                replacement_retry_text = str(
+                                    silent_turn_state.get("pending_scene_replacement_text", "") or ""
+                                ).strip()
+                                if silent_recovery_attempts < 2 and replacement_retry_text:
+                                    silent_recovery_attempts += 1
+                                    live_queue.reset(session_id, "pending_scene_replacement_ack_retry")
+                                    _send_pending_scene_replacement_prompt(
+                                        session_id,
+                                        live_queue,
+                                        replacement_retry_text,
+                                    )
+                                    assistant_parts = []
+                                    last_output_transcription = ""
+                                    child_utterance_this_turn = ""
+                                    last_persisted_partial_child_utterance = ""
+                                    last_persisted_partial_child_utterance_finished = False
+                                    child_turn_attempted_this_turn = False
+                                    child_turn_answered_this_turn = False
+                                    scene_visuals_called_this_turn = False
+                                    model_emitted_meaningful_output = False
+                                    assistant_output_soft_closed = False
+                                    assistant_output_hard_closed = False
+                                    assistant_audio_closed_after_finish = False
+                                    assistant_finished_utterances_this_turn = 0
+                                    heard_humanish_speech_this_turn = False
+                                    heard_noise_only_this_turn = False
+                                    _audio_seen_this_turn.discard(session_id)
+                                    _cancel_turn_output_seal()
+                                    turn_output_sealed_until_child_input = False
+                                    _turn_start_t = time.monotonic()
+                                    continue
 
                             if session_id in _awaiting_greeting_sessions:
                                 # If the greeting didn't land, resend it instead of asking the child to repeat.
@@ -5723,11 +6856,16 @@ async def _run_agent(
 
                         await websocket.send_text(json.dumps({"type": "TURN_COMPLETE"}))
                         seal_delay_seconds = (
-                            0.45
-                            if had_child_input_this_turn
-                            and assistant_finished_utterances_this_turn <= 0
+                            0.8
+                            if completed_pending_scene_replacement_ack_turn
                             and session_id not in _ending_story_sessions
-                            else 0.0
+                            else (
+                                0.45
+                                if had_child_input_this_turn
+                                and assistant_finished_utterances_this_turn <= 0
+                                and session_id not in _ending_story_sessions
+                                else 0.0
+                            )
                         )
                         _schedule_turn_output_seal(seal_delay_seconds)
                         model_emitted_meaningful_output = False
@@ -7077,7 +8215,34 @@ async def _handle_command(
                 ),
             )
 
+    elif cmd.type == ClientCommandType.PAGE_READ_ALOUD:
+        payload = cmd.payload if isinstance(cmd.payload, dict) else {}
+        active = bool(payload.get("active", False))
+        try:
+            suppress_for_ms = int(payload.get("suppress_for_ms", payload.get("suppressForMs", 0)) or 0)
+        except Exception:
+            suppress_for_ms = 0
+        suppress_for_ms = max(0, min(suppress_for_ms, 10_000))
+        _set_page_read_aloud_suppression(
+            cmd.session_id,
+            active=active,
+            suppress_for_ms=suppress_for_ms,
+        )
+        if active:
+            _activity_active_sessions.discard(cmd.session_id)
+        logger.info(
+            "Page read-aloud suppression updated for session %s: active=%s suppress_for_ms=%d",
+            cmd.session_id,
+            active,
+            suppress_for_ms,
+        )
+        return
+
     elif cmd.type == ClientCommandType.ACTIVITY_START:
+        if _page_read_aloud_suppression_active(session_id):
+            _activity_last_change[session_id] = time.monotonic()
+            logger.info("Ignoring activity_start during page read-aloud suppression for session %s", session_id)
+            return
         if session_id in _awaiting_greeting_sessions and not _barge_in_enabled():
             # Ignore manual VAD start if we are still waiting for the greeting to finish
             # and barge-in is disabled. The audio bytes are also dropped above.
@@ -7102,6 +8267,11 @@ async def _handle_command(
         return
 
     elif cmd.type == ClientCommandType.ACTIVITY_END:
+        if _page_read_aloud_suppression_active(session_id):
+            _activity_active_sessions.discard(session_id)
+            _activity_last_change[session_id] = time.monotonic()
+            logger.info("Ignoring activity_end during page read-aloud suppression for session %s", session_id)
+            return
         if session_id in _awaiting_greeting_sessions and not _barge_in_enabled():
             # Ignore manual VAD end if we ignored the start.
             pass
@@ -7557,6 +8727,19 @@ async def _forward_session_events(
                     is_placeholder = bool(payload.get("is_placeholder"))
                     is_fallback = bool(payload.get("is_fallback"))
                     persist_asset = payload.get("persist_asset", True) is not False
+                    request_id = str(payload.get("request_id", "") or "").strip()
+                    if not persist_asset:
+                        storage_session = _get_storage_session(runner, user_id, session_id)
+                        storage_state = storage_session.state if storage_session is not None else {}
+                        if _should_ignore_nonpersistent_scene_ready(
+                            storage_state,
+                            request_id=request_id,
+                        ):
+                            logger.info(
+                                "Dropping stale nonpersistent scene_ready event for session %s while a newer replacement/page request is active.",
+                                session_id,
+                            )
+                            continue
                     queued_follow_up_text = ""
                     # Mark that this session has received at least one real image.
                     if not is_placeholder:
@@ -7578,7 +8761,6 @@ async def _forward_session_events(
                             description = str(payload.get("description", "")).strip()
                             gcs_uri = str(payload.get("gcs_uri", "") or "").strip()
                             storybeat_text = str(payload.get("storybeat_text", "") or "").strip()
-                            request_id = str(payload.get("request_id", "") or "").strip()
                             _apply_scene_asset_to_story_state(
                                 state,
                                 request_id=request_id,
@@ -7652,7 +8834,7 @@ async def _forward_session_events(
                         def _clear_scene_render_pending(state: dict[str, Any]) -> None:
                             _apply_nonpersistent_scene_ready_to_state(
                                 state,
-                                request_id=str(payload.get("request_id", "") or "").strip(),
+                                request_id=request_id,
                                 looks_like_image=looks_like_image,
                                 is_fallback=is_fallback,
                                 description=str(payload.get("description", "") or "").strip(),

@@ -37,6 +37,16 @@ class StudioNarrationPlan(BaseModel):
     narration_lines: list[str] = Field(default_factory=list)
 
 
+class StudioNarrationReviewReport(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    direction: Literal["forward", "backward"]
+    status: Literal["approved", "revise_narration"]
+    reason: str
+    narration_feedback: list[str] = Field(default_factory=list)
+    kid_delight_notes: list[str] = Field(default_factory=list)
+
+
 class StudioAudioCue(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
@@ -171,6 +181,84 @@ def _normalize_mix_guidance(raw: Any) -> dict[str, Any]:
     return result
 
 
+def _dedupe_clean_texts(raw_items: Any, *, limit: int | None = None) -> list[str]:
+    cleaned: list[str] = []
+    seen: set[str] = set()
+    for item in list(raw_items or []):
+        text = _clean_text(item)
+        if not text:
+            continue
+        key = text.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        cleaned.append(text)
+        if limit is not None and len(cleaned) >= limit:
+            break
+    return cleaned
+
+
+def _merge_narration_review_reports(reports: list[dict[str, Any]] | None) -> dict[str, Any]:
+    normalized_reports: list[dict[str, Any]] = []
+    for raw in list(reports or []):
+        if not isinstance(raw, dict):
+            continue
+        direction = _clean_text(raw.get("direction")).lower()
+        if direction not in {"forward", "backward"}:
+            continue
+        status = _clean_text(raw.get("status")).lower()
+        if status not in {"approved", "revise_narration"}:
+            status = "approved"
+        normalized_reports.append(
+            {
+                "direction": direction,
+                "status": status,
+                "reason": _clean_text(raw.get("reason")),
+                "narration_feedback": _dedupe_clean_texts(raw.get("narration_feedback"), limit=6),
+                "kid_delight_notes": _dedupe_clean_texts(raw.get("kid_delight_notes"), limit=6),
+            }
+        )
+
+    needs_revision = any(report["status"] == "revise_narration" for report in normalized_reports)
+    merged_feedback = _dedupe_clean_texts(
+        [
+            item
+            for report in normalized_reports
+            for item in list(report.get("narration_feedback", []) or [])
+        ],
+        limit=8,
+    )
+    merged_delight = _dedupe_clean_texts(
+        [
+            item
+            for report in normalized_reports
+            for item in list(report.get("kid_delight_notes", []) or [])
+        ],
+        limit=6,
+    )
+    merged_reasons = _dedupe_clean_texts(
+        [report.get("reason", "") for report in normalized_reports],
+        limit=3,
+    )
+    if merged_reasons:
+        merged_reason = " ".join(merged_reasons)
+    elif needs_revision:
+        merged_reason = "Narration needs another pass to feel like one complete story."
+    else:
+        merged_reason = "Narration reads like one connected story from beginning to end."
+
+    return {
+        "status": "revise_narration" if needs_revision else "approved",
+        "reason": merged_reason,
+        "narration_feedback": merged_feedback,
+        "kid_delight_notes": merged_delight,
+        "directions_reviewed": [
+            report["direction"]
+            for report in normalized_reports
+        ],
+    }
+
+
 def _normalize_cue_map(raw_cues: Any, scene_count: int) -> dict[int, dict[str, Any]]:
     cues: dict[int, dict[str, Any]] = {}
     if not isinstance(raw_cues, list):
@@ -205,15 +293,25 @@ def build_storybook_studio_plan_from_workflow_state(
     fallback_narration_lines: list[str] | None = None,
 ) -> dict[str, Any]:
     narration_plan = parse_studio_json(state.get("studio_narration_plan")) or {}
+    narration_review = parse_studio_json(state.get("studio_narration_review_summary")) or {}
     audio_plan = parse_studio_json(state.get("studio_audio_cue_plan")) or {}
     quality_report = parse_studio_json(state.get("studio_quality_report")) or {}
+    plan_status = _clean_text(quality_report.get("status")) or "observed"
+    plan_reason = _clean_text(quality_report.get("reason"))
+    narration_review_status = _clean_text(narration_review.get("status")).lower()
+    narration_review_reason = _clean_text(narration_review.get("reason"))
+
+    if narration_review_status == "revise_narration":
+        plan_status = "revise_narration"
+        if narration_review_reason:
+            plan_reason = narration_review_reason
 
     mix_guidance = _normalize_mix_guidance(audio_plan.get("mix_guidance"))
     mix_guidance.update(_normalize_mix_guidance(quality_report.get("mix_guidance")))
 
     plan = {
-        "status": _clean_text(quality_report.get("status")) or "observed",
-        "reason": _clean_text(quality_report.get("reason")),
+        "status": plan_status,
+        "reason": plan_reason,
         "narration_style": _clean_text(narration_plan.get("narration_style")),
         "narration_lines": _normalize_narration_lines(
             narration_plan.get("narration_lines"),
@@ -229,9 +327,15 @@ def build_storybook_studio_plan_from_workflow_state(
             for note in list(quality_report.get("kid_delight_notes", []) or [])
             if _clean_text(note)
         ][:6],
+        "narration_review": narration_review,
         "revision_history": [
             item
             for item in list(state.get("studio_revision_history", []) or [])
+            if isinstance(item, dict)
+        ],
+        "narration_revision_history": [
+            item
+            for item in list(state.get("studio_narration_revision_history", []) or [])
             if isinstance(item, dict)
         ],
         "quality_report": quality_report,
@@ -254,6 +358,11 @@ def build_storybook_studio_summary(plan: dict[str, Any]) -> dict[str, Any]:
         "music_cue_count": len(plan.get("music_cues", {}) or {}),
         "sfx_cue_count": len(plan.get("sfx_cues", {}) or {}),
         "kid_delight_notes": list(plan.get("kid_delight_notes", []) or [])[:4],
+        "narration_review_status": _clean_text(
+            (plan.get("narration_review") or {}).get("status")
+            if isinstance(plan.get("narration_review"), dict)
+            else ""
+        ),
         "revision_history": list(plan.get("revision_history", []) or [])[:4],
         "narration_preview": list(plan.get("narration_lines", []) or [])[:3],
         "mix_guidance": dict(plan.get("mix_guidance", {}) or {}),
@@ -305,11 +414,15 @@ Revision notes:
 
 Task:
 - Write one short read-aloud narration line for each scene.
+- Read the whole adventure first so you understand how it begins, how it changes, and how it ends before writing line one.
+- Silently plan a clear beginning, middle, and ending arc across all scenes, then write the page lines to match that arc.
 - Treat the scene descriptions and story pages as raw production notes from a child's live adventure, not as final prose.
 - Your job is to turn those notes into a coherent storybook retelling that makes the whole adventure feel intentional and connected.
 - You are not transcribing the child literally. You are writing the polished storybook version of what happened.
 - Make the lines feel like one connected story from page to page, not isolated captions.
+- The opening line should feel like the true start of a story, not a label for a picture.
 - Let each line clearly follow the previous scene's action, place, or feeling.
+- Middle lines should feel like the adventure is moving forward.
 - Use the continuity notes and child delight anchors to carry recurring characters, props, wishes, and destinations through the story.
 - If the child jumps suddenly to a new place, bridge it in story form so the move feels like the next beat of the same adventure.
 - Prefer concrete details that are actually present in the story pages over generic labels from the raw scene descriptions.
@@ -318,6 +431,7 @@ Task:
 - Never mention a landmark or prop unless it is supported by the current page's story page notes or the neighboring scene notes.
 - Rewrite command-like fragments such as "go inside the castle" or "let's go the other way" into natural story narration instead of repeating them literally.
 - If the raw notes are messy, contradictory, or incomplete, resolve them into the clearest gentle adventure beat that still matches the pictures and continuity notes.
+- Write the final scene with full awareness of how the story began, so the ending feels earned and complete.
 - Land the final scene on a satisfying story beat, not a generic label or meta ending.
 - Every scene line must stay at or under {studio_scene_max_words} spoken words.
 - Match the child's age band:
@@ -335,6 +449,80 @@ Return JSON only:
 {
   "narration_style": "one short sentence",
   "narration_lines": ["short line", "short line"]
+}
+"""
+
+
+_NARRATION_FORWARD_REVIEW_TEMPLATE = """\
+You are the Forward Story Editor for a preschool story studio.
+
+Story title: {story_title}
+Child name: {child_name}
+Child age: {child_age}
+Child age band: {child_age_band}
+Story summary: {story_summary}
+Scene count: {studio_scene_count}
+Story pages JSON: {studio_story_pages_json}
+Continuity world-state notes: {studio_continuity_world_state_text}
+Child delight anchors:
+{studio_child_delight_anchors_text}
+Narration plan JSON: {studio_narration_plan}
+Scene line word limit: {studio_scene_max_words}
+
+Task:
+- Review the narration from the first scene to the final scene.
+- Check that the opening line truly starts the story, the middle lines move the adventure forward, and the final line feels like a satisfying ending.
+- Request revision if the narration feels like disconnected captions instead of one continuous story.
+- Request revision if the story jumps abruptly without a natural bridge, repeats the same opening pattern, or ends on a weak label.
+- Request revision if the narration repeats command-like raw notes instead of turning them into story prose.
+- Request revision if any line sounds incomplete, clipped, or awkwardly unfinished.
+- Request revision if a line mentions a place, prop, building, room, character, or landmark that is not supported by the relevant story page notes.
+- Keep feedback short and specific.
+
+Return JSON only:
+{
+  "direction": "forward",
+  "status": "approved|revise_narration",
+  "reason": "one short sentence",
+  "narration_feedback": ["short note"],
+  "kid_delight_notes": ["short note"]
+}
+"""
+
+
+_NARRATION_BACKWARD_REVIEW_TEMPLATE = """\
+You are the Backward Story Editor for a preschool story studio.
+
+Story title: {story_title}
+Child name: {child_name}
+Child age: {child_age}
+Child age band: {child_age_band}
+Story summary: {story_summary}
+Scene count: {studio_scene_count}
+Story pages JSON: {studio_story_pages_json}
+Continuity world-state notes: {studio_continuity_world_state_text}
+Child delight anchors:
+{studio_child_delight_anchors_text}
+Narration plan JSON: {studio_narration_plan}
+Scene line word limit: {studio_scene_max_words}
+
+Task:
+- Review the narration from the final scene back to the first scene.
+- Check that the ending feels earned, that it resolves or warmly lands the adventure, and that the earlier lines set up that ending naturally.
+- Request revision if the last line feels generic, abrupt, or disconnected from the story that came before it.
+- Request revision if reading backward reveals missing setup, dropped continuity, or a middle section that does not actually lead to the ending.
+- Request revision if the narration sounds like isolated picture labels instead of one remembered adventure.
+- Request revision if any line sounds incomplete, clipped, or awkwardly unfinished.
+- Request revision if a line mentions a place, prop, building, room, character, or landmark that is not supported by the relevant story page notes.
+- Keep feedback short and specific.
+
+Return JSON only:
+{
+  "direction": "backward",
+  "status": "approved|revise_narration",
+  "reason": "one short sentence",
+  "narration_feedback": ["short note"],
+  "kid_delight_notes": ["short note"]
 }
 """
 
@@ -432,6 +620,14 @@ async def _audio_instruction(context: ReadonlyContext) -> str:
     return await instructions_utils.inject_session_state(_AUDIO_TEMPLATE, context)
 
 
+async def _narration_forward_review_instruction(context: ReadonlyContext) -> str:
+    return await instructions_utils.inject_session_state(_NARRATION_FORWARD_REVIEW_TEMPLATE, context)
+
+
+async def _narration_backward_review_instruction(context: ReadonlyContext) -> str:
+    return await instructions_utils.inject_session_state(_NARRATION_BACKWARD_REVIEW_TEMPLATE, context)
+
+
 async def _qc_instruction(context: ReadonlyContext) -> str:
     return await instructions_utils.inject_session_state(_QC_TEMPLATE, context)
 
@@ -440,6 +636,8 @@ class StorybookStudioWorkflowAgent(BaseAgent):
     model_config = ConfigDict(arbitrary_types_allowed=True)
 
     narration_agent: LlmAgent
+    narration_forward_review_agent: LlmAgent
+    narration_backward_review_agent: LlmAgent
     audio_agent: LlmAgent
     qa_agent: LlmAgent
     max_revision_rounds: int = 1
@@ -448,6 +646,8 @@ class StorybookStudioWorkflowAgent(BaseAgent):
         self,
         *,
         narration_agent: LlmAgent,
+        narration_forward_review_agent: LlmAgent,
+        narration_backward_review_agent: LlmAgent,
         audio_agent: LlmAgent,
         qa_agent: LlmAgent,
         max_revision_rounds: int,
@@ -455,12 +655,69 @@ class StorybookStudioWorkflowAgent(BaseAgent):
         super().__init__(
             name="storybook_studio_workflow",
             description="Agentic studio workflow for preschool narration, soundtrack planning, and pre-render QA.",
-            sub_agents=[narration_agent, audio_agent, qa_agent],
+            sub_agents=[
+                narration_agent,
+                narration_forward_review_agent,
+                narration_backward_review_agent,
+                audio_agent,
+                qa_agent,
+            ],
             narration_agent=narration_agent,
+            narration_forward_review_agent=narration_forward_review_agent,
+            narration_backward_review_agent=narration_backward_review_agent,
             audio_agent=audio_agent,
             qa_agent=qa_agent,
             max_revision_rounds=max_revision_rounds,
         )
+
+    async def _run_narration_phase(self, ctx: InvocationContext):
+        state = ctx.session.state
+
+        async for event in self.narration_agent.run_async(ctx):
+            yield event
+
+        for revision_round in range(self.max_revision_rounds + 1):
+            async for event in self.narration_forward_review_agent.run_async(ctx):
+                yield event
+            async for event in self.narration_backward_review_agent.run_async(ctx):
+                yield event
+
+            forward_review = parse_studio_json(state.get("studio_narration_forward_review")) or {}
+            backward_review = parse_studio_json(state.get("studio_narration_backward_review")) or {}
+            merged_review = _merge_narration_review_reports([forward_review, backward_review])
+
+            narration_revision_history = list(state.get("studio_narration_revision_history", []) or [])
+            narration_revision_history.append(
+                {
+                    "round": revision_round + 1,
+                    "status": _clean_text(merged_review.get("status")),
+                    "reason": _clean_text(merged_review.get("reason")),
+                }
+            )
+            merged_event = _build_state_delta_event(
+                ctx,
+                author=self.name,
+                updates={
+                    "studio_narration_review_summary": merged_review,
+                    "studio_narration_revision_history": narration_revision_history,
+                },
+            )
+            if merged_event is not None:
+                yield merged_event
+
+            if merged_review.get("status") == "approved" or revision_round >= self.max_revision_rounds:
+                break
+
+            feedback_event = _build_state_delta_event(
+                ctx,
+                author=self.name,
+                updates={"studio_feedback_notes": _format_revision_feedback(merged_review)},
+            )
+            if feedback_event is not None:
+                yield feedback_event
+
+            async for event in self.narration_agent.run_async(ctx):
+                yield event
 
     async def _run_async_impl(self, ctx: InvocationContext):
         state = ctx.session.state
@@ -472,6 +729,8 @@ class StorybookStudioWorkflowAgent(BaseAgent):
                 for key, default in (
                     ("studio_feedback_notes", "No revision notes yet."),
                     ("studio_revision_history", []),
+                    ("studio_narration_revision_history", []),
+                    ("studio_narration_review_summary", {}),
                 )
                 if key not in state
             },
@@ -479,8 +738,15 @@ class StorybookStudioWorkflowAgent(BaseAgent):
         if initial_state_event is not None:
             yield initial_state_event
 
-        async for event in self.narration_agent.run_async(ctx):
+        async for event in self._run_narration_phase(ctx):
             yield event
+        feedback_reset_event = _build_state_delta_event(
+            ctx,
+            author=self.name,
+            updates={"studio_feedback_notes": "No revision notes yet."},
+        )
+        if feedback_reset_event is not None:
+            yield feedback_reset_event
         async for event in self.audio_agent.run_async(ctx):
             yield event
 
@@ -519,8 +785,18 @@ class StorybookStudioWorkflowAgent(BaseAgent):
                 yield feedback_event
 
             if status in {"revise_narration", "revise_both"}:
-                async for event in self.narration_agent.run_async(ctx):
+                async for event in self._run_narration_phase(ctx):
                     yield event
+                feedback_reset_event = _build_state_delta_event(
+                    ctx,
+                    author=self.name,
+                    updates={"studio_feedback_notes": "No revision notes yet."},
+                )
+                if feedback_reset_event is not None:
+                    yield feedback_reset_event
+                async for event in self.audio_agent.run_async(ctx):
+                    yield event
+                continue
             if status in {"revise_audio", "revise_both"}:
                 async for event in self.audio_agent.run_async(ctx):
                     yield event
@@ -538,6 +814,20 @@ def _build_workflow_agent(
         output_key="studio_narration_plan",
         output_schema=StudioNarrationPlan,
     )
+    narration_forward_review_agent = LlmAgent(
+        name="studio_narration_forward_review",
+        model=model,
+        instruction=_narration_forward_review_instruction,
+        output_key="studio_narration_forward_review",
+        output_schema=StudioNarrationReviewReport,
+    )
+    narration_backward_review_agent = LlmAgent(
+        name="studio_narration_backward_review",
+        model=model,
+        instruction=_narration_backward_review_instruction,
+        output_key="studio_narration_backward_review",
+        output_schema=StudioNarrationReviewReport,
+    )
     audio_agent = LlmAgent(
         name="studio_audio_director",
         model=model,
@@ -554,6 +844,8 @@ def _build_workflow_agent(
     )
     return StorybookStudioWorkflowAgent(
         narration_agent=narration_agent,
+        narration_forward_review_agent=narration_forward_review_agent,
+        narration_backward_review_agent=narration_backward_review_agent,
         audio_agent=audio_agent,
         qa_agent=qa_agent,
         max_revision_rounds=max_revision_rounds,
@@ -584,6 +876,8 @@ async def run_storybook_studio_workflow(
                 "studio_child_delight_anchors_text",
                 "No child delight anchors recorded.",
             ),
+            "studio_narration_revision_history": [],
+            "studio_narration_review_summary": {},
             "studio_continuity_world_state_text": dict(initial_state or {}).get(
                 "studio_continuity_world_state_text",
                 "No continuity state recorded.",

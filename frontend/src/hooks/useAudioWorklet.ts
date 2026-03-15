@@ -480,6 +480,46 @@ export function useAudioWorklet({
         setAudioState((current) => (current === 'speaking' ? 'idle' : current));
     }, []);
 
+    const interruptPlayback = useCallback(() => {
+        stopBufferedClip();
+        try {
+            playbackNodeRef.current?.port.postMessage({ type: 'interrupt' });
+        } catch {
+            // Best effort only.
+        }
+        isSpeakingRef.current = false;
+        if (gainNodeRef.current && duckedForUserRef.current) {
+            gainNodeRef.current.gain.linearRampToValueAtTime(
+                getNarrationCeiling(),
+                gainNodeRef.current.context.currentTime + 0.05,
+            );
+            duckedForUserRef.current = false;
+        }
+        setAudioState(micStreamRef.current ? 'listening' : 'idle');
+    }, [getNarrationCeiling, stopBufferedClip]);
+
+    const teardownPlayback = useCallback(() => {
+        interruptPlayback();
+        if (playbackNodeRef.current) {
+            playbackNodeRef.current.port.onmessage = null;
+            try {
+                playbackNodeRef.current.disconnect();
+            } catch {
+                // Ignore redundant disconnects.
+            }
+            playbackNodeRef.current = null;
+        }
+        if (gainNodeRef.current) {
+            try {
+                gainNodeRef.current.disconnect();
+            } catch {
+                // Ignore redundant disconnects.
+            }
+            gainNodeRef.current = null;
+        }
+        audioInitializedRef.current = false;
+    }, [interruptPlayback]);
+
     const estimateBufferedClipSpeechWindow = useCallback((buffer: AudioBuffer) => {
         const totalDuration = Math.max(buffer.duration, 0.01);
         if (!buffer.length || buffer.numberOfChannels <= 0) {
@@ -636,11 +676,11 @@ export function useAudioWorklet({
     // Cleanup on unmount
     useEffect(() => {
         return () => {
-            stopBufferedClip();
+            teardownPlayback();
             stopListening();
             wakeLockRef.current?.release?.();
         };
-    }, [stopBufferedClip, stopListening]);
+    }, [stopListening, teardownPlayback]);
 
     return {
         audioState,
@@ -653,6 +693,7 @@ export function useAudioWorklet({
         playBufferedClip,
         stopBufferedClip,
         flushPlaybackBuffer,
+        interruptPlayback,
         setNarrationMuted,
     };
 }

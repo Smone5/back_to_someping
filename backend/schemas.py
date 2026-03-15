@@ -42,6 +42,7 @@ class ClientCommandType(StrEnum):
     CLIENT_READY = "client_ready"       # Gate approved, playback ready — send greeting
     ACTIVITY_START = "activity_start"   # User started speaking (tap orb)
     ACTIVITY_END = "activity_end"       # User finished speaking (tap orb again) — model can respond
+    PAGE_READ_ALOUD = "page_read_aloud" # Frontend is playing page read-aloud audio; suppress ASR bleed
 
 
 class ClientCommand(BaseModel):
