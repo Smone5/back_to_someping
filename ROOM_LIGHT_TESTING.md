@@ -143,6 +143,8 @@ Examples:
 - `light.story_room`
 - `light.demo_light`
 
+Use the exact entity ID shown in Home Assistant. If the entity already starts with `light.`, do not add another `light.` prefix in your `curl` commands or Voxitale settings.
+
 ### 5. Verify Home Assistant can control the light before using Voxitale
 
 Test the state read:
@@ -150,7 +152,7 @@ Test the state read:
 ```bash
 curl \
   -H "Authorization: Bearer YOUR_LONG_LIVED_TOKEN" \
-  https://YOUR_PUBLIC_HA_URL/api/states/light.YOUR_ENTITY_ID
+  https://YOUR_PUBLIC_HA_URL/api/states/YOUR_ENTITY_ID
 ```
 
 Test turning the light on:
@@ -159,7 +161,7 @@ Test turning the light on:
 curl \
   -H "Authorization: Bearer YOUR_LONG_LIVED_TOKEN" \
   -H "Content-Type: application/json" \
-  -d '{"entity_id":"light.YOUR_ENTITY_ID","brightness":180}' \
+  -d '{"entity_id":"YOUR_ENTITY_ID","brightness":180}' \
   https://YOUR_PUBLIC_HA_URL/api/services/light/turn_on
 ```
 

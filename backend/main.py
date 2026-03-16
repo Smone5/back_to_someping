@@ -104,7 +104,7 @@ class Settings(BaseSettings):
     google_cloud_location: str = "us-central1"
     vertex_ai_location: str = "global"
     google_genai_use_vertexai: bool = True
-    elevenlabs_api_key: str
+    elevenlabs_api_key: str = ""
     gcs_assets_bucket: str = "storyteller-session-assets"
     gcs_final_videos_bucket: str = "storyteller-final-videos"
     home_assistant_url: str = ""

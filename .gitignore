@@ -10,6 +10,9 @@
 # Directories
 !agent/
 !backend/
+!docs/
+!docs/readme-assets/
+!docs/readme-assets/*
 !frontend/
 !google_terraform/
 !shared/

@@ -1,0 +1,544 @@
+<mxfile host="Electron" version="21.1.2" type="device">
+  <diagram id="runtime_overview" name="Runtime Overview (RO)">
+    <mxGraphModel dx="1800" dy="1400" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="2300" pageHeight="1400" math="0" shadow="0">
+      <root>
+        <mxCell id="0" />
+        <mxCell id="1" parent="0" />
+
+        <mxCell id="p1_browser_group" value="Child Device / Frontend" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f8f9fa;strokeColor=#6c8ebf;verticalAlign=top;fontStyle=1;spacingTop=10;fontSize=16;" vertex="1" parent="1">
+          <mxGeometry x="40" y="40" width="340" height="1240" as="geometry" />
+        </mxCell>
+        <mxCell id="p1_backend_group" value="Cloud Run Backend Session Runtime" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f8f9fa;strokeColor=#82b366;verticalAlign=top;fontStyle=1;spacingTop=10;fontSize=16;" vertex="1" parent="1">
+          <mxGeometry x="420" y="40" width="700" height="1240" as="geometry" />
+        </mxCell>
+        <mxCell id="p1_model_group" value="Gemini / ADK Bidi Runtime" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f8f9fa;strokeColor=#9673a6;verticalAlign=top;fontStyle=1;spacingTop=10;fontSize=16;" vertex="1" parent="1">
+          <mxGeometry x="1160" y="40" width="540" height="760" as="geometry" />
+        </mxCell>
+        <mxCell id="p1_data_group" value="Persistence, Assets, and Async Assembly" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f8f9fa;strokeColor=#d6b656;verticalAlign=top;fontStyle=1;spacingTop=10;fontSize=16;" vertex="1" parent="1">
+          <mxGeometry x="1160" y="830" width="700" height="450" as="geometry" />
+        </mxCell>
+        <mxCell id="p1_ext_group" value="Optional Integrations / Legend" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f8f9fa;strokeColor=#666666;verticalAlign=top;fontStyle=1;spacingTop=10;fontSize=16;" vertex="1" parent="1">
+          <mxGeometry x="1900" y="40" width="330" height="1240" as="geometry" />
+        </mxCell>
+
+        <mxCell id="p1_flow_note" value="Read the core live loop left to right across the middle row. Lower rows show queued UI events, tool side effects, persistence, and movie assembly." style="shape=note;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;fontSize=12;" vertex="1" parent="1">
+          <mxGeometry x="520" y="70" width="980" height="70" as="geometry" />
+        </mxCell>
+        <mxCell id="p1_code_note" value="This page uses `RO-*` codes.&lt;br/&gt;Other tabs: `Reconnect and Recovery (RC)` and `ADK Bidi Flow (BD)`." style="shape=note;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontSize=12;" vertex="1" parent="1">
+          <mxGeometry x="1600" y="90" width="250" height="70" as="geometry" />
+        </mxCell>
+
+        <mxCell id="p1_ui" value="RO-01 Browser storyteller client&lt;br/&gt;StorytellerLive UI, scenes, assembly overlay, theater mode" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontSize=13;fontStyle=1;" vertex="1" parent="1">
+          <mxGeometry x="85" y="170" width="250" height="95" as="geometry" />
+        </mxCell>
+        <mxCell id="p1_audio" value="RO-02 Browser audio engine&lt;br/&gt;mic capture, PCM playback, page audio, SFX" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontSize=13;" vertex="1" parent="1">
+          <mxGeometry x="85" y="340" width="250" height="90" as="geometry" />
+        </mxCell>
+        <mxCell id="p1_ws_state" value="RO-03 Browser websocket transport&lt;br/&gt;WSS /ws/story + reconnect state machine" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontSize=13;fontStyle=1;" vertex="1" parent="1">
+          <mxGeometry x="85" y="500" width="250" height="95" as="geometry" />
+        </mxCell>
+        <mxCell id="p1_rehydrate" value="RO-04 UI rehydration&lt;br/&gt;session_rehydrated, current image,&lt;br/&gt;storybeat text, assembly status" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontSize=13;" vertex="1" parent="1">
+          <mxGeometry x="85" y="740" width="250" height="100" as="geometry" />
+        </mxCell>
+        <mxCell id="p1_browser_ha" value="RO-05 Browser-side Home Assistant apply&lt;br/&gt;used for local/private lighting fallback" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontSize=13;" vertex="1" parent="1">
+          <mxGeometry x="85" y="970" width="250" height="90" as="geometry" />
+        </mxCell>
+
+        <mxCell id="p1_fastapi" value="RO-06 FastAPI / ws_router&lt;br/&gt;accept websocket, parse child events,&lt;br/&gt;stream assistant output back" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;fontSize=13;fontStyle=1;" vertex="1" parent="1">
+          <mxGeometry x="500" y="500" width="240" height="95" as="geometry" />
+        </mxCell>
+        <mxCell id="p1_owner" value="RO-07 Active websocket owner guard&lt;br/&gt;connection_id, ghost close,&lt;br/&gt;heartbeat watchdog" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;fontSize=13;" vertex="1" parent="1">
+          <mxGeometry x="820" y="170" width="240" height="95" as="geometry" />
+        </mxCell>
+        <mxCell id="p1_runner" value="RO-08 ADK Bidi bridge&lt;br/&gt;ResettableLiveRequestQueue + runner.run_live(...)&lt;br/&gt;state mutation + reconnect restore" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;fontSize=13;fontStyle=1;" vertex="1" parent="1">
+          <mxGeometry x="820" y="500" width="240" height="105" as="geometry" />
+        </mxCell>
+        <mxCell id="p1_event_bus" value="RO-09 Session event bus&lt;br/&gt;buffered video_ready / lighting_command / theater_mode" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;fontSize=13;" vertex="1" parent="1">
+          <mxGeometry x="500" y="740" width="240" height="95" as="geometry" />
+        </mxCell>
+        <mxCell id="p1_tools" value="RO-10 Storyteller tool suite&lt;br/&gt;scene visuals, room lights, titles,&lt;br/&gt;continuity, movie assembly" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;fontSize=13;" vertex="1" parent="1">
+          <mxGeometry x="820" y="740" width="240" height="105" as="geometry" />
+        </mxCell>
+        <mxCell id="p1_poll" value="RO-11 Movie completion poll&lt;br/&gt;wait for final MP4 and emit theater_mode" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;fontSize=13;" vertex="1" parent="1">
+          <mxGeometry x="820" y="970" width="240" height="90" as="geometry" />
+        </mxCell>
+        <mxCell id="p1_backend_note" value="One current websocket owner per session_id prevents turn_complete, video_ready, and theater_mode from landing on different sockets." style="shape=note;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;fontSize=12;" vertex="1" parent="1">
+          <mxGeometry x="500" y="1120" width="560" height="95" as="geometry" />
+        </mxCell>
+
+        <mxCell id="p1_agent" value="RO-12 Storyteller ADK agent&lt;br/&gt;shared prompt, turn policy,&lt;br/&gt;tool choice, recovery prompts" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#e1d5e7;strokeColor=#9673a6;fontSize=13;fontStyle=1;" vertex="1" parent="1">
+          <mxGeometry x="1260" y="180" width="300" height="90" as="geometry" />
+        </mxCell>
+        <mxCell id="p1_live" value="RO-13 Gemini Live native-audio Bidi session&lt;br/&gt;live audio in/out, streaming events,&lt;br/&gt;function and tool calls" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#e1d5e7;strokeColor=#9673a6;fontSize=13;fontStyle=1;" vertex="1" parent="1">
+          <mxGeometry x="1260" y="500" width="300" height="100" as="geometry" />
+        </mxCell>
+        <mxCell id="p1_helpers" value="RO-14 Gemini helper models&lt;br/&gt;image generation, continuity capture,&lt;br/&gt;title generation, text repair" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#e1d5e7;strokeColor=#9673a6;fontSize=13;" vertex="1" parent="1">
+          <mxGeometry x="1260" y="700" width="300" height="95" as="geometry" />
+        </mxCell>
+        <mxCell id="p1_bidi_note" value="ADK Bidi is the live bridge: browser audio and control input go into a LiveRequestQueue, runner.run_live streams into Gemini Live, and streamed audio/tool events come back over the same live session." style="shape=note;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;fontSize=12;" vertex="1" parent="1">
+          <mxGeometry x="1260" y="630" width="330" height="90" as="geometry" />
+        </mxCell>
+
+        <mxCell id="p1_story_outputs" value="RO-15 Tool outputs&lt;br/&gt;story state, scene assets,&lt;br/&gt;assembly request" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;fontSize=13;fontStyle=1;" vertex="1" parent="1">
+          <mxGeometry x="1390" y="850" width="250" height="70" as="geometry" />
+        </mxCell>
+        <mxCell id="p1_firestore" value="RO-16 Firestore story/session mirror&lt;br/&gt;resume state, story pages,&lt;br/&gt;assembly status, release metadata" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;fontSize=13;" vertex="1" parent="1">
+          <mxGeometry x="1210" y="970" width="250" height="100" as="geometry" />
+        </mxCell>
+        <mxCell id="p1_gcs" value="RO-17 GCS assets&lt;br/&gt;scene stills, thumbnails,&lt;br/&gt;page audio, final movies" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;fontSize=13;" vertex="1" parent="1">
+          <mxGeometry x="1570" y="970" width="250" height="100" as="geometry" />
+        </mxCell>
+        <mxCell id="p1_ffmpeg" value="RO-18 Cloud Run FFmpeg assembler job&lt;br/&gt;reads assets and story pages,&lt;br/&gt;writes MP4 and release payload" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;fontSize=13;fontStyle=1;" vertex="1" parent="1">
+          <mxGeometry x="1380" y="1120" width="270" height="100" as="geometry" />
+        </mxCell>
+        <mxCell id="p1_data_note" value="The final movie can appear after reconnect because storybook state is mirrored outside the live audio stream." style="shape=note;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;fontSize=12;" vertex="1" parent="1">
+          <mxGeometry x="1240" y="1190" width="550" height="60" as="geometry" />
+        </mxCell>
+
+        <mxCell id="p1_ha" value="RO-19 Home Assistant lights&lt;br/&gt;color, brightness, transition,&lt;br/&gt;theater cues and wait-mode requests" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f5f5f5;strokeColor=#666666;fontSize=13;" vertex="1" parent="1">
+          <mxGeometry x="1945" y="610" width="240" height="95" as="geometry" />
+        </mxCell>
+        <mxCell id="p1_eleven" value="RO-20 ElevenLabs&lt;br/&gt;page read-aloud audio,&lt;br/&gt;voice fallback, SFX" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f5f5f5;strokeColor=#666666;fontSize=13;" vertex="1" parent="1">
+          <mxGeometry x="1945" y="770" width="240" height="90" as="geometry" />
+        </mxCell>
+        <mxCell id="p1_legend" value="Legend&lt;br/&gt;&lt;font color=&quot;#1a73e8&quot;&gt;Blue edges: live browser/audio/control path&lt;/font&gt;&lt;br/&gt;&lt;font color=&quot;#2e7d32&quot;&gt;Green edges: backend orchestration + queued UI events&lt;/font&gt;&lt;br/&gt;&lt;font color=&quot;#a56b00&quot;&gt;Gold edges: persistence and movie assembly&lt;/font&gt;&lt;br/&gt;&lt;font color=&quot;#666666&quot;&gt;Gray dashed edges: optional integrations&lt;/font&gt;&lt;br/&gt;Node lookup: see Voxitale_Runtime_Architecture_Dictionary.md" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;fontSize=12;" vertex="1" parent="1">
+          <mxGeometry x="1935" y="120" width="250" height="170" as="geometry" />
+        </mxCell>
+
+        <mxCell id="p1_e_ui_audio" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;strokeWidth=2;strokeColor=#1a73e8;endArrow=block;endFill=1;" edge="1" parent="1" source="p1_ui" target="p1_audio">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="p1_e_audio_ws" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;strokeWidth=2;strokeColor=#1a73e8;endArrow=block;endFill=1;" edge="1" parent="1" source="p1_audio" target="p1_ws_state">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="p1_e_ws_rehydrate" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;strokeWidth=2;strokeColor=#1a73e8;endArrow=block;endFill=1;" edge="1" parent="1" source="p1_ws_state" target="p1_rehydrate">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+
+        <mxCell id="p1_e_ws_fastapi" value="live WSS audio + control" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;labelBackgroundColor=#ffffff;fontSize=12;fontColor=#1a73e8;strokeWidth=3;strokeColor=#1a73e8;startArrow=block;endArrow=block;startFill=1;endFill=1;" edge="1" parent="1" source="p1_ws_state" target="p1_fastapi">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="p1_e_ui_fastapi" value="HTTPS helpers /api/*" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;dashed=1;labelBackgroundColor=#ffffff;fontSize=12;strokeColor=#666666;fontColor=#666666;" edge="1" parent="1" source="p1_ui" target="p1_fastapi">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="420" y="220" />
+              <mxPoint x="420" y="260" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+
+        <mxCell id="p1_e_fastapi_owner" value="socket ownership + health" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;labelBackgroundColor=#ffffff;fontSize=12;fontColor=#2e7d32;strokeColor=#2e7d32;strokeWidth=2;endArrow=block;endFill=1;" edge="1" parent="1" source="p1_fastapi" target="p1_owner">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="620" y="220" />
+              <mxPoint x="940" y="220" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="p1_e_fastapi_runner" value="session state + live queue" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;labelBackgroundColor=#ffffff;fontSize=12;fontColor=#2e7d32;strokeColor=#2e7d32;strokeWidth=3;endArrow=block;endFill=1;" edge="1" parent="1" source="p1_fastapi" target="p1_runner">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="p1_e_runner_agent" value="invoke storyteller agent" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;labelBackgroundColor=#ffffff;fontSize=12;fontColor=#2e7d32;strokeColor=#2e7d32;strokeWidth=2;endArrow=block;endFill=1;" edge="1" parent="1" source="p1_runner" target="p1_agent">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="1090" y="550" />
+              <mxPoint x="1090" y="225" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="p1_e_agent_live" value="ADK Bidi live stream" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;labelBackgroundColor=#ffffff;fontSize=12;fontColor=#7b1fa2;strokeColor=#7b1fa2;strokeWidth=3;startArrow=block;endArrow=block;startFill=1;endFill=1;" edge="1" parent="1" source="p1_agent" target="p1_live">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+
+        <mxCell id="p1_e_runner_tools" value="tool calls + tool responses" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;labelBackgroundColor=#ffffff;fontSize=12;fontColor=#2e7d32;strokeColor=#2e7d32;strokeWidth=2;endArrow=block;endFill=1;" edge="1" parent="1" source="p1_runner" target="p1_tools">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="p1_e_tools_helpers" value="helper calls" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;labelBackgroundColor=#ffffff;fontSize=12;fontColor=#7b1fa2;strokeColor=#7b1fa2;strokeWidth=2;endArrow=block;endFill=1;" edge="1" parent="1" source="p1_tools" target="p1_helpers">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="1090" y="720" />
+              <mxPoint x="1215" y="720" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="p1_e_tools_event" value="publish UI events" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;labelBackgroundColor=#ffffff;fontSize=12;fontColor=#2e7d32;strokeColor=#2e7d32;strokeWidth=2;endArrow=block;endFill=1;" edge="1" parent="1" source="p1_tools" target="p1_event_bus">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="p1_e_event_fastapi" value="flush queued events to current socket" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;labelBackgroundColor=#ffffff;fontSize=12;fontColor=#2e7d32;strokeColor=#2e7d32;strokeWidth=2;endArrow=block;endFill=1;" edge="1" parent="1" source="p1_event_bus" target="p1_fastapi">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="p1_e_poll_event" value="theater_mode when movie is ready" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;labelBackgroundColor=#ffffff;fontSize=12;fontColor=#2e7d32;strokeColor=#2e7d32;strokeWidth=2;endArrow=block;endFill=1;" edge="1" parent="1" source="p1_poll" target="p1_event_bus">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="780" y="1015" />
+              <mxPoint x="780" y="790" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+
+        <mxCell id="p1_e_tools_outputs" value="story outputs" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;labelBackgroundColor=#ffffff;fontSize=12;fontColor=#a56b00;strokeColor=#a56b00;strokeWidth=2;endArrow=block;endFill=1;" edge="1" parent="1" source="p1_tools" target="p1_story_outputs">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="1090" y="885" />
+              <mxPoint x="1360" y="885" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="p1_e_tools_firestore" value="story state" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;labelBackgroundColor=#ffffff;fontSize=12;fontColor=#a56b00;strokeColor=#a56b00;strokeWidth=2;endArrow=block;endFill=1;" edge="1" parent="1" source="p1_story_outputs" target="p1_firestore">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="p1_e_tools_gcs" value="scene assets" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;labelBackgroundColor=#ffffff;fontSize=12;fontColor=#a56b00;strokeColor=#a56b00;strokeWidth=2;endArrow=block;endFill=1;" edge="1" parent="1" source="p1_story_outputs" target="p1_gcs">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="p1_e_tools_ffmpeg" value="assemble_story_video" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;labelBackgroundColor=#ffffff;fontSize=12;fontColor=#a56b00;strokeColor=#a56b00;strokeWidth=2;endArrow=block;endFill=1;" edge="1" parent="1" source="p1_story_outputs" target="p1_ffmpeg">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="p1_e_ffmpeg_firestore" value="release metadata" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;labelBackgroundColor=#ffffff;fontSize=12;fontColor=#a56b00;strokeColor=#a56b00;strokeWidth=2;startArrow=block;endArrow=block;startFill=1;endFill=1;" edge="1" parent="1" source="p1_ffmpeg" target="p1_firestore">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="p1_e_ffmpeg_gcs" value="read assets / write MP4" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;labelBackgroundColor=#ffffff;fontSize=12;fontColor=#a56b00;strokeColor=#a56b00;strokeWidth=2;startArrow=block;endArrow=block;startFill=1;endFill=1;" edge="1" parent="1" source="p1_ffmpeg" target="p1_gcs">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="p1_e_poll_firestore" value="poll final movie" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;labelBackgroundColor=#ffffff;fontSize=12;fontColor=#a56b00;strokeColor=#a56b00;strokeWidth=2;endArrow=block;endFill=1;" edge="1" parent="1" source="p1_poll" target="p1_firestore">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+
+        <mxCell id="p1_e_tools_ha" value="room lights" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;dashed=1;labelBackgroundColor=#ffffff;fontSize=12;fontColor=#666666;strokeColor=#666666;strokeWidth=2;endArrow=block;endFill=1;" edge="1" parent="1" source="p1_tools" target="p1_ha">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="1090" y="665" />
+              <mxPoint x="1910" y="665" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="p1_e_tools_eleven" value="read-aloud / SFX" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;dashed=1;labelBackgroundColor=#ffffff;fontSize=12;fontColor=#666666;strokeColor=#666666;strokeWidth=2;endArrow=block;endFill=1;" edge="1" parent="1" source="p1_tools" target="p1_eleven">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="1090" y="900" />
+              <mxPoint x="1910" y="900" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="p1_e_browser_ha" value="browser fallback" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;dashed=1;labelBackgroundColor=#ffffff;fontSize=12;fontColor=#666666;strokeColor=#666666;strokeWidth=2;endArrow=block;endFill=1;" edge="1" parent="1" source="p1_browser_ha" target="p1_ha">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="1880" y="1015" />
+              <mxPoint x="1880" y="655" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+      </root>
+    </mxGraphModel>
+  </diagram>
+
+  <diagram id="reconnect_recovery" name="Reconnect and Recovery (RC)">
+    <mxGraphModel dx="1800" dy="1400" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="1900" pageHeight="1400" math="0" shadow="0">
+      <root>
+        <mxCell id="0" />
+        <mxCell id="1" parent="0" />
+
+        <mxCell id="p2_browser_group" value="Browser / Frontend" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f8f9fa;strokeColor=#6c8ebf;verticalAlign=top;fontStyle=1;spacingTop=10;fontSize=16;" vertex="1" parent="1">
+          <mxGeometry x="40" y="60" width="320" height="1220" as="geometry" />
+        </mxCell>
+        <mxCell id="p2_backend_group" value="Backend WebSocket Runtime" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f8f9fa;strokeColor=#82b366;verticalAlign=top;fontStyle=1;spacingTop=10;fontSize=16;" vertex="1" parent="1">
+          <mxGeometry x="400" y="60" width="430" height="1220" as="geometry" />
+        </mxCell>
+        <mxCell id="p2_state_group" value="State / Event Queue" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f8f9fa;strokeColor=#d6b656;verticalAlign=top;fontStyle=1;spacingTop=10;fontSize=16;" vertex="1" parent="1">
+          <mxGeometry x="870" y="60" width="420" height="1220" as="geometry" />
+        </mxCell>
+        <mxCell id="p2_adk_group" value="ADK / Gemini Live" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f8f9fa;strokeColor=#9673a6;verticalAlign=top;fontStyle=1;spacingTop=10;fontSize=16;" vertex="1" parent="1">
+          <mxGeometry x="1330" y="60" width="430" height="1220" as="geometry" />
+        </mxCell>
+        <mxCell id="p2_code_note" value="This page uses `RC-*` codes.&lt;br/&gt;See the other tabs for `RO-*` and `BD-*`." style="shape=note;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontSize=12;" vertex="1" parent="1">
+          <mxGeometry x="1470" y="95" width="240" height="70" as="geometry" />
+        </mxCell>
+
+        <mxCell id="p2_browser_1" value="RC-01 Transport/proxy closes&lt;br/&gt;or page/tab resumes" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontSize=13;" vertex="1" parent="1">
+          <mxGeometry x="85" y="150" width="230" height="80" as="geometry" />
+        </mxCell>
+        <mxCell id="p2_browser_2" value="RC-02 Frontend enters reconnecting&lt;br/&gt;and keeps the current storybook UI visible" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontSize=13;" vertex="1" parent="1">
+          <mxGeometry x="85" y="310" width="230" height="90" as="geometry" />
+        </mxCell>
+        <mxCell id="p2_browser_3" value="RC-03 Open a new websocket&lt;br/&gt;with the same session_id" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontSize=13;" vertex="1" parent="1">
+          <mxGeometry x="85" y="480" width="230" height="80" as="geometry" />
+        </mxCell>
+        <mxCell id="p2_browser_4" value="RC-04 Apply SESSION_REHYDRATED&lt;br/&gt;restore image, storybeat text,&lt;br/&gt;assembly status, scene history" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontSize=13;" vertex="1" parent="1">
+          <mxGeometry x="85" y="780" width="230" height="110" as="geometry" />
+        </mxCell>
+        <mxCell id="p2_browser_5" value="RC-05 Resume mic only when safe;&lt;br/&gt;otherwise remain in assembly wait mode&lt;br/&gt;or passive story playback" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontSize=13;" vertex="1" parent="1">
+          <mxGeometry x="85" y="1020" width="230" height="100" as="geometry" />
+        </mxCell>
+
+        <mxCell id="p2_backend_1" value="RC-06 Backend accepts the new /ws/story connection" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;fontSize=13;" vertex="1" parent="1">
+          <mxGeometry x="500" y="150" width="230" height="80" as="geometry" />
+        </mxCell>
+        <mxCell id="p2_backend_2" value="RC-07 Singleton guard swaps the active websocket owner&lt;br/&gt;for this session_id" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;fontSize=13;" vertex="1" parent="1">
+          <mxGeometry x="500" y="310" width="230" height="90" as="geometry" />
+        </mxCell>
+        <mxCell id="p2_backend_3" value="RC-08 Old ghost socket is closed&lt;br/&gt;to prevent split delivery" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;fontSize=13;" vertex="1" parent="1">
+          <mxGeometry x="500" y="450" width="230" height="80" as="geometry" />
+        </mxCell>
+        <mxCell id="p2_backend_4" value="RC-09 _prepare_clean_live_reconnect(...)&lt;br/&gt;cleans up the prior live model state" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;fontSize=13;" vertex="1" parent="1">
+          <mxGeometry x="500" y="620" width="230" height="90" as="geometry" />
+        </mxCell>
+        <mxCell id="p2_backend_5" value="RC-10 Restart _run_agent(...) and&lt;br/&gt;_forward_session_events(...)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;fontSize=13;" vertex="1" parent="1">
+          <mxGeometry x="500" y="820" width="230" height="80" as="geometry" />
+        </mxCell>
+        <mxCell id="p2_backend_6" value="RC-11 Heartbeat ping + watchdog&lt;br/&gt;close stale sockets if pong disappears" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;fontSize=13;" vertex="1" parent="1">
+          <mxGeometry x="500" y="1020" width="230" height="90" as="geometry" />
+        </mxCell>
+
+        <mxCell id="p2_state_1" value="RC-12 replace_session_queue(session_id)&lt;br/&gt;keeps buffered events alive across reconnect" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;fontSize=13;" vertex="1" parent="1">
+          <mxGeometry x="965" y="220" width="230" height="90" as="geometry" />
+        </mxCell>
+        <mxCell id="p2_state_2" value="RC-13 Cached storybook state + Firestore mirror&lt;br/&gt;hold current scene and assembly progress" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;fontSize=13;" vertex="1" parent="1">
+          <mxGeometry x="965" y="400" width="230" height="90" as="geometry" />
+        </mxCell>
+        <mxCell id="p2_state_3" value="RC-14 Send SESSION_REHYDRATED&lt;br/&gt;and restore_storybook_ui_after_reconnect(...)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;fontSize=13;" vertex="1" parent="1">
+          <mxGeometry x="965" y="590" width="230" height="90" as="geometry" />
+        </mxCell>
+        <mxCell id="p2_state_4" value="RC-15 Drain queued video_ready, theater_mode,&lt;br/&gt;lighting_command, and other custom events&lt;br/&gt;to the current socket" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;fontSize=13;" vertex="1" parent="1">
+          <mxGeometry x="965" y="810" width="230" height="100" as="geometry" />
+        </mxCell>
+        <mxCell id="p2_state_5" value="RC-16 Late image completion or final movie readiness&lt;br/&gt;can still arrive after reconnect" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;fontSize=13;" vertex="1" parent="1">
+          <mxGeometry x="965" y="1020" width="230" height="90" as="geometry" />
+        </mxCell>
+
+        <mxCell id="p2_adk_1" value="RC-17 Previous Gemini Live stream may clean-close&lt;br/&gt;(for example 1000 cancelled)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#e1d5e7;strokeColor=#9673a6;fontSize=13;" vertex="1" parent="1">
+          <mxGeometry x="1430" y="220" width="230" height="90" as="geometry" />
+        </mxCell>
+        <mxCell id="p2_adk_2" value="RC-18 Fresh Gemini Live session starts&lt;br/&gt;for the same conversation" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#e1d5e7;strokeColor=#9673a6;fontSize=13;" vertex="1" parent="1">
+          <mxGeometry x="1430" y="420" width="230" height="80" as="geometry" />
+        </mxCell>
+        <mxCell id="p2_adk_3" value="RC-19 Pending child turn can be replayed&lt;br/&gt;or recovered after render completion" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#e1d5e7;strokeColor=#9673a6;fontSize=13;" vertex="1" parent="1">
+          <mxGeometry x="1430" y="620" width="230" height="90" as="geometry" />
+        </mxCell>
+        <mxCell id="p2_adk_4" value="RC-20 Conversation continues or assembly wait mode stays active&lt;br/&gt;without losing the story state" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#e1d5e7;strokeColor=#9673a6;fontSize=13;" vertex="1" parent="1">
+          <mxGeometry x="1430" y="820" width="230" height="90" as="geometry" />
+        </mxCell>
+
+        <mxCell id="p2_note_main" value="Reconnect safety goals:&lt;br/&gt;1. One active websocket owner&lt;br/&gt;2. Preserve queued tool events&lt;br/&gt;3. Rehydrate story + assembly UI&lt;br/&gt;4. Restart live model cleanly" style="shape=note;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;fontSize=12;" vertex="1" parent="1">
+          <mxGeometry x="1420" y="1030" width="250" height="150" as="geometry" />
+        </mxCell>
+        <mxCell id="p2_note_split" value="Ghost sockets are forcibly closed so image completion and turn completion do not land on different browser connections." style="shape=note;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;fontSize=12;" vertex="1" parent="1">
+          <mxGeometry x="500" y="1150" width="230" height="90" as="geometry" />
+        </mxCell>
+        <mxCell id="p2_note_event" value="Buffered video_ready or theater_mode events can survive a fast reconnect because the queue is replaced, not discarded." style="shape=note;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;fontSize=12;" vertex="1" parent="1">
+          <mxGeometry x="965" y="1150" width="230" height="90" as="geometry" />
+        </mxCell>
+
+        <mxCell id="p2_e_b1_b2" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;endArrow=block;endFill=1;" edge="1" parent="1" source="p2_browser_1" target="p2_browser_2">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="p2_e_b2_b3" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;endArrow=block;endFill=1;" edge="1" parent="1" source="p2_browser_2" target="p2_browser_3">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="p2_e_b3_backend1" value="reconnect request" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;labelBackgroundColor=#ffffff;fontSize=12;endArrow=block;endFill=1;" edge="1" parent="1" source="p2_browser_3" target="p2_backend_1">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="p2_e_backend1_backend2" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;endArrow=block;endFill=1;" edge="1" parent="1" source="p2_backend_1" target="p2_backend_2">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="p2_e_backend2_backend3" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;endArrow=block;endFill=1;" edge="1" parent="1" source="p2_backend_2" target="p2_backend_3">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="p2_e_backend2_state1" value="swap queue ownership" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;labelBackgroundColor=#ffffff;fontSize=12;endArrow=block;endFill=1;" edge="1" parent="1" source="p2_backend_2" target="p2_state_1">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="p2_e_state1_state2" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;endArrow=block;endFill=1;" edge="1" parent="1" source="p2_state_1" target="p2_state_2">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="p2_e_state2_state3" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;endArrow=block;endFill=1;" edge="1" parent="1" source="p2_state_2" target="p2_state_3">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="p2_e_state3_browser4" value="session_rehydrated + restored UI events" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;labelBackgroundColor=#ffffff;fontSize=12;endArrow=block;endFill=1;" edge="1" parent="1" source="p2_state_3" target="p2_browser_4">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="p2_e_backend2_backend4" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;endArrow=block;endFill=1;" edge="1" parent="1" source="p2_backend_2" target="p2_backend_4">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="p2_e_backend4_backend5" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;endArrow=block;endFill=1;" edge="1" parent="1" source="p2_backend_4" target="p2_backend_5">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="p2_e_backend4_adk2" value="start fresh live stream" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;labelBackgroundColor=#ffffff;fontSize=12;endArrow=block;endFill=1;" edge="1" parent="1" source="p2_backend_4" target="p2_adk_2">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="p2_e_adk1_adk2" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;endArrow=block;endFill=1;" edge="1" parent="1" source="p2_adk_1" target="p2_adk_2">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="p2_e_adk2_adk3" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;endArrow=block;endFill=1;" edge="1" parent="1" source="p2_adk_2" target="p2_adk_3">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="p2_e_adk3_adk4" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;endArrow=block;endFill=1;" edge="1" parent="1" source="p2_adk_3" target="p2_adk_4">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="p2_e_backend5_state4" value="drain current queue" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;labelBackgroundColor=#ffffff;fontSize=12;endArrow=block;endFill=1;" edge="1" parent="1" source="p2_backend_5" target="p2_state_4">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="p2_e_state1_state4" value="preserved events" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;labelBackgroundColor=#ffffff;fontSize=12;endArrow=block;endFill=1;" edge="1" parent="1" source="p2_state_1" target="p2_state_4">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="p2_e_state4_browser4" value="video_ready / theater_mode / lighting_command" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;labelBackgroundColor=#ffffff;fontSize=12;endArrow=block;endFill=1;" edge="1" parent="1" source="p2_state_4" target="p2_browser_4">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="p2_e_state5_state4" value="late completion still publishes" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;labelBackgroundColor=#ffffff;fontSize=12;endArrow=block;endFill=1;" edge="1" parent="1" source="p2_state_5" target="p2_state_4">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="p2_e_backend5_backend6" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;endArrow=block;endFill=1;" edge="1" parent="1" source="p2_backend_5" target="p2_backend_6">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="p2_e_browser4_browser5" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;endArrow=block;endFill=1;" edge="1" parent="1" source="p2_browser_4" target="p2_browser_5">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="p2_e_adk4_browser5" value="safe conversation resumes or assembly chatter continues" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;labelBackgroundColor=#ffffff;fontSize=12;endArrow=block;endFill=1;" edge="1" parent="1" source="p2_adk_4" target="p2_browser_5">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="1290" y="865" />
+              <mxPoint x="1290" y="1070" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+      </root>
+    </mxGraphModel>
+  </diagram>
+
+  <diagram id="adk_bidi_flow" name="ADK Bidi Flow (BD)">
+    <mxGraphModel dx="1800" dy="1400" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="2100" pageHeight="1400" math="0" shadow="0">
+      <root>
+        <mxCell id="0" />
+        <mxCell id="1" parent="0" />
+
+        <mxCell id="p3_browser_group" value="Browser / Child Device" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f8f9fa;strokeColor=#6c8ebf;verticalAlign=top;fontStyle=1;spacingTop=10;fontSize=16;" vertex="1" parent="1">
+          <mxGeometry x="40" y="80" width="360" height="1180" as="geometry" />
+        </mxCell>
+        <mxCell id="p3_ws_group" value="Backend WebSocket Bridge" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f8f9fa;strokeColor=#82b366;verticalAlign=top;fontStyle=1;spacingTop=10;fontSize=16;" vertex="1" parent="1">
+          <mxGeometry x="450" y="80" width="420" height="1180" as="geometry" />
+        </mxCell>
+        <mxCell id="p3_adk_group" value="Google ADK Bidi Layer" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f8f9fa;strokeColor=#9673a6;verticalAlign=top;fontStyle=1;spacingTop=10;fontSize=16;" vertex="1" parent="1">
+          <mxGeometry x="920" y="80" width="500" height="1180" as="geometry" />
+        </mxCell>
+        <mxCell id="p3_model_group" value="Gemini Live + Tool Side Effects" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f8f9fa;strokeColor=#d6b656;verticalAlign=top;fontStyle=1;spacingTop=10;fontSize=16;" vertex="1" parent="1">
+          <mxGeometry x="1470" y="80" width="520" height="1180" as="geometry" />
+        </mxCell>
+        <mxCell id="p3_code_note" value="This page uses `BD-*` codes.&lt;br/&gt;See the other tabs for `RO-*` and `RC-*`." style="shape=note;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontSize=12;" vertex="1" parent="1">
+          <mxGeometry x="1660" y="105" width="240" height="70" as="geometry" />
+        </mxCell>
+
+        <mxCell id="p3_browser_in" value="BD-01 Child speaks into the browser&lt;br/&gt;Mic frames captured as PCM" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontSize=13;" vertex="1" parent="1">
+          <mxGeometry x="100" y="150" width="240" height="80" as="geometry" />
+        </mxCell>
+        <mxCell id="p3_browser_send" value="BD-02 Frontend sends audio and control JSON&lt;br/&gt;over WSS /ws/story" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontSize=13;" vertex="1" parent="1">
+          <mxGeometry x="100" y="300" width="240" height="90" as="geometry" />
+        </mxCell>
+        <mxCell id="p3_browser_recv" value="BD-03 Frontend receives streamed assistant audio,&lt;br/&gt;TURN_COMPLETE, video_ready, theater_mode" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontSize=13;" vertex="1" parent="1">
+          <mxGeometry x="100" y="760" width="240" height="100" as="geometry" />
+        </mxCell>
+        <mxCell id="p3_browser_ui" value="BD-04 UI plays Amelia's voice and updates&lt;br/&gt;story image, captions, theater state" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontSize=13;" vertex="1" parent="1">
+          <mxGeometry x="100" y="940" width="240" height="90" as="geometry" />
+        </mxCell>
+
+        <mxCell id="p3_ws_recv" value="BD-05 ws_router receives websocket audio frames&lt;br/&gt;and child JSON events" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;fontSize=13;" vertex="1" parent="1">
+          <mxGeometry x="540" y="150" width="240" height="90" as="geometry" />
+        </mxCell>
+        <mxCell id="p3_ws_audio" value="BD-06 _send_live_realtime(...)&lt;br/&gt;wraps PCM as Blob and pushes realtime audio" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;fontSize=13;" vertex="1" parent="1">
+          <mxGeometry x="540" y="320" width="240" height="90" as="geometry" />
+        </mxCell>
+        <mxCell id="p3_ws_text" value="BD-07 _send_live_content(...)&lt;br/&gt;pushes text/control instructions when needed&lt;br/&gt;(repairs, queued follow-up, recovery)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;fontSize=13;" vertex="1" parent="1">
+          <mxGeometry x="540" y="470" width="240" height="100" as="geometry" />
+        </mxCell>
+        <mxCell id="p3_ws_mux" value="BD-08 _run_agent(...) multiplexes returned ADK events&lt;br/&gt;into websocket audio + backend side effects" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;fontSize=13;fontStyle=1;" vertex="1" parent="1">
+          <mxGeometry x="540" y="760" width="240" height="100" as="geometry" />
+        </mxCell>
+        <mxCell id="p3_ws_note" value="This backend is not just calling a model endpoint. It is acting as a live bidirectional bridge between the browser websocket and ADK's live request/event stream." style="shape=note;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;fontSize=12;" vertex="1" parent="1">
+          <mxGeometry x="520" y="980" width="280" height="140" as="geometry" />
+        </mxCell>
+
+        <mxCell id="p3_adk_queue" value="BD-09 ResettableLiveRequestQueue&lt;br/&gt;real ADK LiveRequestQueue subtype&lt;br/&gt;can discard stale frames on reset()" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#e1d5e7;strokeColor=#9673a6;fontSize=13;fontStyle=1;" vertex="1" parent="1">
+          <mxGeometry x="1040" y="210" width="260" height="100" as="geometry" />
+        </mxCell>
+        <mxCell id="p3_adk_run" value="BD-10 runner.run_live(..., live_request_queue=live_queue)&lt;br/&gt;opens the ADK live session" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#e1d5e7;strokeColor=#9673a6;fontSize=13;fontStyle=1;" vertex="1" parent="1">
+          <mxGeometry x="1040" y="420" width="260" height="90" as="geometry" />
+        </mxCell>
+        <mxCell id="p3_adk_stream" value="BD-11 ADK Bidi data plane&lt;br/&gt;streaming requests in / events out" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#e1d5e7;strokeColor=#9673a6;fontSize=13;" vertex="1" parent="1">
+          <mxGeometry x="1040" y="620" width="260" height="90" as="geometry" />
+        </mxCell>
+        <mxCell id="p3_adk_reset" value="BD-12 Reset / recovery path&lt;br/&gt;queue_reset, pending-turn replay,&lt;br/&gt;clean reconnect after transport errors" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#e1d5e7;strokeColor=#9673a6;fontSize=13;" vertex="1" parent="1">
+          <mxGeometry x="1040" y="840" width="260" height="100" as="geometry" />
+        </mxCell>
+
+        <mxCell id="p3_model_live" value="BD-13 Gemini Live native-audio session&lt;br/&gt;Bidi audio + text + tool calling" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;fontSize=13;fontStyle=1;" vertex="1" parent="1">
+          <mxGeometry x="1610" y="210" width="250" height="90" as="geometry" />
+        </mxCell>
+        <mxCell id="p3_model_events" value="BD-14 Streaming output events&lt;br/&gt;assistant audio chunks, transcripts,&lt;br/&gt;tool/function calls, turn completion" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;fontSize=13;" vertex="1" parent="1">
+          <mxGeometry x="1610" y="420" width="250" height="100" as="geometry" />
+        </mxCell>
+        <mxCell id="p3_model_tools" value="BD-15 Tool side effects&lt;br/&gt;scene generation, lighting, story assembly,&lt;br/&gt;title repair, read-aloud" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;fontSize=13;" vertex="1" parent="1">
+          <mxGeometry x="1610" y="650" width="250" height="100" as="geometry" />
+        </mxCell>
+        <mxCell id="p3_model_pub" value="BD-16 Session event bus publishes&lt;br/&gt;video_ready, lighting_command,&lt;br/&gt;theater_mode back to the browser" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;fontSize=13;" vertex="1" parent="1">
+          <mxGeometry x="1610" y="860" width="250" height="100" as="geometry" />
+        </mxCell>
+        <mxCell id="p3_model_note" value="Why ADK Bidi mattered here:&lt;br/&gt;- true live audio conversation&lt;br/&gt;- tool calls inside the same stream&lt;br/&gt;- recoverable queue resets and reconnects&lt;br/&gt;- browser stays synced with generated media" style="shape=note;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;fontSize=12;" vertex="1" parent="1">
+          <mxGeometry x="1590" y="1030" width="290" height="150" as="geometry" />
+        </mxCell>
+
+        <mxCell id="p3_e_1" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;endArrow=block;endFill=1;" edge="1" parent="1" source="p3_browser_in" target="p3_browser_send">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="p3_e_2" value="WSS audio + JSON" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;labelBackgroundColor=#ffffff;fontSize=12;endArrow=block;endFill=1;strokeWidth=2;" edge="1" parent="1" source="p3_browser_send" target="p3_ws_recv">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="p3_e_3" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;endArrow=block;endFill=1;" edge="1" parent="1" source="p3_ws_recv" target="p3_ws_audio">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="p3_e_4" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;endArrow=block;endFill=1;" edge="1" parent="1" source="p3_ws_audio" target="p3_adk_queue">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="p3_e_5" value="text/content lane" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;labelBackgroundColor=#ffffff;fontSize=12;endArrow=block;endFill=1;" edge="1" parent="1" source="p3_ws_text" target="p3_adk_queue">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="p3_e_6" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;endArrow=block;endFill=1;" edge="1" parent="1" source="p3_adk_queue" target="p3_adk_run">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="p3_e_7" value="ADK Bidi session" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;labelBackgroundColor=#ffffff;fontSize=12;startArrow=block;endArrow=block;startFill=1;endFill=1;strokeWidth=2;" edge="1" parent="1" source="p3_adk_run" target="p3_model_live">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="p3_e_8" value="streamed model events" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;labelBackgroundColor=#ffffff;fontSize=12;endArrow=block;endFill=1;" edge="1" parent="1" source="p3_model_live" target="p3_model_events">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="p3_e_9" value="events out" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;labelBackgroundColor=#ffffff;fontSize=12;endArrow=block;endFill=1;" edge="1" parent="1" source="p3_model_events" target="p3_adk_stream">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="p3_e_10" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;endArrow=block;endFill=1;" edge="1" parent="1" source="p3_adk_stream" target="p3_ws_mux">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="p3_e_11" value="assistant PCM + JSON events" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;labelBackgroundColor=#ffffff;fontSize=12;endArrow=block;endFill=1;strokeWidth=2;" edge="1" parent="1" source="p3_ws_mux" target="p3_browser_recv">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="p3_e_12" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;endArrow=block;endFill=1;" edge="1" parent="1" source="p3_browser_recv" target="p3_browser_ui">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="p3_e_13" value="tool calls" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;labelBackgroundColor=#ffffff;fontSize=12;endArrow=block;endFill=1;" edge="1" parent="1" source="p3_model_events" target="p3_model_tools">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="p3_e_14" value="publish UI side effects" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;labelBackgroundColor=#ffffff;fontSize=12;endArrow=block;endFill=1;" edge="1" parent="1" source="p3_model_tools" target="p3_model_pub">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="p3_e_15" value="video_ready / lighting_command / theater_mode" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;labelBackgroundColor=#ffffff;fontSize=12;endArrow=block;endFill=1;" edge="1" parent="1" source="p3_model_pub" target="p3_browser_recv">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="1520" y="905" />
+              <mxPoint x="1520" y="810" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="p3_e_16" value="reset() after transport/model problems" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;dashed=1;labelBackgroundColor=#ffffff;fontSize=12;endArrow=block;endFill=1;" edge="1" parent="1" source="p3_adk_reset" target="p3_adk_queue">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="p3_e_17" value="clean reconnect / pending-turn replay" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;dashed=1;labelBackgroundColor=#ffffff;fontSize=12;endArrow=block;endFill=1;" edge="1" parent="1" source="p3_adk_reset" target="p3_adk_run">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+      </root>
+    </mxGraphModel>
+  </diagram>
+</mxfile>

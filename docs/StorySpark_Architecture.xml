@@ -1,0 +1,210 @@
+<mxfile host="Electron" version="21.1.2" type="device">
+  <diagram id="diagram_1" name="Simplified Architecture">
+    <mxGraphModel dx="1600" dy="1200" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="1600" pageHeight="1200" math="0" shadow="0">
+      <root>
+        <mxCell id="0" />
+        <mxCell id="1" parent="0" />
+        
+        <!-- Grouping Boxes -->
+        <mxCell id="grp_client" value="Client (Browser)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f8f9fa;strokeColor=#dae8fc;verticalAlign=top;fontStyle=1;spacingTop=10;fontSize=14;" vertex="1" parent="1">
+          <mxGeometry x="60" y="60" width="240" height="400" as="geometry" />
+        </mxCell>
+        
+        <mxCell id="grp_app" value="Application Tier (Google Cloud Run)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f8f9fa;strokeColor=#d5e8d4;verticalAlign=top;fontStyle=1;spacingTop=10;fontSize=14;" vertex="1" parent="1">
+          <mxGeometry x="420" y="60" width="320" height="580" as="geometry" />
+        </mxCell>
+        
+        <mxCell id="grp_agent" value="Agent, Models &amp; Prompt Learning (Google ADK &amp; Vertex)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f8f9fa;strokeColor=#e1d5e7;verticalAlign=top;fontStyle=1;spacingTop=10;fontSize=14;" vertex="1" parent="1">
+          <mxGeometry x="800" y="60" width="700" height="420" as="geometry" />
+        </mxCell>
+
+        <mxCell id="grp_data" value="Data Layer (Google Cloud Storage &amp; Firestore)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f8f9fa;strokeColor=#fff2cc;verticalAlign=top;fontStyle=1;spacingTop=10;fontSize=14;" vertex="1" parent="1">
+          <mxGeometry x="420" y="740" width="1080" height="180" as="geometry" />
+        </mxCell>
+
+        <!-- Components -->
+        <!-- Client -->
+        <mxCell id="UI" value="Next.js / React UI" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;" vertex="1" parent="1">
+          <mxGeometry x="100" y="120" width="160" height="60" as="geometry" />
+        </mxCell>
+        <mxCell id="AW" value="Audio Worklets&lt;br/&gt;(16 kHz Mic Capture)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;" vertex="1" parent="1">
+          <mxGeometry x="100" y="250" width="160" height="60" as="geometry" />
+        </mxCell>
+        <mxCell id="TG" value="Parent Gate &amp; Theater Mode" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;" vertex="1" parent="1">
+          <mxGeometry x="100" y="380" width="160" height="60" as="geometry" />
+        </mxCell>
+
+        <!-- App Tier -->
+        <mxCell id="FE" value="Next.js Frontend Service" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;" vertex="1" parent="1">
+          <mxGeometry x="500" y="120" width="160" height="60" as="geometry" />
+        </mxCell>
+        <mxCell id="BE" value="FastAPI Backend Service&lt;br/&gt;(WebSocket &amp; API Router)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;" vertex="1" parent="1">
+          <mxGeometry x="500" y="240" width="160" height="80" as="geometry" />
+        </mxCell>
+        <mxCell id="JOB" value="Cloud Run Job&lt;br/&gt;(FFmpeg Storybook Assembler)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;fontStyle=1" vertex="1" parent="1">
+          <mxGeometry x="500" y="540" width="160" height="60" as="geometry" />
+        </mxCell>
+
+        <!-- Agent -->
+        <mxCell id="GEM" value="Gemini Live + Vertex Models" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#e1d5e7;strokeColor=#9673a6;" vertex="1" parent="1">
+          <mxGeometry x="840" y="120" width="360" height="60" as="geometry" />
+        </mxCell>
+        <mxCell id="TOOLS" value="ADK Tools&lt;br/&gt;(Mixed Text+Image Storybeats)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#e1d5e7;strokeColor=#9673a6;" vertex="1" parent="1">
+          <mxGeometry x="840" y="250" width="360" height="60" as="geometry" />
+        </mxCell>
+        
+        <mxCell id="META" value="Shared Prompt Meta-Learning&lt;br/&gt;(In-Process Rule Injection&lt;br/&gt;+ Feedback Logging)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#e1d5e7;strokeColor=#9673a6;fontStyle=1" vertex="1" parent="1">
+          <mxGeometry x="1270" y="170" width="180" height="90" as="geometry" />
+        </mxCell>
+
+        <!-- Ext Integrations -->
+        <mxCell id="EL" value="3rd Party Integration&lt;br/&gt;(ElevenLabs Audio/SFX API)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f5f5f5;strokeColor=#666666;fontStyle=1" vertex="1" parent="1">
+          <mxGeometry x="840" y="380" width="170" height="60" as="geometry" />
+        </mxCell>
+        <mxCell id="IOT" value="Smart Room Lighting&lt;br/&gt;(Home Assistant API)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f5f5f5;strokeColor=#666666;fontStyle=1" vertex="1" parent="1">
+          <mxGeometry x="1030" y="380" width="170" height="60" as="geometry" />
+        </mxCell>
+
+        <!-- Data Layer -->
+        <mxCell id="GCS" value="Cloud Storage&lt;br/&gt;(Assets &amp; MP4s)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;" vertex="1" parent="1">
+          <mxGeometry x="720" y="790" width="160" height="60" as="geometry" />
+        </mxCell>
+        <mxCell id="FS" value="Firestore Metadata&lt;br/&gt;&amp; Feedback Rollups" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;" vertex="1" parent="1">
+          <mxGeometry x="1100" y="790" width="160" height="60" as="geometry" />
+        </mxCell>
+        
+        <!-- Key Connections -->
+        
+        <!-- Internal Browser Links -->
+        <mxCell id="eUI_AW" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;endArrow=block;startArrow=block;endFill=1;startFill=1;" edge="1" parent="1" source="UI" target="AW">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="eAW_TG" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;endArrow=block;startArrow=block;endFill=1;startFill=1;" edge="1" parent="1" source="AW" target="TG">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+
+        <!-- Browser to Cloud Run -->
+        <mxCell id="eUI_FE" value="HTTPS" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;labelBackgroundColor=#ffffff;" edge="1" parent="1" source="UI" target="FE">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="eAW_BE" value="Real-time WSS Stream&lt;br/&gt;(Direct to Backend)" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;labelBackgroundColor=#ffffff;strokeWidth=2;" edge="1" parent="1" source="AW" target="BE">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+
+        <!-- FE to BE proxying -->
+        <mxCell id="eFE_BE" value="API Proxy" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;dashed=1;labelBackgroundColor=#ffffff;" edge="1" parent="1" source="FE" target="BE">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+
+        <!-- Backend to Agent -->
+        <mxCell id="eBE_GEM" value="Audio I/O" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;labelBackgroundColor=#ffffff;strokeWidth=2;exitX=1;exitY=0.25;entryX=0;entryY=0.5;" edge="1" parent="1" source="BE" target="GEM">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        
+        <mxCell id="eBE_TOOLS" value="Tool Execution" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;labelBackgroundColor=#ffffff;exitX=1;exitY=0.5;entryX=0;entryY=0.5;" edge="1" parent="1" source="BE" target="TOOLS">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+
+        <!-- Meta-learning injections -->
+        <mxCell id="eMETA_GEM" value="Live Prompt Rules" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;dashed=1;labelBackgroundColor=#ffffff;exitX=0;exitY=0.2;entryX=1;entryY=0.5;" edge="1" parent="1" source="META" target="GEM">
+          <mxGeometry relative="1" as="geometry">
+             <Array as="points">
+              <mxPoint x="1230" y="188"/>
+              <mxPoint x="1230" y="150"/>
+            </Array>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="eMETA_TOOLS" value="Scene Prompt Rules" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;dashed=1;labelBackgroundColor=#ffffff;exitX=0;exitY=0.8;entryX=1;entryY=0.5;" edge="1" parent="1" source="META" target="TOOLS">
+          <mxGeometry relative="1" as="geometry">
+             <Array as="points">
+              <mxPoint x="1230" y="242"/>
+              <mxPoint x="1230" y="280"/>
+            </Array>
+          </mxGeometry>
+        </mxCell>
+
+        <!-- Meta-learning reads principles and writes feedback -->
+        <mxCell id="eMETA_FS" value="Reads principles;&lt;br/&gt;writes feedback + rollups" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;labelBackgroundColor=#ffffff;startArrow=block;startFill=1;exitX=0.5;exitY=1;entryX=1;entryY=0.5;" edge="1" parent="1" source="META" target="FS">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="1360" y="820"/>
+            </Array>
+          </mxGeometry>
+        </mxCell>
+
+        <!-- Job uses rules - Routed far left to keep center clean -->
+        <mxCell id="eMETA_JOB" value="Storyboard Review&lt;br/&gt;+ Repair Rules" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;dashed=1;labelBackgroundColor=#ffffff;exitX=0.25;exitY=1;entryX=1;entryY=0.25;" edge="1" parent="1" source="META" target="JOB">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="1315" y="470"/>
+              <mxPoint x="750" y="470"/>
+              <mxPoint x="750" y="555"/>
+            </Array>
+          </mxGeometry>
+        </mxCell>
+
+        <!-- Tools to Integrations -->
+        <mxCell id="eTOOLS_EL" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;dashed=1;exitX=0.25;exitY=1;entryX=0.5;entryY=0;" edge="1" parent="1" source="TOOLS" target="EL">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="eTOOLS_IOT" value="Matches Mood" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;dashed=1;labelBackgroundColor=#ffffff;exitX=0.75;exitY=1;entryX=0.5;entryY=0;" edge="1" parent="1" source="TOOLS" target="IOT">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+
+        <!-- Tool Outputs -> Data Layers -->
+        <mxCell id="eTOOLS_GCS" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;exitX=0;exitY=0.75;entryX=0.5;entryY=0;" edge="1" parent="1" source="TOOLS" target="GCS">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="800" y="295"/>
+              <mxPoint x="800" y="700"/>
+            </Array>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="eTOOLS_FS" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;exitX=1;exitY=0.75;entryX=0.5;entryY=0;" edge="1" parent="1" source="TOOLS" target="FS">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="1230" y="295"/>
+              <mxPoint x="1230" y="700"/>
+              <mxPoint x="1180" y="700"/>
+            </Array>
+          </mxGeometry>
+        </mxCell>
+
+        <!-- Backend Triggers Job -->
+        <mxCell id="eBE_JOB" value="Triggers Async Movie Build" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;labelBackgroundColor=#ffffff;exitX=0.5;exitY=1;entryX=0.5;entryY=0;" edge="1" parent="1" source="BE" target="JOB">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        
+        <!-- Job calls ElevenLabs - Routed around the trigger line -->
+        <mxCell id="eJOB_EL" value="SFX / TTS Synthesis" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;dashed=1;labelBackgroundColor=#ffffff;exitX=1;exitY=0.5;entryX=0;entryY=0.5;" edge="1" parent="1" source="JOB" target="EL">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="780" y="570"/>
+              <mxPoint x="780" y="410"/>
+            </Array>
+          </mxGeometry>
+        </mxCell>
+
+        <!-- Job reads/writes Data -->
+        <mxCell id="eJOB_GCS" value="Reads Scene PNGs / Writes MP4" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;labelBackgroundColor=#ffffff;dashed=1;exitX=0.5;exitY=1;entryX=0.25;entryY=0;" edge="1" parent="1" source="JOB" target="GCS">
+          <mxGeometry relative="1" as="geometry">
+             <Array as="points">
+              <mxPoint x="580" y="680"/>
+              <mxPoint x="760" y="680"/>
+            </Array>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="eJOB_FS" value="Writes session metadata" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;dashed=1;labelBackgroundColor=#ffffff;exitX=1;exitY=1;entryX=0;entryY=0.5;" edge="1" parent="1" source="JOB" target="FS">
+          <mxGeometry relative="1" as="geometry">
+             <Array as="points">
+              <mxPoint x="680" y="720"/>
+              <mxPoint x="1060" y="720"/>
+              <mxPoint x="1060" y="820"/>
+            </Array>
+          </mxGeometry>
+        </mxCell>
+
+      </root>
+    </mxGraphModel>
+  </diagram>
+</mxfile>

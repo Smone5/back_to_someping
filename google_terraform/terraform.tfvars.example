@@ -7,9 +7,9 @@ domain_name = "storyspark.example.com"
 
 # These bootstrap image tags should exist before the first terraform apply.
 # After that, deploy.sh will keep the image values updated automatically.
-backend_image  = "gcr.io/your-project-id/storyteller-backend:bootstrap"
-frontend_image = "gcr.io/your-project-id/storyteller-frontend:bootstrap"
-ffmpeg_image   = "gcr.io/your-project-id/storyteller-ffmpeg:bootstrap"
+backend_image  = "us-central1-docker.pkg.dev/your-project-id/voxitale/storyteller-backend:bootstrap"
+frontend_image = "us-central1-docker.pkg.dev/your-project-id/voxitale/storyteller-frontend:bootstrap"
+ffmpeg_image   = "us-central1-docker.pkg.dev/your-project-id/voxitale/storyteller-ffmpeg:bootstrap"
 
 # Common tuning knobs. Everything else can fall back to defaults in variables.tf.
 max_backend_instances  = 10
