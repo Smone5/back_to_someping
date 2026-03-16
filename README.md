@@ -40,9 +40,9 @@ The demo highlights the guided story setup flow, optional Home Assistant lightin
       Each story ends as an illustrated, narrated playback with readable page text and simple sharing controls.
     </td>
     <td align="center" valign="top" width="50%">
-      <img src="docs/readme-assets/light-finale-demo.jpg" alt="Voxitale synchronized smart light finale screen" width="100%" /><br />
-      <strong>Ambient finale</strong><br />
-      Connected lights can add a simple synchronized room effect to the final playback for a more immersive finish.
+      <img src="docs/readme-assets/light-finale-demo.jpg" alt="Voxitale Amelia introduction screen" width="100%" /><br />
+      <strong>Meet Amelia</strong><br />
+      This is the introduction moment where children first meet Amelia and begin the live voice storytelling experience.
     </td>
   </tr>
 </table>
