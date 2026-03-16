@@ -611,6 +611,55 @@ function normalizeSceneHistory(raw: unknown): SceneBranchPoint[] {
     return normalized.sort((a, b) => a.scene_number - b.scene_number);
 }
 
+function upsertSceneHistoryPoint(
+    history: SceneBranchPoint[],
+    point: SceneBranchPoint,
+): SceneBranchPoint[] {
+    const sceneNumber = Number(point.scene_number ?? 0);
+    if (!Number.isFinite(sceneNumber) || sceneNumber <= 0) {
+        return history;
+    }
+
+    const normalizedPoint: SceneBranchPoint = {
+        scene_number: sceneNumber,
+        label: point.label ?? null,
+        scene_description: point.scene_description ?? null,
+        storybeat_text: point.storybeat_text ?? null,
+        image_url: point.image_url ?? null,
+        is_current: point.is_current ?? true,
+        is_selected: point.is_selected ?? false,
+    };
+
+    let replaced = false;
+    const merged = history.map((existing) => {
+        if (existing.scene_number !== sceneNumber) {
+            return normalizedPoint.is_current
+                ? { ...existing, is_current: false }
+                : existing;
+        }
+        replaced = true;
+        return {
+            ...existing,
+            ...normalizedPoint,
+            label: normalizedPoint.label ?? existing.label ?? null,
+            scene_description: normalizedPoint.scene_description ?? existing.scene_description ?? null,
+            storybeat_text: normalizedPoint.storybeat_text ?? existing.storybeat_text ?? null,
+            image_url: normalizedPoint.image_url ?? existing.image_url ?? null,
+        };
+    });
+
+    if (!replaced) {
+        if (normalizedPoint.is_current) {
+            for (let index = 0; index < merged.length; index += 1) {
+                merged[index] = { ...merged[index], is_current: false };
+            }
+        }
+        merged.push(normalizedPoint);
+    }
+
+    return merged.sort((a, b) => a.scene_number - b.scene_number);
+}
+
 const ASSEMBLY_MISSION_ROTATION_SECONDS = 18;
 const ASSEMBLY_MISSIONS: AssemblyMission[] = [
     {
@@ -797,6 +846,7 @@ export default function StorytellerLive() {
     const [currentSceneThumbnailB64, setCurrentSceneThumbnailB64] = useState<string | null>(null);
     const [currentSceneVideoUrl, setCurrentSceneVideoUrl] = useState<string | null>(null);
     const [currentSceneStorybeatText, setCurrentSceneStorybeatText] = useState<string | null>(null);
+    const [currentPresentedSceneNumber, setCurrentPresentedSceneNumber] = useState<number | null>(null);
     const [sceneHistory, setSceneHistory] = useState<SceneBranchPoint[]>([]);
     const [finalMovieUrl, setFinalMovieUrl] = useState<string | null>(null);
     const [tradingCardUrl, setTradingCardUrl] = useState<string | null>(null);
@@ -1925,6 +1975,10 @@ export default function StorytellerLive() {
                     {
                         const url = msg.payload?.url as string;
                         if (!url) break;
+                        const sceneNumber = Number(msg.payload?.scene_number ?? 0);
+                        const normalizedSceneNumber = Number.isFinite(sceneNumber) && sceneNumber > 0
+                            ? sceneNumber
+                            : null;
                         const requestId = typeof msg.payload?.request_id === 'string'
                             ? (msg.payload.request_id as string).trim() || null
                             : null;
@@ -1933,9 +1987,15 @@ export default function StorytellerLive() {
                         const isPlaceholder = Boolean(msg.payload?.is_placeholder);
                         setStoryPhase(isPlaceholder ? 'drawing_scene' : 'waiting_for_child');
                         const isFallback = Boolean(msg.payload?.is_fallback);
+                        const sceneDescription = typeof msg.payload?.description === 'string'
+                            ? (msg.payload.description as string).trim()
+                            : '';
                         const storybeatText = typeof msg.payload?.storybeat_text === 'string'
                             ? (msg.payload.storybeat_text as string).trim()
                             : '';
+                        const sceneHistoryImageUrl = !url.startsWith('data:')
+                            ? url
+                            : null;
                         const mediaType = (msg.payload?.media_type as string | undefined)?.toLowerCase();
                         const inferredType: 'image' | 'video' =
                             mediaType === 'image' ||
@@ -1955,14 +2015,54 @@ export default function StorytellerLive() {
                                     break;
                                 }
                             }
+                            if (isPlaceholder && normalizedSceneNumber) {
+                                setSceneHistory((current) => {
+                                    const baseHistory = hasSceneHistoryPayload ? nextSceneHistory : current;
+                                    return upsertSceneHistoryPoint(
+                                        baseHistory,
+                                        {
+                                            scene_number: normalizedSceneNumber,
+                                            label: storybeatText || sceneDescription || null,
+                                            scene_description: sceneDescription || null,
+                                            storybeat_text: storybeatText || null,
+                                            image_url: null,
+                                            is_current: true,
+                                            is_selected: false,
+                                        },
+                                    );
+                                });
+                                setCurrentPresentedSceneNumber(normalizedSceneNumber);
+                            }
                             let scenePresentationApplied = false;
                             const applyCommittedScenePresentation = () => {
                                 if (scenePresentationApplied) {
                                     return;
                                 }
                                 scenePresentationApplied = true;
-                                if (hasSceneHistoryPayload && nextSceneHistory.length) {
-                                    setSceneHistory(nextSceneHistory);
+                                setSceneHistory((current) => {
+                                    const baseHistory = hasSceneHistoryPayload ? nextSceneHistory : current;
+                                    if (!normalizedSceneNumber) {
+                                        return hasSceneHistoryPayload ? baseHistory : current;
+                                    }
+                                    return upsertSceneHistoryPoint(
+                                        baseHistory,
+                                        {
+                                            scene_number: normalizedSceneNumber,
+                                            label: storybeatText || sceneDescription || null,
+                                            scene_description: sceneDescription || null,
+                                            storybeat_text: storybeatText || null,
+                                            image_url: !isPlaceholder ? sceneHistoryImageUrl : null,
+                                            is_current: true,
+                                            is_selected: false,
+                                        },
+                                    );
+                                });
+                                if (normalizedSceneNumber) {
+                                    setCurrentPresentedSceneNumber(normalizedSceneNumber);
+                                } else if (hasSceneHistoryPayload && nextSceneHistory.length) {
+                                    setCurrentPresentedSceneNumber(
+                                        nextSceneHistory[nextSceneHistory.length - 1]?.scene_number ?? null,
+                                    );
                                 }
                                 if (storybeatText) {
                                     setCurrentSceneStorybeatText(storybeatText);
@@ -2185,6 +2285,12 @@ export default function StorytellerLive() {
                         if (nextSceneHistory.length || Array.isArray(msg.payload?.scene_history)) {
                             setSceneHistory(nextSceneHistory);
                         }
+                        const pageNumber = Number(msg.payload?.current_scene_page_number ?? msg.payload?.scene_number ?? 0);
+                        setCurrentPresentedSceneNumber(
+                            Number.isFinite(pageNumber) && pageNumber > 0
+                                ? pageNumber
+                                : (nextSceneHistory[nextSceneHistory.length - 1]?.scene_number ?? null),
+                        );
                     }
                     break;
                 case 'session_rehydrated':
@@ -2197,7 +2303,16 @@ export default function StorytellerLive() {
                         setStoryPhase(rehydratedStoryPhase);
                         setAgentThinking(Boolean(msg.payload?.pending_response) && !shouldStayInTheater);
                         setServerVadEnabled(Boolean(msg.payload?.server_vad_enabled));
-                        setSceneHistory(normalizeSceneHistory(msg.payload?.scene_history));
+                        {
+                            const nextSceneHistory = normalizeSceneHistory(msg.payload?.scene_history);
+                            setSceneHistory(nextSceneHistory);
+                            const pageNumber = Number(msg.payload?.current_scene_page_number ?? 0);
+                            setCurrentPresentedSceneNumber(
+                                Number.isFinite(pageNumber) && pageNumber > 0
+                                    ? pageNumber
+                                    : (nextSceneHistory[nextSceneHistory.length - 1]?.scene_number ?? null),
+                            );
+                        }
                         const persistedAssemblyState = sessionIdRef.current
                             ? loadPersistedStorybookAssemblyState(sessionIdRef.current)
                             : null;
@@ -3626,9 +3741,8 @@ export default function StorytellerLive() {
     const isYoungChildMode = childAge <= 5;
     const showInlineHudControls = !isYoungChildMode;
     const selectedScene = sceneHistory.find((scene) => scene.scene_number === selectedSceneNumber) ?? null;
-    const currentScenePageNumber = sceneHistory.length
-        ? sceneHistory[sceneHistory.length - 1]?.scene_number ?? null
-        : null;
+    const currentScenePageNumber = currentPresentedSceneNumber
+        ?? (sceneHistory.length ? sceneHistory[sceneHistory.length - 1]?.scene_number ?? null : null);
     const etaSeconds = storybookStatus?.etaSeconds ?? 0;
     const etaLabel = etaSeconds ? `About ${Math.ceil(etaSeconds / 30) * 30} seconds` : null;
     const assemblingMilestones = storybookStatus?.kind === 'remake'

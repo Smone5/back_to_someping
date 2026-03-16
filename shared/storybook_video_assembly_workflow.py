@@ -326,6 +326,12 @@ def normalize_video_assembly_decision(
     report_ready = bool(report.get("ready_to_publish")) and report_status in {"complete", "approved"}
     retryable = bool(report.get("retryable"))
 
+    # The deterministic render report is the source of truth for publishability.
+    # If the worker says the movie is ready, do not let a flaky auditor/finalizer
+    # downgrade it to a retry or manual review.
+    if report_ready and status in {"retry_render", "needs_manual_review"}:
+        return default_decision
+
     if status == "approved":
         if report_ready:
             return {

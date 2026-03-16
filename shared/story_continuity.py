@@ -346,7 +346,7 @@ def _canonical_label(text: str) -> str:
         flags=re.IGNORECASE,
     )
     cleaned = re.sub(
-        r"^(?:(?:inside|outside|at|in|into|through|from|to|toward|towards|along|down|up)\s+)+",
+        r"^(?:(?:inside|outside|at|in|into|through|from|to|toward|towards|along|down|up|of)\s+)+",
         "",
         cleaned,
         flags=re.IGNORECASE,
@@ -487,6 +487,50 @@ def _detect_transition(text: str) -> str:
         if pattern.search(text or ""):
             return name
     return ""
+
+
+def _persistent_companion_labels(state: Mapping[str, Any]) -> list[str]:
+    labels: list[str] = []
+    toy_name_hint = _clean_text(state.get("toy_reference_name_hint", ""))
+    sidekick_description = _clean_text(state.get("sidekick_description", ""))
+    toy_context = bool(toy_name_hint)
+    if sidekick_description and any(
+        token in sidekick_description.lower()
+        for token in ("toy companion", "shared toy", "plush", "stuffed animal", "stuffie")
+    ):
+        toy_context = True
+
+    if toy_name_hint:
+        labels.append(toy_name_hint)
+
+    for entry in list(state.get("character_facts_list", []) or []):
+        if not isinstance(entry, Mapping):
+            continue
+        character_name = _clean_text(entry.get("character_name", ""))
+        fact = _clean_text(entry.get("fact", ""))
+        if not fact:
+            continue
+        if "shared toy" not in fact.lower() and "toy companion" not in fact.lower():
+            continue
+        toy_context = True
+        if character_name and character_name.lower() != "shared toy companion":
+            labels.append(character_name)
+
+    if toy_context and not labels:
+        labels.append("shared toy companion")
+
+    deduped: list[str] = []
+    seen: set[str] = set()
+    for label in labels:
+        cleaned = _canonical_label(label)
+        if not cleaned:
+            continue
+        lowered = cleaned.lower()
+        if lowered in seen:
+            continue
+        seen.add(lowered)
+        deduped.append(cleaned)
+    return deduped[:2]
 
 
 def _matching_entity_keys_for_fragment(
@@ -845,8 +889,8 @@ def should_render_new_scene_page(
     world = state["continuity_world_state"]
     current_location_label = _clean_text(world.get("current_location_label", ""))
     pending_location_label = _clean_text(world.get("pending_location_label", ""))
-    pending_transition = _clean_text(world.get("pending_transition", ""))
     child_text = _clean_text(state.get("last_child_utterance", "") or world.get("pending_request", ""))
+    pending_transition = _clean_text(world.get("pending_transition", "")) or _detect_transition(child_text)
     proposed_location_label = _clean_text(target_location_label)
     navigation_request = _is_navigation_page_turn_request(child_text)
     child_age_band = _clean_text(state.get("child_age_band", ""))
@@ -1226,8 +1270,8 @@ def validate_live_scene_request(
     current_location_label = _clean_text(world.get("current_location_label", ""))
     current_visual_summary = _clean_text(state.get("current_scene_visual_summary", ""))
     previous_visual_summary = _clean_text(state.get("previous_scene_visual_summary", ""))
-    pending_transition = _clean_text(world.get("pending_transition", ""))
     child_text = _clean_text(state.get("last_child_utterance", "") or world.get("pending_request", ""))
+    pending_transition = _clean_text(world.get("pending_transition", "")) or _detect_transition(child_text)
     navigation_request = _is_navigation_page_turn_request(child_text)
     same_place_reveal = _is_same_place_reveal_request(state, child_text)
     proposed_locations = _extract_location_candidates(cleaned)
@@ -1275,6 +1319,9 @@ def validate_live_scene_request(
     pending_character_keys = [str(item).strip() for item in list(world.get("pending_character_keys", []) or []) if str(item).strip()]
     carry_character_keys = pending_character_keys or active_character_keys
     carry_character_labels = _list_entity_labels(state, "characters", carry_character_keys[:3])
+    for label in _persistent_companion_labels(state):
+        if label and label not in carry_character_labels:
+            carry_character_labels.append(label)
     current_prop_keys = _meaningful_prop_keys(
         state,
         [str(item).strip() for item in list(world.get("active_prop_keys", []) or []) if str(item).strip()],
@@ -1350,6 +1397,15 @@ def validate_live_scene_request(
         prompt_notes.append(
             "Keep the architecture, materials, palette, and lighting family coherent with the current place. Do not jump to an unrelated forest, field, or outdoor biome unless the child explicitly asked to leave."
         )
+        prompt_notes.append(
+            "Keep the same time of day, weather, and overall lighting mood unless the child explicitly asked for a change."
+        )
+        if current_visual_summary:
+            prompt_notes.append(
+                "Carry forward the most recognizable architecture and lighting cues from the current scene: "
+                + current_visual_summary[:220]
+                + "."
+            )
 
     if (
         current_location_label
@@ -1477,6 +1533,9 @@ def record_continuity_scene(
         character_labels = _list_entity_labels(state, "characters", list(world.get("pending_character_keys", []) or []))
     if not character_labels and location_label and _locations_match(location_label, _clean_text(world.get("current_location_label", ""))):
         character_labels = _list_entity_labels(state, "characters", list(world.get("active_character_keys", []) or []))
+    for label in _persistent_companion_labels(state):
+        if label and label not in character_labels:
+            character_labels.append(label)
 
     prop_labels = _extract_prop_candidates(combined)
     if not prop_labels:

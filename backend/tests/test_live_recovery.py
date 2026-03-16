@@ -4,12 +4,14 @@ import asyncio
 import sys
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 
 _PROJECT_ROOT = Path(__file__).resolve().parents[2]
 if str(_PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(_PROJECT_ROOT))
 
+from agent import tools as agent_tools
 from backend import ws_router
 
 
@@ -707,6 +709,113 @@ class LiveRecoveryTests(unittest.TestCase):
         self.assertEqual(state["toy_reference_name_hint"], "")
         self.assertEqual(state["sidekick_description"], "a magical companion")
         self.assertEqual(list(state["character_facts_list"]), [])
+
+    def test_capture_child_story_continuity_keeps_established_toy_name_on_friend_request(self) -> None:
+        state: dict[str, object] = {}
+        ws_router._ensure_session_state_defaults(state)
+        ws_router._apply_shared_toy_story_state(
+            state,
+            summary_text="An orange cat-like hero toy with a red mane, blue suit, and silver sword.",
+            toy_name_hint="Lion-O",
+        )
+
+        ws_router._capture_child_story_continuity(
+            state,
+            "Can my friend, Lainey, come with us?",
+        )
+
+        self.assertEqual(state["toy_reference_name_hint"], "Lion-O")
+        self.assertEqual(
+            state["sidekick_description"],
+            "Lion-O, an orange cat-like hero toy with a red mane, blue suit, and silver sword.",
+        )
+        self.assertNotIn("Lainey", state["character_facts"])
+
+    def test_apply_shared_toy_story_state_prunes_conflicting_toy_aliases(self) -> None:
+        state: dict[str, object] = {}
+        ws_router._ensure_session_state_defaults(state)
+        state["character_facts_list"] = [
+            {"character_name": "Lino", "fact": "shared toy helper and recurring companion in the story"},
+            {"character_name": "shared toy companion", "fact": "the child's recurring toy companion"},
+        ]
+        state["character_facts"] = (
+            "- Lino: shared toy helper and recurring companion in the story\n"
+            "- shared toy companion: the child's recurring toy companion"
+        )
+        state["continuity_entity_registry"]["characters"] = {
+            "lino": {"label": "Lino"},
+            "lion_o": {"label": "Lion-O"},
+        }
+        state["continuity_world_state"]["active_character_keys"] = ["lino", "lion_o"]
+        state["continuity_world_state"]["pending_character_keys"] = ["lino"]
+        state["character_bible"] = {
+            "lino": {"label": "Lino"},
+            "lion_o": {"label": "Lion-O"},
+        }
+
+        ws_router._apply_shared_toy_story_state(
+            state,
+            summary_text="An orange cat-like hero toy with a red mane, blue suit, and silver sword.",
+            toy_name_hint="Lion-O",
+        )
+
+        fact_names = [entry["character_name"] for entry in state["character_facts_list"]]
+        self.assertNotIn("Lino", fact_names)
+        self.assertIn("Lion-O", fact_names)
+        self.assertNotIn("lino", state["continuity_world_state"]["active_character_keys"])
+        self.assertNotIn("lino", state["continuity_world_state"]["pending_character_keys"])
+        self.assertNotIn("lino", state["character_bible"])
+
+    def test_save_character_fact_ignores_low_confidence_friend_name_when_toy_is_established(self) -> None:
+        state = {
+            "camera_received": True,
+            "toy_reference_name_hint": "Lion-O",
+            "toy_reference_visual_summary": "An orange cat-like hero toy with a red mane, blue suit, and silver sword.",
+            "last_child_utterance": "Can my friend, Lainey, come with us?",
+            "character_facts_list": [],
+            "character_facts": "",
+        }
+
+        result = asyncio.run(
+            agent_tools.save_character_fact(
+                "Lino",
+                "child's friend",
+                SimpleNamespace(state=state),
+            )
+        )
+
+        self.assertEqual(result, "System: Ignored low-confidence character fact.")
+        self.assertEqual(state["character_facts_list"], [])
+        self.assertEqual(state["character_facts"], "")
+
+    def test_save_character_fact_allows_explicit_shared_toy_name(self) -> None:
+        state = {
+            "camera_received": True,
+            "toy_reference_name_hint": "",
+            "toy_reference_visual_summary": "An orange cat-like hero toy with a red mane, blue suit, and silver sword.",
+            "last_child_utterance": "His name is Lion-O from Thundercats.",
+            "character_facts_list": [],
+            "character_facts": "",
+        }
+
+        result = asyncio.run(
+            agent_tools.save_character_fact(
+                "Lion-O",
+                "shared toy helper and recurring companion in the story",
+                SimpleNamespace(state=state),
+            )
+        )
+
+        self.assertTrue(result.startswith("SAVE_FACT:Lion-O|"))
+        self.assertEqual(
+            state["character_facts_list"],
+            [
+                {
+                    "character_name": "Lion-O",
+                    "fact": "shared toy helper and recurring companion in the story",
+                }
+            ],
+        )
 
     def test_scene_render_helpers_ignore_skipped_render_state(self) -> None:
         session_id = "session-skipped-render"

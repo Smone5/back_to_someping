@@ -28,14 +28,17 @@ _GCS_FINAL_BUCKET = _ASSEMBLE_MODULE.GCS_FINAL_BUCKET
 _build_storybook_movie_readalong_segments = _ASSEMBLE_MODULE._build_storybook_movie_readalong_segments
 _build_storybook_theater_lighting_cues = _ASSEMBLE_MODULE._build_storybook_theater_lighting_cues
 _build_storybook_readalong_ass_text = _ASSEMBLE_MODULE._build_storybook_readalong_ass_text
+_build_video_assembly_render_report = _ASSEMBLE_MODULE._build_video_assembly_render_report
 _build_public_story_video_url = _ASSEMBLE_MODULE._build_public_story_video_url
 _build_narration_segments = _ASSEMBLE_MODULE._build_narration_segments
 _build_page_narration_source_texts = _ASSEMBLE_MODULE._build_page_narration_source_texts
 _build_storybook_padded_audio_track = _ASSEMBLE_MODULE._build_storybook_padded_audio_track
 _ensure_end_card_music_cue = _ASSEMBLE_MODULE._ensure_end_card_music_cue
 _elevenlabs_generate_music = _ASSEMBLE_MODULE._elevenlabs_generate_music
+_elevenlabs_generate_sfx = _ASSEMBLE_MODULE._elevenlabs_generate_sfx
 _ffmpeg_nonsilent_seconds = _ASSEMBLE_MODULE._ffmpeg_nonsilent_seconds
 _ffprobe_duration = _ASSEMBLE_MODULE._ffprobe_duration
+_generate_storybook_music_bytes = _ASSEMBLE_MODULE._generate_storybook_music_bytes
 _narration_mentions_unsupported_detail = _ASSEMBLE_MODULE._narration_mentions_unsupported_detail
 _resolve_storybook_word_starts_ms = _ASSEMBLE_MODULE._resolve_storybook_word_starts_ms
 _recommended_audio_boost_gain_db = _ASSEMBLE_MODULE._recommended_audio_boost_gain_db
@@ -153,14 +156,15 @@ class StorybookAssembleSourceTests(unittest.TestCase):
 
         with mock.patch.object(_ASSEMBLE_MODULE.httpx, "Client") as mock_client_cls:
             with mock.patch.object(_ASSEMBLE_MODULE, "_slow_storybook_tts_audio", return_value=b"voice-bytes"):
-                mock_client_cls.return_value.__enter__.return_value = client
-                provider, audio, timings = _synthesize_tts_with_provider(
-                    "Hi.",
-                    child_age=4,
-                    storybook_movie_pacing="read_with_me",
-                    voice_id="S9EY1FKT0mCZ06GOW6V4",
-                    allow_non_elevenlabs_fallback=False,
-                )
+                with mock.patch.dict(_ASSEMBLE_MODULE._ELEVENLABS_VOICE_FALLBACK_OVERRIDES, {}, clear=True):
+                    mock_client_cls.return_value.__enter__.return_value = client
+                    provider, audio, timings = _synthesize_tts_with_provider(
+                        "Hi.",
+                        child_age=4,
+                        storybook_movie_pacing="read_with_me",
+                        voice_id="S9EY1FKT0mCZ06GOW6V4",
+                        allow_non_elevenlabs_fallback=False,
+                    )
 
         self.assertEqual(provider, "elevenlabs")
         self.assertEqual(audio, b"voice-bytes")
@@ -172,6 +176,119 @@ class StorybookAssembleSourceTests(unittest.TestCase):
         self.assertIn(
             "/text-to-speech/EXAVITQu4vr4xnSDxMaL/with-timestamps",
             client.post.call_args_list[1].args[0],
+        )
+
+    @mock.patch.dict("os.environ", {"ELEVENLABS_API_KEY": "eleven-123", "ELEVENLABS_VOICE_ID": "EXAVITQu4vr4xnSDxMaL"}, clear=False)
+    def test_storybook_selected_voice_caches_fallback_after_first_missing_voice(self) -> None:
+        client = mock.Mock()
+        not_found_response = mock.Mock()
+        not_found_response.status_code = 404
+        not_found_response.headers = {"content-type": "application/json"}
+        not_found_response.json.return_value = {
+            "detail": {
+                "type": "not_found",
+                "code": "voice_not_found",
+                "message": "A voice with voice_id 'S9EY1FKT0mCZ06GOW6V4' was not found.",
+            }
+        }
+        not_found_response.text = '{"detail":{"code":"voice_not_found"}}'
+
+        success_response = mock.Mock()
+        success_response.status_code = 200
+        success_response.headers = {"content-type": "application/json"}
+        success_response.json.return_value = {
+            "audio_base64": "UklGRg==",
+            "alignment": {
+                "characters": list("Hi."),
+                "character_start_times_seconds": [0.0, 0.1, 0.2],
+                "character_end_times_seconds": [0.1, 0.2, 0.3],
+            },
+        }
+        client.post.side_effect = [not_found_response, success_response, success_response]
+
+        with mock.patch.object(_ASSEMBLE_MODULE.httpx, "Client") as mock_client_cls:
+            with mock.patch.object(_ASSEMBLE_MODULE, "_slow_storybook_tts_audio", return_value=b"voice-bytes"):
+                with mock.patch.dict(_ASSEMBLE_MODULE._ELEVENLABS_VOICE_FALLBACK_OVERRIDES, {}, clear=True):
+                    mock_client_cls.return_value.__enter__.return_value = client
+                    first_provider, first_audio, _ = _synthesize_tts_with_provider(
+                        "Hi.",
+                        child_age=4,
+                        storybook_movie_pacing="read_with_me",
+                        voice_id="S9EY1FKT0mCZ06GOW6V4",
+                        allow_non_elevenlabs_fallback=False,
+                    )
+                    second_provider, second_audio, _ = _synthesize_tts_with_provider(
+                        "Hi again.",
+                        child_age=4,
+                        storybook_movie_pacing="read_with_me",
+                        voice_id="S9EY1FKT0mCZ06GOW6V4",
+                        allow_non_elevenlabs_fallback=False,
+                    )
+
+        self.assertEqual(first_provider, "elevenlabs")
+        self.assertEqual(second_provider, "elevenlabs")
+        self.assertEqual(first_audio, b"voice-bytes")
+        self.assertEqual(second_audio, b"voice-bytes")
+        self.assertEqual(len(client.post.call_args_list), 3)
+        self.assertIn(
+            "/text-to-speech/S9EY1FKT0mCZ06GOW6V4/with-timestamps",
+            client.post.call_args_list[0].args[0],
+        )
+        self.assertIn(
+            "/text-to-speech/EXAVITQu4vr4xnSDxMaL/with-timestamps",
+            client.post.call_args_list[1].args[0],
+        )
+        self.assertIn(
+            "/text-to-speech/EXAVITQu4vr4xnSDxMaL/with-timestamps",
+            client.post.call_args_list[2].args[0],
+        )
+
+    def test_video_assembly_render_report_does_not_retry_release_gate_quality_failures(self) -> None:
+        report = _build_video_assembly_render_report(
+            "session-123",
+            data={
+                "assembly_status": "failed",
+                "assembly_error": (
+                    "The final storybook movie failed the release gate. "
+                    "duration=12.00s audio_expected=True audio_available=True "
+                    "final_has_audio_stream=True issues=shot variety 1 is below required 3"
+                ),
+                "final_video_url": "https://example.com/final.mp4",
+                "audio_expected": True,
+                "audio_available": True,
+                "final_has_audio_stream": True,
+                "theater_release_ready": False,
+                "expected_narration_count": 5,
+                "rendered_narration_count": 5,
+            },
+            runtime_overrides={},
+            error_text="The final storybook movie failed the release gate.",
+        )
+
+        self.assertFalse(report["ready_to_publish"])
+        self.assertFalse(report["retryable"])
+        self.assertIn(
+            "release_gate_failed",
+            {issue["code"] for issue in report["issues"]},
+        )
+
+    def test_video_assembly_render_report_retries_transient_worker_failures(self) -> None:
+        report = _build_video_assembly_render_report(
+            "session-123",
+            data={
+                "assembly_status": "failed",
+                "assembly_error": "429 RESOURCE_EXHAUSTED while rendering final movie.",
+                "theater_release_ready": False,
+            },
+            runtime_overrides={},
+            error_text="429 RESOURCE_EXHAUSTED while rendering final movie.",
+        )
+
+        self.assertFalse(report["ready_to_publish"])
+        self.assertTrue(report["retryable"])
+        self.assertIn(
+            "assembly_failed",
+            {issue["code"] for issue in report["issues"]},
         )
 
     def test_scene_sources_skip_placeholder_story_pages(self) -> None:
@@ -539,13 +656,134 @@ class StorybookAssembleSourceTests(unittest.TestCase):
         async_client.__aenter__.return_value = client
         async_client.__aexit__.return_value = False
 
-        with mock.patch.object(_ASSEMBLE_MODULE, "_ELEVENLABS_AUDIO_DISABLED_REASON", None):
-            with mock.patch.object(_ASSEMBLE_MODULE.httpx, "AsyncClient", return_value=async_client):
-                audio = asyncio.run(_elevenlabs_generate_music("gentle magical ending music", 4.0))
+        with mock.patch.object(_ASSEMBLE_MODULE, "_ELEVENLABS_MUSIC_DISABLED_REASON", None):
+            with mock.patch.object(_ASSEMBLE_MODULE, "_ELEVENLABS_AUDIO_CONCURRENCY_SEMAPHORE", None):
+                with mock.patch.object(_ASSEMBLE_MODULE, "_ELEVENLABS_AUDIO_CONCURRENCY_LIMIT", None):
+                    with mock.patch.object(_ASSEMBLE_MODULE.httpx, "AsyncClient", return_value=async_client):
+                        audio = asyncio.run(_elevenlabs_generate_music("gentle magical ending music", 4.0))
 
         self.assertEqual(audio, b"music-bytes")
         self.assertIn("/v1/music", client.post.call_args.args[0])
         self.assertNotIn("sound-generation", client.post.call_args.args[0])
+
+    @mock.patch.dict("os.environ", {"ELEVENLABS_API_KEY": "eleven-123"}, clear=False)
+    def test_music_rate_limit_does_not_disable_sfx(self) -> None:
+        music_client = mock.AsyncMock()
+        music_response = mock.Mock()
+        music_response.status_code = 429
+        music_response.headers = {"content-type": "application/json"}
+        music_response.text = '{"detail":{"code":"concurrent_limit_exceeded"}}'
+        music_client.post.return_value = music_response
+        music_async_client = mock.AsyncMock()
+        music_async_client.__aenter__.return_value = music_client
+        music_async_client.__aexit__.return_value = False
+
+        sfx_client = mock.AsyncMock()
+        sfx_response = mock.Mock()
+        sfx_response.status_code = 200
+        sfx_response.headers = {"content-type": "audio/mpeg"}
+        sfx_response.content = b"sfx-bytes"
+        sfx_client.post.return_value = sfx_response
+        sfx_async_client = mock.AsyncMock()
+        sfx_async_client.__aenter__.return_value = sfx_client
+        sfx_async_client.__aexit__.return_value = False
+
+        with mock.patch.object(_ASSEMBLE_MODULE, "_ELEVENLABS_MUSIC_DISABLED_REASON", None):
+            with mock.patch.object(_ASSEMBLE_MODULE, "_ELEVENLABS_SFX_DISABLED_REASON", None):
+                with mock.patch.object(_ASSEMBLE_MODULE, "_ELEVENLABS_AUDIO_CONCURRENCY_SEMAPHORE", None):
+                    with mock.patch.object(_ASSEMBLE_MODULE, "_ELEVENLABS_AUDIO_CONCURRENCY_LIMIT", None):
+                        with mock.patch.object(
+                            _ASSEMBLE_MODULE.httpx,
+                            "AsyncClient",
+                            side_effect=[music_async_client, sfx_async_client],
+                        ):
+                            music_audio = asyncio.run(_elevenlabs_generate_music("gentle magical ending music", 4.0))
+                            sfx_audio = asyncio.run(_elevenlabs_generate_sfx("sparkly pop", 1.4))
+
+        self.assertIsNone(music_audio)
+        self.assertEqual(sfx_audio, b"sfx-bytes")
+        self.assertIn("/v1/music", music_client.post.call_args.args[0])
+        self.assertIn("/v1/sound-generation", sfx_client.post.call_args.args[0])
+
+    @mock.patch.dict("os.environ", {"ELEVENLABS_API_KEY": "eleven-123"}, clear=False)
+    def test_elevenlabs_audio_requests_share_concurrency_limit(self) -> None:
+        in_flight = 0
+        max_in_flight = 0
+
+        class _FakeAsyncClient:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, exc_type, exc, tb):
+                return False
+
+            async def post(self, *_args, **_kwargs):
+                nonlocal in_flight, max_in_flight
+                in_flight += 1
+                max_in_flight = max(max_in_flight, in_flight)
+                await asyncio.sleep(0.01)
+                in_flight -= 1
+                response = mock.Mock()
+                response.status_code = 200
+                response.headers = {"content-type": "audio/mpeg"}
+                response.content = b"audio"
+                return response
+
+        async def _run_calls() -> list[bytes | None]:
+            return await asyncio.gather(
+                _elevenlabs_generate_music("gentle magical ending music", 4.0),
+                _elevenlabs_generate_sfx("sparkly pop", 1.4),
+                _elevenlabs_generate_music("soft ending music", 4.0),
+            )
+
+        with mock.patch.dict("os.environ", {"STORYBOOK_ELEVENLABS_AUDIO_CONCURRENCY": "2"}, clear=False):
+            with mock.patch.object(_ASSEMBLE_MODULE, "_ELEVENLABS_MUSIC_DISABLED_REASON", None):
+                with mock.patch.object(_ASSEMBLE_MODULE, "_ELEVENLABS_SFX_DISABLED_REASON", None):
+                    with mock.patch.object(_ASSEMBLE_MODULE, "_ELEVENLABS_AUDIO_CONCURRENCY_SEMAPHORE", None):
+                        with mock.patch.object(_ASSEMBLE_MODULE, "_ELEVENLABS_AUDIO_CONCURRENCY_LIMIT", None):
+                            with mock.patch.object(_ASSEMBLE_MODULE.httpx, "AsyncClient", return_value=_FakeAsyncClient()):
+                                results = asyncio.run(_run_calls())
+
+        self.assertEqual(results, [b"audio", b"audio", b"audio"])
+        self.assertLessEqual(max_in_flight, 2)
+
+    def test_storybook_music_auto_skips_lyria_when_not_enabled(self) -> None:
+        async def _run() -> tuple[bytes, str] | None:
+            with mock.patch.object(_ASSEMBLE_MODULE, "_elevenlabs_generate_music", return_value=None):
+                with mock.patch.object(_ASSEMBLE_MODULE, "_lyria_generate_music", side_effect=AssertionError("lyria should not run")):
+                    return await _generate_storybook_music_bytes("gentle magical ending music", 4.0, seed=7)
+
+        with mock.patch.dict("os.environ", {"STORYBOOK_MUSIC_PROVIDER": "auto"}, clear=False):
+            result = asyncio.run(_run())
+
+        self.assertIsNone(result)
+
+    def test_storybook_music_auto_uses_lyria_when_explicitly_enabled(self) -> None:
+        async def _run() -> tuple[bytes, str] | None:
+            with mock.patch.object(_ASSEMBLE_MODULE, "_elevenlabs_generate_music", return_value=None):
+                with mock.patch.object(_ASSEMBLE_MODULE, "_lyria_generate_music", return_value=(b"lyria-audio", ".wav")) as mock_lyria:
+                    result = await _generate_storybook_music_bytes("gentle magical ending music", 4.0, seed=7)
+                    self.assertEqual(mock_lyria.call_count, 1)
+                    return result
+
+        with mock.patch.dict(
+            "os.environ",
+            {"STORYBOOK_MUSIC_PROVIDER": "auto", "ENABLE_STORYBOOK_LYRIA_MUSIC": "1"},
+            clear=False,
+        ):
+            result = asyncio.run(_run())
+
+        self.assertEqual(result, (b"lyria-audio", ".wav"))
+
+    def test_explicit_lyria_provider_respects_enable_flag(self) -> None:
+        async def _run() -> tuple[bytes, str] | None:
+            with mock.patch.object(_ASSEMBLE_MODULE, "_lyria_generate_music", side_effect=AssertionError("lyria should stay disabled")):
+                return await _generate_storybook_music_bytes("gentle magical ending music", 4.0, seed=7)
+
+        with mock.patch.dict("os.environ", {"STORYBOOK_MUSIC_PROVIDER": "lyria"}, clear=False):
+            result = asyncio.run(_run())
+
+        self.assertIsNone(result)
 
     def test_theater_lighting_cues_follow_scene_timeline_and_live_scene_colors(self) -> None:
         cues = _build_storybook_theater_lighting_cues(

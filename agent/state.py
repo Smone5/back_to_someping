@@ -131,6 +131,7 @@ class StorySession(BaseModel):
     story_phase: str = Field(default="opening")
     assembly_kind: str = Field(default="initial")
     scene_render_pending: bool = Field(default=False)
+    pending_scene_page_number: int = Field(default=0)
     theater_release_ready: bool = Field(default=False)
     child_delight_anchors: list[str] = Field(default_factory=list)
     child_delight_anchors_text: str = Field(default="None saved yet.")

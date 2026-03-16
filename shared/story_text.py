@@ -31,7 +31,13 @@ _META_STORY_PREFIX_RE = re.compile(
     r"here(?:'s| is)\s+"
     r"(?:(?:a|an|the)\s+)?"
     r"(?:(?:[\w']+(?:-[\w']+)?\s+){0,6})?"
-    r"(?:illustration|image|picture|page|caption)\s*(?::|-)\s*",
+    r"(?:illustration|image|picture|page|caption)(?:\s+of)?\s*(?::|-)\s*",
+    flags=re.IGNORECASE,
+)
+_BARE_META_STORY_PREFIX_RE = re.compile(
+    r"^(?:(?:a|an|the)\s+)?"
+    r"(?:(?:[\w']+(?:-[\w']+)?\s+){0,6})?"
+    r"(?:illustration|image|picture|page|caption)(?:\s+of)?\s*(?::|-)\s*",
     flags=re.IGNORECASE,
 )
 _META_REQUEST_PREFIX_RE = re.compile(
@@ -45,6 +51,25 @@ _META_REQUEST_PREFIX_RE = re.compile(
 _META_WHAT_YOU_PREFIX_RE = re.compile(
     r"^(?:(?:sure|okay|ok|great|wonderful)[!,. ]+\s*)?"
     r"here(?:'s| is)\s+what\s+you\s+(?:described|imagined|asked(?:\s+for)?|requested|wanted)\s*(?::|-)\s*",
+    flags=re.IGNORECASE,
+)
+_EMBEDDED_META_STORY_SUFFIX_RE = re.compile(
+    r"(?:\s+|[.?!]\s+)"
+    r"(?:"
+    r"story\s+continuity\s+target\s*:.*"
+    r"|transition\s+type\s*:.*"
+    r"|active\s+recurring\s+cast\s*:.*"
+    r"|carry\s+over\s+these\s+props\s+if\s+they\s+belong\s+in\s+the\s+connected\s+space\s*:.*"
+    r"|keep\s+these\s+same\s+characters\s+in\s+view\s*:.*"
+    r"|keep\s+these\s+recurring\s+characters\s+visible\s+and\s+consistent\s*:.*"
+    r"|do\s+not\s+invent\s+new\s+named\s+characters.*"
+    r"|do\s+not\s+replace\s+the\s+current\s+helper.*"
+    r"|stay\s+with\s+the\s+already\s+established\s+story\s+cast.*"
+    r"|carry\s+the\s+same\s+established\s+cast\s+forward.*"
+    r"|make\s+the\s+destination\s+unmistakable.*"
+    r"|show\s+unmistakable\b.*"
+    r"|tone\s*:.*"
+    r")$",
     flags=re.IGNORECASE,
 )
 _CONVERSATIONAL_STORYBEAT_RE = re.compile(
@@ -194,6 +219,16 @@ _TRAILING_DESCRIPTOR_WORDS = {
     "tiny",
     "warm",
 }
+_TRAILING_FRAGMENT_WORDS = {
+    "made",
+    "filled",
+    "covered",
+    "decorated",
+    "lined",
+    "stacked",
+    "wrapped",
+    "topped",
+}
 _PUNCT_TRANSLATION = str.maketrans(
     {
         "\u2018": "'",
@@ -282,6 +317,11 @@ def _has_placeholder_story_ending(sentence: str) -> bool:
     return len(tokens) >= 5 or tokens[0] in _SPATIAL_START_WORDS
 
 
+def _ends_with_dangling_story_fragment(sentence: str) -> bool:
+    tokens = _normalized_story_tokens(sentence)
+    return bool(tokens) and tokens[-1] in _TRAILING_FRAGMENT_WORDS
+
+
 def _has_broken_story_linking(sentence: str) -> bool:
     return bool(
         _BROKEN_LINKING_PHRASE_RE.search(sentence)
@@ -311,6 +351,8 @@ def _score_normalized_story_sentence(sentence: str) -> int:
         score -= 6
     if _ends_with_weak_story_word(sentence):
         score -= 5
+    if _ends_with_dangling_story_fragment(sentence):
+        score -= 6
     if _has_placeholder_story_ending(sentence):
         score -= 4
     if _has_broken_story_linking(sentence):
@@ -328,6 +370,8 @@ def _finalize_storybeat_candidate(candidate: str, *, max_chars: int) -> str:
     if not candidate:
         return ""
     candidate = _META_STORY_PREFIX_RE.sub("", candidate).strip(" \"'")
+    candidate = _BARE_META_STORY_PREFIX_RE.sub("", candidate).strip(" \"'")
+    candidate = _EMBEDDED_META_STORY_SUFFIX_RE.sub("", candidate).strip(" \"'")
     if not candidate:
         return ""
     candidate = _LEADING_BRANCH_LABEL_RE.sub("", candidate).strip(" ,;:-")
@@ -357,8 +401,10 @@ def clean_story_text(text: Any) -> str:
     normalized = _HTML_TAG_RE.sub(" ", normalized)
     normalized = _LABEL_RE.sub("", normalized.strip())
     normalized = _META_STORY_PREFIX_RE.sub("", normalized)
+    normalized = _BARE_META_STORY_PREFIX_RE.sub("", normalized)
     normalized = _META_REQUEST_PREFIX_RE.sub("", normalized)
     normalized = _META_WHAT_YOU_PREFIX_RE.sub("", normalized)
+    normalized = _EMBEDDED_META_STORY_SUFFIX_RE.sub("", normalized)
     normalized = _DECORATIVE_RE.sub(" ", normalized)
     normalized = _CHOICE_PROMPT_RE.sub("", normalized)
     normalized = re.sub(r"\s+", " ", normalized)
@@ -405,6 +451,7 @@ def story_sentence_needs_revision(text: Any) -> bool:
     return (
         _has_adjacent_repeated_story_word(sentence)
         or _ends_with_weak_story_word(sentence)
+        or _ends_with_dangling_story_fragment(sentence)
         or _has_placeholder_story_ending(sentence)
         or _has_broken_story_linking(sentence)
     )
@@ -423,6 +470,8 @@ def truncate_story_sentence(text: Any, *, max_words: int) -> str:
         and clipped[-1].rstrip(".,!?;:").lower() in _TRAILING_DESCRIPTOR_WORDS
         and clipped[-2].rstrip(".,!?;:").lower() in (_TRAILING_WEAK_WORDS | {"a", "an", "the"})
     ):
+        clipped.pop()
+    while len(clipped) > 4 and clipped[-1].rstrip(".,!?;:").lower() in _TRAILING_FRAGMENT_WORDS:
         clipped.pop()
     while len(clipped) > 4 and clipped[-1].rstrip(".,!?;:").lower() in _TRAILING_WEAK_WORDS:
         clipped.pop()

@@ -90,7 +90,11 @@ from shared.story_text import (
     truncate_story_sentence as shared_truncate_story_sentence,
 )
 from shared.storybook_lighting import heuristic_storybook_lighting_command
-from shared.storybook_pages import count_rendered_story_pages, story_pages_from_state_data
+from shared.storybook_pages import (
+    count_rendered_story_pages,
+    resolve_story_page_number,
+    story_pages_from_state_data,
+)
 from shared.storybook_studio_workflow import (
     build_storybook_studio_plan_from_workflow_state,
     build_storybook_studio_summary,
@@ -267,6 +271,7 @@ class VisualArgs(BaseModel):
     )
     illustration_style: str | None = Field(default=None, description="The chosen illustration style for this session.")
     request_id: str | None = Field(default=None, description="Stable id joining placeholder and final image for one scene request.")
+    scene_number: int | None = Field(default=None, description="Stable page number assigned when this scene request is created.")
     delivery_format: str = Field(default="jpeg", description="Client transport format for the first still.")
     delivery_quality: int = Field(default=72, description="Client transport encoding quality.")
     delivery_max_side: int | None = Field(default=None, description="Optional max image side for the first still delivered to the browser.")
@@ -338,6 +343,26 @@ class CharacterFactArgs(BaseModel):
     fact: str
 
 
+_CHARACTER_NAME_INTRO_PATTERNS = (
+    re.compile(
+        r"\b(?:his|her|their)\s+name\s+is\s+([A-Za-z0-9][A-Za-z0-9' -]{0,40}?)(?=[,.!?]|$|\s+(?:and|with|who|that|because|but)\b)",
+        flags=re.IGNORECASE,
+    ),
+    re.compile(
+        r"\b(?:this|it|he|she|they)\s+(?:is|are|'s)\s+([A-Za-z0-9][A-Za-z0-9' -]{0,40}?)(?=[,.!?]|$|\s+(?:and|with|who|that|because|but)\b)",
+        flags=re.IGNORECASE,
+    ),
+    re.compile(
+        r"\b(?:named|called)\s+([A-Za-z0-9][A-Za-z0-9' -]{0,40}?)(?=[,.!?]|$|\s+(?:and|with|who|that|because|but)\b)",
+        flags=re.IGNORECASE,
+    ),
+)
+_LOW_CONFIDENCE_CHARACTER_FACT_RE = re.compile(
+    r"\bchild'?s friend\b|\bfriend\b",
+    flags=re.IGNORECASE,
+)
+
+
 class ChildNameArgs(BaseModel):
     model_config = ConfigDict(extra="ignore")
     name: str = Field(..., description="Child's preferred first name")
@@ -364,11 +389,83 @@ def _extract_recent_child_name_candidate(text: Any) -> str | None:
         return None
 
     match = _NAME_TOOL_PHRASE_RE.search(cleaned)
-    if match:
-        candidate = match.group(1).strip(" .,!?:;").title()
-        if candidate.lower() in _NAME_TOOL_REJECT_WORDS:
-            return None
-        return candidate
+    if not match:
+        return None
+    candidate = match.group(1).strip(" .,!?:;").title()
+    if candidate.lower() in _NAME_TOOL_REJECT_WORDS:
+        return None
+    return candidate
+
+
+def _clean_character_name_hint(candidate: Any) -> str:
+    cleaned = re.sub(r"\s+", " ", str(candidate or "")).strip(" \"'.,!?")
+    cleaned = re.sub(r"^(?:my|the|a|an)\s+", "", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"\s+from\s+[A-Za-z0-9][A-Za-z0-9' -]{1,40}$", "", cleaned, flags=re.IGNORECASE)
+    if not cleaned:
+        return ""
+    if len(cleaned) > 48 or len(cleaned.split()) > 4:
+        return ""
+    return cleaned
+
+
+def _extract_explicit_character_name_hint(text: Any) -> str:
+    compact = re.sub(r"\s+", " ", str(text or "")).strip()
+    if not compact:
+        return ""
+    for pattern in _CHARACTER_NAME_INTRO_PATTERNS:
+        match = pattern.search(compact)
+        if not match:
+            continue
+        candidate = _clean_character_name_hint(match.group(1))
+        if candidate:
+            return candidate
+    return ""
+
+
+def _should_ignore_low_confidence_character_fact(
+    character_name: str,
+    fact: str,
+    state: Mapping[str, Any],
+) -> bool:
+    normalized_name = _clean_character_name_hint(character_name)
+    normalized_fact = _normalize_text_fragment(fact, limit=220).lower()
+    if not normalized_name or not normalized_fact:
+        return False
+
+    established_toy_name = _clean_character_name_hint(state.get("toy_reference_name_hint", ""))
+    visual_toy_anchor = bool(
+        str(state.get("toy_reference_visual_summary", "") or "").strip()
+        or str(state.get("toy_reference_thumbnail_b64", "") or "").strip()
+        or bool(state.get("camera_received", False))
+    )
+    if not visual_toy_anchor:
+        return False
+
+    recent_utterance = (
+        str(state.get("partial_child_utterance", "") or "").strip()
+        or str(state.get("last_child_utterance", "") or "").strip()
+    )
+    explicit_name = _clean_character_name_hint(_extract_explicit_character_name_hint(recent_utterance))
+
+    if _LOW_CONFIDENCE_CHARACTER_FACT_RE.search(normalized_fact) and not explicit_name:
+        return True
+
+    if (
+        established_toy_name
+        and normalized_name.lower() != established_toy_name.lower()
+        and not explicit_name
+    ):
+        return True
+
+    if (
+        established_toy_name
+        and normalized_name.lower() != established_toy_name.lower()
+        and explicit_name
+        and explicit_name.lower() != normalized_name.lower()
+    ):
+        return True
+
+    return False
 
     token_match = re.fullmatch(r"[A-Za-z][A-Za-z'\-]{1,23}", cleaned)
     if token_match:
@@ -617,6 +714,17 @@ def _resolve_story_page_for_lighting(tool_state: dict[str, Any]) -> dict[str, An
         for page in reversed(pages):
             if str(page.get("request_id", "") or "").strip() == active_request_id:
                 return dict(page)
+        try:
+            pending_scene_page_number = int(tool_state.get("pending_scene_page_number") or 0)
+        except Exception:
+            pending_scene_page_number = 0
+        if pending_scene_page_number > 0:
+            return {
+                "scene_number": pending_scene_page_number,
+                "request_id": active_request_id,
+                "scene_description": str(tool_state.get("pending_scene_description", "") or "").strip(),
+                "storybeat_text": str(tool_state.get("current_scene_storybeat_text", "") or "").strip(),
+            }
     if pages:
         return dict(pages[-1])
     current_scene_description = str(tool_state.get("current_scene_description", "") or "").strip()
@@ -628,6 +736,28 @@ def _resolve_story_page_for_lighting(tool_state: dict[str, Any]) -> dict[str, An
         "scene_description": current_scene_description,
         "storybeat_text": current_storybeat_text,
     }
+
+
+def _toy_identity_priority_prompt(name_hint: str, summary_text: str) -> str:
+    normalized_name = _normalize_text_fragment(name_hint, limit=80)
+    normalized_summary = _normalize_text_fragment(summary_text, limit=220)
+    if not normalized_name and not normalized_summary:
+        return ""
+    if normalized_name:
+        identity_name = normalized_name
+        return (
+            f"{identity_name} must match the shared toy or image first. Preserve the same face, silhouette, colors, "
+            "body proportions, outfit, accessories, material cues, and any other distinctive details that are actually "
+            "visible in the reference. Use the name only as a label, not as a reason to invent off-reference brand or "
+            "franchise details. Avoid drifting into a generic toy, plush, action figure, doll, or animal archetype."
+        )
+    if normalized_summary:
+        return (
+            "The shared toy or image must match the reference first. Preserve the same face, silhouette, colors, "
+            "body proportions, outfit, accessories, material cues, and other distinctive visible details, and avoid "
+            "drifting into a generic toy or animal archetype."
+        )
+    return ""
 
 
 def _promote_pending_scene_request_to_current(
@@ -647,6 +777,7 @@ def _promote_pending_scene_request_to_current(
     )
     if not is_current_scene_request:
         return False
+    description, storybeat_text = _normalize_public_scene_texts(description, storybeat_text)
 
     if description:
         state["current_scene_description"] = description
@@ -669,6 +800,7 @@ def _promote_pending_scene_request_to_current(
 
     state["pending_scene_description"] = ""
     state["pending_scene_base_description"] = ""
+    state["pending_scene_page_number"] = 0
     return True
 
 
@@ -903,6 +1035,22 @@ def _copy_state_mapping(raw_state: Any) -> dict[str, Any]:
 def _normalize_text_fragment(value: Any, *, limit: int = 220) -> str:
     cleaned = re.sub(r"\s+", " ", str(value or "")).strip()
     return cleaned[:limit]
+
+
+def _normalize_public_scene_texts(
+    description: Any,
+    storybeat_text: Any = "",
+) -> tuple[str, str]:
+    cleaned_description = shared_clean_story_text(description)
+    if cleaned_description:
+        cleaned_description = re.sub(r"\s+", " ", cleaned_description).strip()[:500]
+    cleaned_storybeat = shared_normalize_storybeat_text(
+        storybeat_text or cleaned_description,
+        max_chars=220,
+    )
+    if not cleaned_description and cleaned_storybeat:
+        cleaned_description = shared_clean_story_text(cleaned_storybeat)
+    return cleaned_description, cleaned_storybeat
 
 
 def _stable_visual_key(label: str) -> str:
@@ -2158,6 +2306,12 @@ def _build_visual_continuity_plan(
         forbidden_drift.append(
             f"Do not teleport away from {current_location}; keep the next scene directly connected to that space."
         )
+        forbidden_drift.append(
+            "Do not flip day to night, night to day, or change the overall lighting mood unless the child explicitly asks."
+        )
+        forbidden_drift.append(
+            "Keep the next room or hall recognizably part of the same building with matching architecture, materials, palette, and cozy visual style."
+        )
     for entry in _character_bible_entries_for_keys(state, active_character_keys):
         character_key = _normalize_text_fragment(entry.get("character_key", ""), limit=120)
         label = _normalize_text_fragment(entry.get("label", ""), limit=120)
@@ -2394,15 +2548,21 @@ def _persist_uploaded_scene_asset(
     thumbnail_mime: str | None,
     focused_character_references: list[dict[str, Any]] | None = None,
     request_id: str | None = None,
+    scene_number: int | None = None,
     preview_image_url: str | None = None,
 ) -> None:
     if not session_id:
         return
+    description, storybeat_text = _normalize_public_scene_texts(description, storybeat_text)
 
     state = load_storybook_resume_state(session_id)
     ensure_story_continuity_state(state)
     _ensure_visual_memory_state(state)
     normalized_request_id = str(request_id or "").strip()
+    try:
+        normalized_scene_number = int(scene_number or 0)
+    except Exception:
+        normalized_scene_number = 0
     if not _should_persist_uploaded_scene_asset(
         session_id=session_id,
         superseded_render=False,
@@ -2426,7 +2586,7 @@ def _persist_uploaded_scene_asset(
         target_index = len(pages)
         pages.append(
             {
-                "scene_number": target_index + 1,
+                "scene_number": normalized_scene_number or (target_index + 1),
                 "request_id": normalized_request_id,
                 "scene_description": "",
                 "storybeat_text": "",
@@ -2440,7 +2600,7 @@ def _persist_uploaded_scene_asset(
         target_index = len(pages)
         pages.append(
             {
-                "scene_number": target_index + 1,
+                "scene_number": normalized_scene_number or (target_index + 1),
                 "request_id": normalized_request_id,
                 "scene_description": "",
                 "storybeat_text": "",
@@ -2450,6 +2610,11 @@ def _persist_uploaded_scene_asset(
         )
 
     target_page = dict(pages[target_index])
+    resolved_scene_number = normalized_scene_number or max(
+        1,
+        int(target_page.get("scene_number", target_index + 1) or (target_index + 1)),
+    )
+    target_page["scene_number"] = resolved_scene_number
     if normalized_request_id:
         target_page["request_id"] = normalized_request_id
     if description:
@@ -2472,12 +2637,11 @@ def _persist_uploaded_scene_asset(
                 branch_target_index = idx
                 break
     if branch_target_index < 0 and normalized_request_id:
-        scene_number = max(1, int(target_page.get("scene_number", target_index + 1) or (target_index + 1)))
         branch_points.append(
             {
-                "scene_number": scene_number,
+                "scene_number": resolved_scene_number,
                 "request_id": normalized_request_id,
-                "label": storybeat_text or description or f"Scene {scene_number}",
+                "label": storybeat_text or description or f"Scene {resolved_scene_number}",
                 "scene_description": description,
                 "storybeat_text": storybeat_text,
                 "image_url": cloud_still_url or preview_image_url or "",
@@ -2489,6 +2653,7 @@ def _persist_uploaded_scene_asset(
         branch_target_index = min(target_index, len(branch_points) - 1)
     if branch_target_index >= 0:
         branch_point = dict(branch_points[branch_target_index])
+        branch_point["scene_number"] = resolved_scene_number
         if description:
             branch_point["scene_description"] = description
         if storybeat_text:
@@ -2546,7 +2711,7 @@ def _persist_uploaded_scene_asset(
         storybeat_text=storybeat_text,
         visual_summary=scene_visual_summary,
         request_id=normalized_request_id,
-        scene_number=max(1, int(target_page.get("scene_number", target_index + 1) or (target_index + 1))),
+        scene_number=resolved_scene_number,
     )
     _remember_character_visual_references(
         updated_state,
@@ -2557,7 +2722,7 @@ def _persist_uploaded_scene_asset(
         thumbnail_b64=thumbnail_b64 or "",
         thumbnail_mime=thumbnail_mime or "image/jpeg",
         focused_reference_images=focused_character_references,
-        scene_number=max(1, int(target_page.get("scene_number", target_index + 1) or (target_index + 1))),
+        scene_number=resolved_scene_number,
     )
 
     cache_storybook_state(session_id, updated_state)
@@ -2943,7 +3108,11 @@ def _generate_scene_still(
         toy_name_hint = _normalize_text_fragment(state.get("toy_reference_name_hint", ""), limit=80) if state else ""
         prompt += (
             "\nToy reference priority: the shared toy is a recurring helper or sidekick in the story. "
-            "Keep it visibly present when the story beat allows, and match the toy's shape, colors, and overall identity from the reference image."
+            "Keep it visibly present when the story beat allows, and match the toy's shape, colors, proportions, face, mane, and overall identity from the reference image."
+        )
+        prompt += (
+            "\nMake the toy easy to notice in the frame. Place it beside the child or in the foreground when possible, "
+            "and do not hide it as a tiny background detail or crop it out."
         )
         if toy_name_hint:
             prompt += f"\nShared toy name: {toy_name_hint}."
@@ -2951,10 +3120,12 @@ def _generate_scene_still(
             prompt += f"\nShared toy details: {toy_summary}."
         prompt += (
             "\nUse the toy as a recurring companion, not just a loose color reference, and do not replace the whole setting with the toy photo. "
-            "Do not turn the toy into a generic dragon, dinosaur, unicorn, or some other new creature unless the child explicitly changes it."
+            "The toy reference outranks later generated scene thumbnails if they conflict about the toy's identity. "
+            "Do not turn the toy into a generic dragon, dinosaur, unicorn, mascot, or some other new creature unless the child explicitly changes it."
         )
         prompt += (
-            "\nDo not identity-swap or body-swap the toy across pages. Preserve the same physical identity shown by the toy reference and shared toy details."
+            "\nDo not identity-swap or body-swap the toy across pages. Preserve the same physical identity shown by the toy reference and shared toy details. "
+            "Keep the toy feeling strong, brave, and heroic when the reference supports that, and avoid babyish or generic chibi redesigns unless the toy reference itself looks that way."
         )
     if isinstance(continuity_plan, Mapping):
         transition_type = _normalize_text_fragment(continuity_plan.get("transition_type", ""), limit=80).replace("_", " ")
@@ -3014,6 +3185,12 @@ def _generate_scene_still(
                 character_notes.append(
                     f"{label} must stay recognizable as the same recurring character. "
                     f"Never change {label} into a different animal, toy type, or person."
+                )
+            if has_toy_ref and role == "sidekick":
+                character_notes.append(
+                    f"For {label}, the shared toy photo is the highest-priority identity anchor. "
+                    "Match that reference first, preserve the visible face, silhouette, colors, outfit, accessories, "
+                    "and distinctive details, and do not genericize it into a different toy or animal type."
                 )
             if latest_visual_summary:
                 character_notes.append(f"Match {label}'s recent look: {latest_visual_summary}.")
@@ -3344,6 +3521,7 @@ async def generate_scene_visuals(
         continuity_mode = _resolve_continuity_mode()
         reference_images: list[dict[str, str]] = []
         using_toy_reference = False
+        toy_context_active = False
 
         def _append_reference_image(b64: str, mime: str, role: str) -> None:
             cleaned_b64 = str(b64 or "").strip()
@@ -3361,11 +3539,32 @@ async def generate_scene_visuals(
             )
 
         if state:
+            toy_summary_hint = str(state.get("toy_reference_visual_summary", "") or "").strip()
+            toy_name_hint = str(state.get("toy_reference_name_hint", "") or "").strip()
+            sidekick_description = str(state.get("sidekick_description", "") or "").strip().lower()
+            toy_context_active = bool(
+                toy_summary_hint
+                or toy_name_hint
+                or str(state.get("toy_reference_thumbnail_b64", "") or "").strip()
+                or bool(state.get("camera_received", False))
+                or (
+                    sidekick_description
+                    and any(
+                        token in sidekick_description
+                        for token in ("toy companion", "shared toy", "sidekick", "plush", "stuffed animal", "stuffie")
+                    )
+                )
+            )
             if continuity_mode == "thumbnail":
                 canonical_b64 = str(state.get("canonical_scene_thumbnail_b64", "") or "").strip()
                 canonical_mime = str(state.get("canonical_scene_thumbnail_mime", "") or "").strip()
                 if canonical_b64:
                     _append_reference_image(canonical_b64, canonical_mime, "canonical_setting")
+                toy_b64 = str(state.get("toy_reference_thumbnail_b64", "") or "").strip()
+                toy_mime = str(state.get("toy_reference_thumbnail_mime", "") or "").strip()
+                if toy_b64:
+                    _append_reference_image(toy_b64, toy_mime, "toy")
+                    using_toy_reference = True
                 recent_scene_refs = _recent_scene_reference_entries(state)
                 for idx, ref in enumerate(recent_scene_refs, start=1):
                     ref_b64 = str(ref.get("thumbnail_b64", "") or "").strip()
@@ -3389,27 +3588,48 @@ async def generate_scene_visuals(
                         ref.get("mime", ""),
                         ref.get("role", "character_latest"),
                     )
-            toy_b64 = str(state.get("toy_reference_thumbnail_b64", "") or "").strip()
-            toy_mime = str(state.get("toy_reference_thumbnail_mime", "") or "").strip()
-            if toy_b64:
-                _append_reference_image(toy_b64, toy_mime, "toy")
-                using_toy_reference = True
 
-        if using_toy_reference:
+        request_id = uuid.uuid4().hex
+        replacement_mode = bool(
+            pending_replacement_text
+            and pending_replacement_phase
+            in {"awaiting_ack", "awaiting_render"}
+        )
+        scene_number = resolve_story_page_number(
+            state,
+            request_id=request_id,
+            replacement_mode=replacement_mode,
+        )
+
+        if toy_context_active:
             toy_name_hint = _normalize_text_fragment(state.get("toy_reference_name_hint", ""), limit=80)
+            toy_summary = _normalize_text_fragment(state.get("toy_reference_visual_summary", ""), limit=220)
+            toy_identity_prompt = _toy_identity_priority_prompt(toy_name_hint, toy_summary)
             if toy_name_hint:
                 visual_description = (
-                    f"{visual_description} The sidekick should still be {toy_name_hint}, "
-                    "match the toy reference image, keep the same identity/colors/silhouette, "
-                    "and feel like a soft, kid-friendly toy (no brand logos)."
+                    f"{visual_description} Unless the child explicitly asked the toy to stay behind, "
+                    f"keep {toy_name_hint} visibly present in this scene as the child's recurring toy sidekick. "
+                    "Place the toy beside the child or in the foreground so it is clearly visible and easy to notice, "
+                    "not tiny, cropped away, or hidden in the background. "
+                    "Treat the toy reference photo as the top-priority identity anchor for that character. "
+                    "Match the toy's real face, colors, silhouette, body proportions, outfit, accessories, material cues, "
+                    "and distinguishing details that are actually visible in the shared reference, keep the same overall "
+                    "vibe or personality if it is evident, and do not simplify it into a generic toy or animal. "
+                    "It should still feel like a kid-friendly toy and should not show brand logos."
                 )
             else:
                 visual_description = (
-                    f"{visual_description} The sidekick should match the toy reference image "
-                    "and feel like a soft, kid-friendly toy (no brand logos)."
+                    f"{visual_description} Unless the child explicitly asked the toy to stay behind, "
+                    "keep the shared toy visibly present in this scene as the recurring sidekick. "
+                    "Place the toy beside the child or in the foreground so it is clearly visible and easy to notice, "
+                    "not tiny, cropped away, or hidden in the background. "
+                    "Treat the toy reference photo as the top-priority identity anchor, "
+                    "match the same face, silhouette, colors, body proportions, outfit, accessories, material cues, "
+                    "and other distinctive visible details, and avoid redesigning it into a generic toy or animal. "
+                    "It should still feel like a kid-friendly toy and should not show brand logos."
                 )
-
-        request_id = uuid.uuid4().hex
+            if toy_identity_prompt:
+                visual_description = f"{visual_description} {toy_identity_prompt}"
 
         def _publish_placeholder(payload_description: str) -> None:
             if not session_id:
@@ -3424,6 +3644,7 @@ async def generate_scene_visuals(
                         "media_type": "image",
                         "is_placeholder": True,
                         "request_id": request_id,
+                        "scene_number": scene_number,
                     },
                 },
             )
@@ -3453,6 +3674,7 @@ async def generate_scene_visuals(
                 reference_images=reference_images,
                 illustration_style=session_style,
                 request_id=request_id,
+                scene_number=scene_number,
                 delivery_format=delivery_format,
                 delivery_quality=delivery_quality,
                 delivery_max_side=delivery_max_side,
@@ -3499,6 +3721,7 @@ async def generate_scene_visuals(
             )
             tool_context.state["pending_scene_description"] = visual_description
             tool_context.state["pending_scene_base_description"] = base_description
+            tool_context.state["pending_scene_page_number"] = scene_number
             tool_context.state["current_visual_continuity_plan"] = dict(continuity_plan or {})
             tool_context.state["character_bible"] = dict(state.get("character_bible", {}) or {})
             tool_context.state["active_scene_request_id"] = request_id
@@ -3532,6 +3755,7 @@ async def generate_scene_visuals(
             cached_generation_state = _copy_state_mapping(state)
             cached_generation_state["pending_scene_description"] = visual_description
             cached_generation_state["pending_scene_base_description"] = base_description
+            cached_generation_state["pending_scene_page_number"] = scene_number
             cached_generation_state["previous_scene_description"] = cached_generation_state.get(
                 "current_scene_description", ""
             )
@@ -3644,9 +3868,15 @@ async def _run_visual_pipeline(
                     base_desc = render_args.base_description or render_args.description
                     simple_desc = re.sub(r"\s+", " ", base_desc).strip()
                     simple_desc = simple_desc[:220] if simple_desc else (base_desc[:220] or base_desc)
-                    prefixed_simple = f"A whimsical children's storybook illustration of: {simple_desc}"
+                    retry_descriptions: list[str] = []
+                    for candidate in (simple_desc, base_desc):
+                        cleaned_candidate = re.sub(r"\s+", " ", str(candidate or "")).strip()
+                        if cleaned_candidate and cleaned_candidate not in retry_descriptions:
+                            retry_descriptions.append(cleaned_candidate)
                     retry_plans = [
-                        (prefixed_simple, render_args.negative_prompt),
+                        (candidate, render_args.negative_prompt)
+                        for candidate in retry_descriptions
+                    ] or [
                         (base_desc, render_args.negative_prompt),
                     ]
                     image_bytes = None
@@ -3854,6 +4084,7 @@ async def _run_visual_pipeline(
                                 # data URL into live session state first.
                                 "persist_asset": False,
                                 "request_id": args.request_id,
+                                "scene_number": args.scene_number,
                             },
                         },
                     )
@@ -3931,6 +4162,7 @@ async def _run_visual_pipeline(
                     thumbnail_mime=thumbnail_mime,
                     focused_character_references=focused_character_references,
                     request_id=args.request_id,
+                    scene_number=args.scene_number,
                     preview_image_url=still_url,
                 )
             elif session_id and (cloud_still_url or gcs_uri):
@@ -3960,6 +4192,7 @@ async def _run_visual_pipeline(
                     thumbnail_mime=None,
                     focused_character_references=focused_character_references,
                     request_id=args.request_id,
+                    scene_number=args.scene_number,
                     preview_image_url=still_url,
                 )
             elif session_id and still_url:
@@ -4020,6 +4253,7 @@ async def _run_visual_pipeline(
                             "media_type": "image",
                             "is_placeholder": True,
                             "request_id": args.request_id,
+                            "scene_number": args.scene_number,
                         },
                     },
                 )
@@ -4061,6 +4295,7 @@ async def _run_visual_pipeline(
                 "is_fallback": True,
                 "persist_asset": False,
                 "request_id": args.request_id,
+                "scene_number": args.scene_number,
             }
             if gcs_uri:
                 payload["gcs_uri"] = gcs_uri
@@ -4243,7 +4478,30 @@ async def save_character_fact(
     if not args.character_name or not args.fact:
         return "System: Character fact was empty."
 
+    if _should_ignore_low_confidence_character_fact(
+        args.character_name,
+        args.fact,
+        tool_context.state,
+    ):
+        logger.info(
+            "Ignoring low-confidence character fact for shared toy continuity: %s -> %s",
+            args.character_name,
+            args.fact,
+        )
+        return "System: Ignored low-confidence character fact."
+
     facts_list = list(tool_context.state.get("character_facts_list", []))
+    normalized_name = args.character_name.casefold()
+    normalized_fact = args.fact.casefold()
+    facts_list = [
+        entry
+        for entry in facts_list
+        if not (
+            isinstance(entry, dict)
+            and str(entry.get("character_name", "")).strip().casefold() == normalized_name
+            and str(entry.get("fact", "")).strip().casefold() == normalized_fact
+        )
+    ]
     facts_list.append({"character_name": args.character_name, "fact": args.fact})
     facts_list = facts_list[-40:]
     tool_context.state["character_facts_list"] = facts_list

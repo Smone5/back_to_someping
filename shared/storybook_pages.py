@@ -194,3 +194,90 @@ def count_rendered_story_pages(data: Mapping[str, Any] | None) -> int:
         1 for value in (data.get("scene_asset_gcs_uris") or []) if _has_real_story_page_asset(value)
     )
     return max(fallback_url_count, fallback_gcs_count)
+
+
+def resolve_story_page_number(
+    data: Mapping[str, Any] | None,
+    *,
+    request_id: str | None = None,
+    replacement_mode: bool = False,
+) -> int:
+    if not isinstance(data, Mapping):
+        return 1
+
+    normalized_request_id = _clean_str(request_id)
+    active_request_id = _clean_str(data.get("active_scene_request_id"))
+    try:
+        pending_scene_page_number = int(data.get("pending_scene_page_number") or 0)
+    except Exception:
+        pending_scene_page_number = 0
+    pages = story_pages_from_state_data(data)
+
+    if normalized_request_id:
+        for page in reversed(pages):
+            if _clean_str(page.get("request_id")) == normalized_request_id:
+                return _clean_int(page.get("scene_number"), 1)
+        if (
+            pending_scene_page_number > 0
+            and active_request_id
+            and normalized_request_id == active_request_id
+        ):
+            return pending_scene_page_number
+
+    highest_scene_number = 0
+    for page in pages:
+        highest_scene_number = max(
+            highest_scene_number,
+            _clean_int(page.get("scene_number"), highest_scene_number or 1),
+        )
+
+    if replacement_mode and pending_scene_page_number > 0:
+        return pending_scene_page_number
+    if replacement_mode:
+        return highest_scene_number or 1
+    if highest_scene_number <= 0:
+        return 1
+    return highest_scene_number + 1
+
+
+def resolve_incoming_story_page_number(
+    data: Mapping[str, Any] | None,
+    *,
+    request_id: str | None = None,
+    proposed_scene_number: int | None = None,
+) -> int:
+    if not isinstance(data, Mapping):
+        return max(_clean_int(proposed_scene_number, 1), 1)
+
+    normalized_request_id = _clean_str(request_id)
+    proposed_number = _clean_int(proposed_scene_number, 0)
+    active_request_id = _clean_str(data.get("active_scene_request_id"))
+    pending_scene_page_number = _clean_int(data.get("pending_scene_page_number"), 0)
+    pages = story_pages_from_state_data(data)
+
+    if normalized_request_id:
+        for page in reversed(pages):
+            if _clean_str(page.get("request_id")) == normalized_request_id:
+                return _clean_int(page.get("scene_number"), 1)
+
+        if active_request_id and normalized_request_id == active_request_id and pending_scene_page_number > 0:
+            return pending_scene_page_number
+
+    highest_scene_number = 0
+    for page in pages:
+        highest_scene_number = max(
+            highest_scene_number,
+            _clean_int(page.get("scene_number"), highest_scene_number or 1),
+        )
+
+    if highest_scene_number <= 0:
+        return proposed_number if proposed_number > 0 else 1
+
+    if normalized_request_id:
+        return highest_scene_number + 1
+
+    if proposed_number <= 0:
+        return highest_scene_number + 1
+    if proposed_number > highest_scene_number + 1:
+        return highest_scene_number + 1
+    return proposed_number

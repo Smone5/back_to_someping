@@ -129,6 +129,29 @@ class StorybookVideoAssemblyWorkflowTests(unittest.TestCase):
         self.assertEqual(decision["status"], "retry_render")
         self.assertTrue(decision["runtime_overrides"]["force_tts"])
 
+    def test_normalized_decision_rejects_hallucinated_manual_review_when_render_is_ready(self) -> None:
+        decision = normalize_video_assembly_decision(
+            {
+                "done": True,
+                "status": "needs_manual_review",
+                "reason": "Maximum render attempts exhausted; assembly consistently failing.",
+                "runtime_overrides": {"force_captions": True},
+            },
+            report={
+                "status": "complete",
+                "ready_to_publish": True,
+                "retryable": False,
+                "reason": "Final storybook movie uploaded.",
+                "issues": [],
+            },
+            attempt=1,
+            max_render_attempts=2,
+        )
+
+        self.assertTrue(decision["done"])
+        self.assertEqual(decision["status"], "approved")
+        self.assertEqual(decision["runtime_overrides"], {})
+
     def test_summary_never_publishes_without_ready_report_and_approved_decision(self) -> None:
         summary = build_storybook_video_assembly_summary(
             {

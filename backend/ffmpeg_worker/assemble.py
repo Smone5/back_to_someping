@@ -125,7 +125,12 @@ DEFAULT_VERTEX_TEXT_MODEL = "gemini-2.5-flash"
 DEFAULT_VERTEX_IMAGE_MODEL = "gemini-2.0-flash-preview-image-generation"
 DEFAULT_ELEVENLABS_VOICE_ID = "JBFqnCBsd6RMkjVDRZzb"
 _ELEVENLABS_TTS_DISABLED_REASON: str | None = None
-_ELEVENLABS_AUDIO_DISABLED_REASON: str | None = None
+_ELEVENLABS_MUSIC_DISABLED_REASON: str | None = None
+_ELEVENLABS_SFX_DISABLED_REASON: str | None = None
+_ELEVENLABS_AUDIO_CONCURRENCY_SEMAPHORE: asyncio.Semaphore | None = None
+_ELEVENLABS_AUDIO_CONCURRENCY_LIMIT: int | None = None
+_ELEVENLABS_VOICE_FALLBACK_OVERRIDES: dict[str, str] = {}
+_LYRIA_MUSIC_DISABLED_REASON: str | None = None
 _VISUAL_GROUNDING_STOPWORDS = {
     "about",
     "after",
@@ -202,6 +207,36 @@ def _storybook_fallback_elevenlabs_voice_id(voice_id: str | None) -> str:
     return ""
 
 
+def _storybook_candidate_elevenlabs_voice_ids(voice_id: str | None) -> list[str]:
+    requested = _normalize_storybook_elevenlabs_voice_id(voice_id)
+    default = _storybook_default_elevenlabs_voice_id()
+    override_key = requested or default
+    resolved = _normalize_storybook_elevenlabs_voice_id(
+        _ELEVENLABS_VOICE_FALLBACK_OVERRIDES.get(override_key)
+    )
+    candidates: list[str] = []
+    for candidate in (resolved, requested, default):
+        if candidate and candidate not in candidates:
+            candidates.append(candidate)
+    return candidates
+
+
+def _remember_storybook_elevenlabs_fallback(
+    requested_voice_id: str | None,
+    resolved_voice_id: str | None,
+) -> None:
+    requested = _normalize_storybook_elevenlabs_voice_id(requested_voice_id) or _storybook_default_elevenlabs_voice_id()
+    resolved = _normalize_storybook_elevenlabs_voice_id(resolved_voice_id)
+    if requested and resolved and requested != resolved:
+        _ELEVENLABS_VOICE_FALLBACK_OVERRIDES[requested] = resolved
+
+
+def _clear_storybook_elevenlabs_fallback(requested_voice_id: str | None) -> None:
+    requested = _normalize_storybook_elevenlabs_voice_id(requested_voice_id) or _storybook_default_elevenlabs_voice_id()
+    if requested:
+        _ELEVENLABS_VOICE_FALLBACK_OVERRIDES.pop(requested, None)
+
+
 def _elevenlabs_voice_not_found_error(payload: Any) -> bool:
     if isinstance(payload, (dict, list)):
         try:
@@ -212,6 +247,36 @@ def _elevenlabs_voice_not_found_error(payload: Any) -> bool:
     return "voice_not_found" in normalized or (
         "voice with voice_id" in normalized and "was not found" in normalized
     )
+
+
+_RETRYABLE_ASSEMBLY_ERROR_PATTERNS: tuple[str, ...] = (
+    "429",
+    "500",
+    "502",
+    "503",
+    "504",
+    "deadline exceeded",
+    "connection aborted",
+    "connection reset",
+    "connection timed out",
+    "econnreset",
+    "gateway timeout",
+    "network error",
+    "rate limit",
+    "resource exhausted",
+    "temporarily unavailable",
+    "timeout",
+    "timed out",
+    "transport error",
+    "try again",
+)
+
+
+def _assembly_error_is_retryable(error_text: Any) -> bool:
+    normalized = " ".join(str(error_text or "").lower().split())
+    if not normalized:
+        return False
+    return any(pattern in normalized for pattern in _RETRYABLE_ASSEMBLY_ERROR_PATTERNS)
 
 
 async def download_blob(session: httpx.AsyncClient, url: str, dest: Path) -> Path:
@@ -370,6 +435,32 @@ def _storybook_sfx_provider() -> str:
     return "auto"
 
 
+def _storybook_lyria_music_enabled() -> bool:
+    return _env_enabled("ENABLE_STORYBOOK_LYRIA_MUSIC", default=False)
+
+
+def _storybook_elevenlabs_audio_concurrency_limit() -> int:
+    return _clamp_int(
+        os.environ.get("STORYBOOK_ELEVENLABS_AUDIO_CONCURRENCY", "2"),
+        2,
+        1,
+        4,
+    )
+
+
+def _elevenlabs_audio_semaphore() -> asyncio.Semaphore:
+    global _ELEVENLABS_AUDIO_CONCURRENCY_SEMAPHORE
+    global _ELEVENLABS_AUDIO_CONCURRENCY_LIMIT
+    limit = _storybook_elevenlabs_audio_concurrency_limit()
+    if (
+        _ELEVENLABS_AUDIO_CONCURRENCY_SEMAPHORE is None
+        or _ELEVENLABS_AUDIO_CONCURRENCY_LIMIT != limit
+    ):
+        _ELEVENLABS_AUDIO_CONCURRENCY_SEMAPHORE = asyncio.Semaphore(limit)
+        _ELEVENLABS_AUDIO_CONCURRENCY_LIMIT = limit
+    return _ELEVENLABS_AUDIO_CONCURRENCY_SEMAPHORE
+
+
 def _normalize_story_tone(raw: Any) -> str:
     text = str(raw or "").strip().lower().replace("-", "_").replace(" ", "_")
     alias_map = {
@@ -422,6 +513,9 @@ def _lyria_generate_music_sync(
     prompt: str,
     seed: int | None = None,
 ) -> tuple[bytes, str] | None:
+    global _LYRIA_MUSIC_DISABLED_REASON
+    if _LYRIA_MUSIC_DISABLED_REASON:
+        return None
     if not PROJECT or not prompt:
         return None
     location = _vertex_ai_location()
@@ -450,6 +544,13 @@ def _lyria_generate_music_sync(
             json=payload,
             timeout=90,
         )
+        if resp.status_code == 404:
+            _LYRIA_MUSIC_DISABLED_REASON = "http_404"
+            logger.warning(
+                "Disabling Lyria music for this run after HTTP 404: %s",
+                (resp.text or "")[:240],
+            )
+            return None
         resp.raise_for_status()
         predictions = list(resp.json().get("predictions", []) or [])
         if not predictions:
@@ -3545,8 +3646,10 @@ def _synthesize_tts_elevenlabs_audio_only(
     if _ELEVENLABS_TTS_DISABLED_REASON:
         return None
     api_key = os.environ.get("ELEVENLABS_API_KEY", "").strip()
-    selected_voice_id = _normalize_storybook_elevenlabs_voice_id(voice_id) or _storybook_default_elevenlabs_voice_id()
-    fallback_voice_id = _storybook_fallback_elevenlabs_voice_id(voice_id)
+    requested_voice_id = _normalize_storybook_elevenlabs_voice_id(voice_id) or _storybook_default_elevenlabs_voice_id()
+    candidate_voice_ids = _storybook_candidate_elevenlabs_voice_ids(voice_id)
+    selected_voice_id = candidate_voice_ids[0] if candidate_voice_ids else ""
+    fallback_voice_id = candidate_voice_ids[1] if len(candidate_voice_ids) > 1 else ""
     if not api_key or not selected_voice_id or not text:
         if api_key and not voice_id:
             logger.warning(
@@ -3568,9 +3671,6 @@ def _synthesize_tts_elevenlabs_audio_only(
             "similarity_boost": 0.75,
         },
     }
-    candidate_voice_ids = [selected_voice_id]
-    if fallback_voice_id:
-        candidate_voice_ids.append(fallback_voice_id)
     try:
         with httpx.Client(timeout=30.0) as client:
             for idx, request_voice_id in enumerate(candidate_voice_ids):
@@ -3581,6 +3681,10 @@ def _synthesize_tts_elevenlabs_audio_only(
                 resp = client.post(endpoint, headers=headers, json=payload)
                 content_type = resp.headers.get("content-type", "")
                 if resp.status_code < 300 and content_type.startswith("audio"):
+                    if request_voice_id == requested_voice_id:
+                        _clear_storybook_elevenlabs_fallback(requested_voice_id)
+                    else:
+                        _remember_storybook_elevenlabs_fallback(requested_voice_id, request_voice_id)
                     return _slow_storybook_tts_audio(
                         resp.content,
                         child_age=child_age,
@@ -3604,6 +3708,7 @@ def _synthesize_tts_elevenlabs_audio_only(
                         request_voice_id,
                         fallback_voice_id,
                     )
+                    _remember_storybook_elevenlabs_fallback(requested_voice_id, fallback_voice_id)
                     continue
                 logger.warning(
                     "ElevenLabs TTS returned no audio (status=%s, content-type=%s) for voice=%s model=%s. Body preview: %s",
@@ -3631,8 +3736,10 @@ def _synthesize_tts_elevenlabs_with_timing(
     if _ELEVENLABS_TTS_DISABLED_REASON:
         return None, None
     api_key = os.environ.get("ELEVENLABS_API_KEY", "").strip()
-    selected_voice_id = _normalize_storybook_elevenlabs_voice_id(voice_id) or _storybook_default_elevenlabs_voice_id()
-    fallback_voice_id = _storybook_fallback_elevenlabs_voice_id(voice_id)
+    requested_voice_id = _normalize_storybook_elevenlabs_voice_id(voice_id) or _storybook_default_elevenlabs_voice_id()
+    candidate_voice_ids = _storybook_candidate_elevenlabs_voice_ids(voice_id)
+    selected_voice_id = candidate_voice_ids[0] if candidate_voice_ids else ""
+    fallback_voice_id = candidate_voice_ids[1] if len(candidate_voice_ids) > 1 else ""
     if not api_key or not selected_voice_id or not text:
         return None, None
     model_id = os.environ.get("ELEVENLABS_TTS_MODEL", "eleven_multilingual_v2").strip()
@@ -3649,9 +3756,6 @@ def _synthesize_tts_elevenlabs_with_timing(
             "similarity_boost": 0.75,
         },
     }
-    candidate_voice_ids = [selected_voice_id]
-    if fallback_voice_id:
-        candidate_voice_ids.append(fallback_voice_id)
     final_voice_id = selected_voice_id
     try:
         with httpx.Client(timeout=30.0) as client:
@@ -3666,6 +3770,10 @@ def _synthesize_tts_elevenlabs_with_timing(
                     body = resp.json()
                     audio_base64 = str(body.get("audio_base64") or body.get("audioBase64") or "").strip()
                     if audio_base64:
+                        if request_voice_id == requested_voice_id:
+                            _clear_storybook_elevenlabs_fallback(requested_voice_id)
+                        else:
+                            _remember_storybook_elevenlabs_fallback(requested_voice_id, request_voice_id)
                         audio_bytes = base64.b64decode(audio_base64)
                         audio_bytes = _slow_storybook_tts_audio(
                             audio_bytes,
@@ -3697,6 +3805,7 @@ def _synthesize_tts_elevenlabs_with_timing(
                         fallback_voice_id,
                     )
                     final_voice_id = fallback_voice_id
+                    _remember_storybook_elevenlabs_fallback(requested_voice_id, fallback_voice_id)
                     continue
                 logger.warning(
                     "ElevenLabs timestamp TTS returned no audio (status=%s, content-type=%s) for voice=%s model=%s. Body preview: %s",
@@ -3850,8 +3959,8 @@ def _synthesize_tts_with_provider(
 
 
 async def _elevenlabs_generate_music(prompt: str, duration_seconds: float) -> bytes | None:
-    global _ELEVENLABS_AUDIO_DISABLED_REASON
-    if _ELEVENLABS_AUDIO_DISABLED_REASON:
+    global _ELEVENLABS_MUSIC_DISABLED_REASON
+    if _ELEVENLABS_MUSIC_DISABLED_REASON:
         return None
     api_key = os.environ.get("ELEVENLABS_API_KEY", "").strip()
     if not api_key or not prompt:
@@ -3878,25 +3987,26 @@ async def _elevenlabs_generate_music(prompt: str, duration_seconds: float) -> by
         "force_instrumental": True,
     }
     try:
-        async with httpx.AsyncClient(timeout=60.0) as client:
-            resp = await client.post(music_endpoint, headers=headers, json=payload)
-            if resp.status_code < 300 and resp.headers.get("content-type", "").startswith("audio"):
-                return resp.content
-            if resp.status_code in {401, 402, 403, 429}:
-                _ELEVENLABS_AUDIO_DISABLED_REASON = f"music_http_{resp.status_code}"
-                logger.warning(
-                    "Disabling ElevenLabs music/SFX for this run after music HTTP %s: %s",
-                    resp.status_code,
-                    (resp.text or "")[:240],
-                )
+        async with _elevenlabs_audio_semaphore():
+            async with httpx.AsyncClient(timeout=60.0) as client:
+                resp = await client.post(music_endpoint, headers=headers, json=payload)
+                if resp.status_code < 300 and resp.headers.get("content-type", "").startswith("audio"):
+                    return resp.content
+                if resp.status_code in {401, 402, 403, 429}:
+                    _ELEVENLABS_MUSIC_DISABLED_REASON = f"music_http_{resp.status_code}"
+                    logger.warning(
+                        "Disabling ElevenLabs music for this run after music HTTP %s: %s",
+                        resp.status_code,
+                        (resp.text or "")[:240],
+                    )
     except Exception:
         return None
     return None
 
 
 async def _elevenlabs_generate_sfx(prompt: str, duration_seconds: float) -> bytes | None:
-    global _ELEVENLABS_AUDIO_DISABLED_REASON
-    if _ELEVENLABS_AUDIO_DISABLED_REASON:
+    global _ELEVENLABS_SFX_DISABLED_REASON
+    if _ELEVENLABS_SFX_DISABLED_REASON:
         return None
     api_key = os.environ.get("ELEVENLABS_API_KEY", "").strip()
     if not api_key or not prompt:
@@ -3916,17 +4026,18 @@ async def _elevenlabs_generate_sfx(prompt: str, duration_seconds: float) -> byte
         "duration_seconds": duration_seconds,
     }
     try:
-        async with httpx.AsyncClient(timeout=60.0) as client:
-            resp = await client.post(sound_endpoint, headers=headers, json=payload)
-            if resp.status_code < 300 and resp.headers.get("content-type", "").startswith("audio"):
-                return resp.content
-            if resp.status_code in {401, 402, 403, 429}:
-                _ELEVENLABS_AUDIO_DISABLED_REASON = f"sfx_http_{resp.status_code}"
-                logger.warning(
-                    "Disabling ElevenLabs music/SFX for this run after HTTP %s: %s",
-                    resp.status_code,
-                    (resp.text or "")[:240],
-                )
+        async with _elevenlabs_audio_semaphore():
+            async with httpx.AsyncClient(timeout=60.0) as client:
+                resp = await client.post(sound_endpoint, headers=headers, json=payload)
+                if resp.status_code < 300 and resp.headers.get("content-type", "").startswith("audio"):
+                    return resp.content
+                if resp.status_code in {401, 402, 403, 429}:
+                    _ELEVENLABS_SFX_DISABLED_REASON = f"sfx_http_{resp.status_code}"
+                    logger.warning(
+                        "Disabling ElevenLabs SFX for this run after HTTP %s: %s",
+                        resp.status_code,
+                        (resp.text or "")[:240],
+                    )
     except Exception:
         return None
     return None
@@ -3942,10 +4053,18 @@ async def _generate_storybook_music_bytes(
     seed: int | None = None,
 ) -> tuple[bytes, str] | None:
     provider = _storybook_music_provider()
-    attempts = ["elevenlabs", "lyria"] if provider == "auto" else [provider]
+    if provider == "auto":
+        attempts = ["elevenlabs"]
+        if _storybook_lyria_music_enabled():
+            attempts.append("lyria")
+    else:
+        attempts = [provider]
     for idx, name in enumerate(attempts):
         if name == "off":
             return None
+        if name == "lyria" and not _storybook_lyria_music_enabled():
+            logger.info("Skipping Lyria music because ENABLE_STORYBOOK_LYRIA_MUSIC is off.")
+            continue
         if name == "lyria":
             result = await _lyria_generate_music(prompt, seed=seed)
         elif name == "elevenlabs":
@@ -4468,12 +4587,10 @@ def _build_video_assembly_render_report(
     issues = _build_video_assembly_issue_entries(data, error_text=error_text)
     issue_codes = {issue["code"] for issue in issues}
     retryable_codes = {
-        "assembly_failed",
         "final_video_missing",
         "narration_missing",
         "audio_stream_missing",
         "narration_incomplete",
-        "release_gate_failed",
     }
     ready_to_publish = bool(
         status == "complete"
@@ -4489,11 +4606,12 @@ def _build_video_assembly_render_report(
             or "Final storybook movie uploaded."
         ).split()
     ).strip()[:320]
+    retryable = bool(issue_codes.intersection(retryable_codes)) or _assembly_error_is_retryable(reason)
     return {
         "session_id": session_id,
         "status": status,
         "ready_to_publish": ready_to_publish,
-        "retryable": bool(issue_codes.intersection(retryable_codes)),
+        "retryable": retryable,
         "reason": reason,
         "issues": issues,
         "runtime_overrides": runtime_overrides,

@@ -10,6 +10,7 @@ if str(_PROJECT_ROOT) not in sys.path:
 
 from shared.story_continuity import (
     ensure_story_continuity_state,
+    prime_character_carryover,
     record_continuity_scene,
     should_render_new_scene_page,
     update_continuity_from_child_utterance,
@@ -642,6 +643,98 @@ class StoryContinuityTests(unittest.TestCase):
         self.assertEqual(world["pending_transition"], "same_room")
         self.assertEqual(world["pending_location_label"], "crystal cave")
         self.assertTrue(world["pending_prop_keys"])
+
+    def test_persistent_shared_toy_companion_is_carried_into_new_scene(self) -> None:
+        state: dict[str, object] = {
+            "toy_reference_name_hint": "Lion-O",
+            "sidekick_description": "Lion-O, the child's toy companion",
+            "character_facts_list": [
+                {
+                    "character_name": "Lion-O",
+                    "fact": "shared toy helper and recurring companion in the story",
+                }
+            ],
+        }
+        ensure_story_continuity_state(state)
+        prime_character_carryover(
+            state,
+            ["Lion-O"],
+            source="test",
+            description="Lion-O, the child's toy companion",
+        )
+        record_continuity_scene(
+            state,
+            description="Outside the dark castle, tall stone towers rise under soft gray daylight.",
+            storybeat_text="The dark castle waits at the end of the path.",
+            scene_number=2,
+        )
+
+        active_labels = [
+            state["continuity_entity_registry"]["characters"][key]["label"]
+            for key in state["continuity_world_state"]["active_character_keys"]
+        ]
+        self.assertIn("Lion-O", active_labels)
+
+    def test_inferred_structural_transition_allows_new_page_without_pending_state(self) -> None:
+        state: dict[str, object] = {}
+        ensure_story_continuity_state(state)
+        record_continuity_scene(
+            state,
+            description="Outside the dark castle, crooked towers rise above the path in soft gray daylight.",
+            storybeat_text="The dark castle waits ahead.",
+            scene_number=1,
+        )
+        state["last_child_utterance"] = "Can we go inside the castle?"
+
+        decision = should_render_new_scene_page(
+            state,
+            "A tall entrance hall inside the dark castle glows with lantern light.",
+            target_location_label="dark castle",
+            render_in_flight=True,
+        )
+
+        self.assertTrue(decision.should_render)
+        self.assertEqual(decision.reason, "structural_transition")
+
+    def test_structural_transition_prompt_preserves_same_castle_daylight(self) -> None:
+        state: dict[str, object] = {
+            "current_scene_visual_summary": (
+                "Outside the dark castle, charcoal stone towers and purple banners sit under soft gray daylight."
+            )
+        }
+        ensure_story_continuity_state(state)
+        record_continuity_scene(
+            state,
+            description="Outside the dark castle, charcoal stone towers and purple banners stand over the gate.",
+            storybeat_text="The dark castle looms quietly under gray daylight.",
+            visual_summary=str(state["current_scene_visual_summary"]),
+            scene_number=1,
+        )
+
+        update_continuity_from_child_utterance(state, "Let's go inside the dark castle.")
+        result = validate_live_scene_request(
+            state,
+            "A bright golden ballroom with sunny windows and pale marble.",
+        )
+
+        self.assertIn("same time of day", result.prompt_suffix.lower())
+        self.assertIn("architecture, materials, palette", result.prompt_suffix)
+        self.assertIn("charcoal stone towers and purple banners", result.prompt_suffix)
+
+    def test_record_scene_strips_leading_of_from_location_label(self) -> None:
+        state: dict[str, object] = {}
+        ensure_story_continuity_state(state)
+
+        record_continuity_scene(
+            state,
+            description="Inside the secret room of the licorice castle, Santa smiles beside wrapped presents.",
+            storybeat_text="Santa waits inside the licorice castle secret room.",
+            scene_number=3,
+        )
+
+        world = state["continuity_world_state"]
+        self.assertEqual(world["current_location_label"], "licorice castle")
+        self.assertIn("Current place: licorice castle", state["continuity_world_state_text"])
 
 
 if __name__ == "__main__":

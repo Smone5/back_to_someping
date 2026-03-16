@@ -54,6 +54,14 @@ class StoryTextTests(unittest.TestCase):
             "Santa Claus relaxes in a cozy secret room by a warm stone fireplace.",
         )
 
+    def test_normalize_storybeat_text_strips_bare_illustration_of_prefix_with_story_payload(self) -> None:
+        self.assertEqual(
+            normalize_storybeat_text(
+                "A whimsical children's storybook illustration of: Candy Land shimmered with playful candy details."
+            ),
+            "Candy Land shimmered with playful candy details.",
+        )
+
     def test_normalize_storybeat_text_strips_you_described_prefix_with_story_payload(self) -> None:
         self.assertEqual(
             normalize_storybeat_text(
@@ -102,6 +110,22 @@ class StoryTextTests(unittest.TestCase):
             "A swirling rainbow path glowing under a big spooky moon, leading towards a playful purple castle.",
         )
 
+    def test_clean_story_text_strips_embedded_prompt_suffixes(self) -> None:
+        self.assertEqual(
+            clean_story_text(
+                "At the top of the staircase, a secret door glows softly. Keep these same characters in view: shared toy companion."
+            ),
+            "At the top of the staircase, a secret door glows softly",
+        )
+
+    def test_clean_story_text_strips_story_continuity_suffixes(self) -> None:
+        self.assertEqual(
+            clean_story_text(
+                "Candy Land shimmered with playful candy details. Story continuity target: keep this page in or directly connected to Candy Land. Transition type: route progress."
+            ),
+            "Candy Land shimmered with playful candy details",
+        )
+
     def test_clean_story_text_strips_box_glyphs_and_variation_selectors(self) -> None:
         self.assertEqual(
             clean_story_text("There are funny ghosts\u25a1 holding lanterns\ufe0f by the chair."),
@@ -129,6 +153,15 @@ class StoryTextTests(unittest.TestCase):
             "Inside the cozy castle, we find soft toys.",
         )
 
+    def test_truncate_story_sentence_drops_dangling_fragment_endings(self) -> None:
+        self.assertEqual(
+            truncate_story_sentence(
+                "Lion-O is very excited to explore the cozy, colorful castle made of candy.",
+                max_words=11,
+            ),
+            "Lion-O is very excited to explore the cozy, colorful castle.",
+        )
+
     def test_story_sentence_quality_prefers_complete_story_line(self) -> None:
         self.assertGreaterEqual(
             story_sentence_quality_score("A rainbow path shines under the spooky moon."),
@@ -144,6 +177,9 @@ class StoryTextTests(unittest.TestCase):
         )
         self.assertTrue(
             story_sentence_needs_revision("inside a cozy, slightly spooky castle hallway with purple stone walls appears.")
+        )
+        self.assertTrue(
+            story_sentence_needs_revision("Lion-O is very excited to explore the cozy, colorful castle made.")
         )
         self.assertFalse(
             story_sentence_needs_revision("A rainbow path shines under the spooky moon.")

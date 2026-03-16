@@ -32,6 +32,8 @@ from .audio import passes_noise_gate, scrub_pii
 from .storybook_flow import derive_story_phase, theater_release_ready
 from shared.story_continuity import (
     ensure_story_continuity_state,
+    _is_explicit_visual_request,
+    _is_navigation_page_turn_request,
     prime_character_carryover,
     record_continuity_scene,
     update_continuity_from_child_utterance,
@@ -42,7 +44,13 @@ from shared.storybook_movie_quality import (
     clamp_child_age,
     normalize_storybook_movie_pacing,
 )
-from shared.storybook_pages import count_rendered_story_pages, story_pages_from_state_data
+from shared.storybook_pages import (
+    count_rendered_story_pages,
+    resolve_incoming_story_page_number,
+    resolve_story_page_number,
+    story_pages_from_state_data,
+)
+from shared.story_text import clean_story_text, normalize_storybeat_text
 from agent.tools import (
     assemble_story_video,
     cache_storybook_state,
@@ -79,6 +87,17 @@ from .schemas import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _normalize_scene_texts(
+    description: Any,
+    storybeat_text: Any = "",
+) -> tuple[str, str]:
+    cleaned_description = clean_story_text(description)
+    cleaned_storybeat = normalize_storybeat_text(storybeat_text or cleaned_description)
+    if not cleaned_description and cleaned_storybeat:
+        cleaned_description = clean_story_text(cleaned_storybeat)
+    return cleaned_description, cleaned_storybeat
 
 _rewind_locks: dict[str, asyncio.Lock] = {}
 _active_websockets: dict[str, WebSocket] = {}
@@ -254,6 +273,7 @@ _SESSION_STATE_DEFAULTS: dict[str, Any] = {
     "pending_scene_replacement_text": "",
     "pending_scene_replacement_phase": "",
     "pending_scene_replacement_armed_at_epoch_ms": 0,
+    "pending_scene_page_number": 0,
     "queued_scene_child_utterance": "",
     "queued_scene_child_utterance_at_epoch_ms": 0,
     "theater_release_ready": False,
@@ -1539,6 +1559,19 @@ async def _trigger_fallback_scene(
     aspect_ratio, image_size, image_model = _resolve_image_prefs_from_state(state)
     delivery_format, delivery_quality, delivery_max_side = _resolve_delivery_preferences(state, image_size)
     request_id = uuid.uuid4().hex
+    replacement_mode = bool(
+        str(state.get("pending_scene_replacement_text", "") or "").strip()
+        and _pending_scene_replacement_phase(state)
+        in {
+            _PENDING_SCENE_REPLACEMENT_PHASE_ACK,
+            _PENDING_SCENE_REPLACEMENT_PHASE_RENDER,
+        }
+    )
+    scene_number = resolve_story_page_number(
+        state,
+        request_id=request_id,
+        replacement_mode=replacement_mode,
+    )
     try:
         args = VisualArgs(
             description=description,
@@ -1551,6 +1584,7 @@ async def _trigger_fallback_scene(
             delivery_quality=delivery_quality,
             delivery_max_side=delivery_max_side,
             request_id=request_id,
+            scene_number=scene_number,
         )
     except Exception:
         return
@@ -1564,6 +1598,7 @@ async def _trigger_fallback_scene(
                 request_id=request_id,
                 description=description,
                 base_description=base_description,
+                scene_number=scene_number,
             ),
         )
     except Exception:
@@ -1582,6 +1617,7 @@ async def _trigger_fallback_scene(
                         "media_type": "image",
                         "is_placeholder": True,
                         "request_id": request_id,
+                        "scene_number": scene_number,
                     },
                 })
             )
@@ -1853,7 +1889,7 @@ def _clean_shared_toy_name_hint(candidate: Any) -> str:
     return cleaned
 
 
-def _extract_shared_toy_name_hint(text: Any) -> str:
+def _extract_shared_toy_name_hint(text: Any, *, allow_fallback: bool = True) -> str:
     compact = re.sub(r"\s+", " ", str(text or "")).strip()
     if not compact:
         return ""
@@ -1864,6 +1900,9 @@ def _extract_shared_toy_name_hint(text: Any) -> str:
             name_hint = _clean_shared_toy_name_hint(match.group(1))
             if name_hint:
                 return name_hint
+
+    if not allow_fallback:
+        return ""
 
     fallback = _clean_shared_toy_name_hint(compact)
     if fallback and 1 <= len(fallback.split()) <= 3:
@@ -1895,10 +1934,6 @@ def _promote_voice_toy_companion_from_utterance(
     companion_signal = bool(_VOICE_TOY_BRING_ALONG_RE.search(cleaned))
     existing_name_hint = _clean_shared_toy_name_hint(state.get("toy_reference_name_hint", ""))
     existing_sidekick_description = str(state.get("sidekick_description", "") or "").strip()
-    extracted_name_hint = _extract_shared_toy_name_hint(cleaned)
-    toy_name_hint = _clean_shared_toy_name_hint(extracted_name_hint or existing_name_hint)
-    if not toy_signal and not companion_signal and not toy_name_hint:
-        return
     existing_toy_context = bool(
         existing_name_hint
         or str(state.get("toy_reference_visual_summary", "") or "").strip()
@@ -1914,7 +1949,16 @@ def _promote_voice_toy_companion_from_utterance(
             )
         )
     )
-    if not toy_signal and not companion_signal and not (existing_toy_context and extracted_name_hint):
+    explicit_name_hint = _extract_shared_toy_name_hint(cleaned, allow_fallback=False)
+    extracted_name_hint = (
+        explicit_name_hint
+        if existing_toy_context else
+        _extract_shared_toy_name_hint(cleaned)
+    )
+    toy_name_hint = _clean_shared_toy_name_hint(extracted_name_hint or existing_name_hint)
+    if not toy_signal and not companion_signal and not toy_name_hint:
+        return
+    if not toy_signal and not companion_signal and not (existing_toy_context and explicit_name_hint):
         return
 
     if toy_name_hint and not existing_name_hint:
@@ -1944,6 +1988,7 @@ def _promote_voice_toy_companion_from_utterance(
             character_name=toy_name_hint,
             fact="shared toy helper and recurring companion in the story",
         )
+    _stabilize_shared_toy_identity(state)
     prime_character_carryover(
         state,
         [continuity_label],
@@ -2717,8 +2762,11 @@ def _scene_branch_state_snapshot(state: dict[str, Any]) -> dict[str, Any]:
 
 
 def _scene_branch_label(point: dict[str, Any]) -> str:
-    for key in ("storybeat_text", "scene_description"):
-        value = str(point.get(key, "") or "").strip()
+    description, storybeat_text = _normalize_scene_texts(
+        point.get("scene_description", ""),
+        point.get("storybeat_text", ""),
+    )
+    for value in (storybeat_text, description):
         if value:
             return value[:140]
     scene_number = int(point.get("scene_number", 0) or 0)
@@ -2739,18 +2787,71 @@ def _scene_branch_public_payload(
     payload: list[dict[str, Any]] = []
     for point in points:
         scene_number = int(point.get("scene_number", 0) or 0)
+        scene_description, storybeat_text = _normalize_scene_texts(
+            point.get("scene_description", ""),
+            point.get("storybeat_text", ""),
+        )
         payload.append(
             {
                 "scene_number": scene_number,
                 "label": _scene_branch_label(point),
-                "scene_description": str(point.get("scene_description", "") or "").strip(),
-                "storybeat_text": str(point.get("storybeat_text", "") or "").strip(),
+                "scene_description": scene_description,
+                "storybeat_text": storybeat_text,
                 "image_url": str(point.get("image_url", "") or "").strip() or None,
                 "is_current": scene_number == current_scene_number,
                 "is_selected": scene_number == int(selected_scene_number or 0),
             }
         )
     return payload
+
+
+def _current_scene_page_number(
+    state: dict[str, Any],
+    *,
+    request_id: str | None = None,
+) -> int | None:
+    normalized_request_id = str(request_id or "").strip()
+    pages = _story_pages_payload(state)
+    points = _scene_branch_points(state)
+
+    if normalized_request_id:
+        for page in reversed(pages):
+            if str(page.get("request_id", "") or "").strip() == normalized_request_id:
+                return max(1, int(page.get("scene_number", 0) or 1))
+        for point in reversed(points):
+            if str(point.get("request_id", "") or "").strip() == normalized_request_id:
+                return max(1, int(point.get("scene_number", 0) or 1))
+
+        active_request_id = str(state.get("active_scene_request_id", "") or "").strip()
+        if normalized_request_id == active_request_id:
+            try:
+                pending_scene_page_number = int(state.get("pending_scene_page_number", 0) or 0)
+            except Exception:
+                pending_scene_page_number = 0
+            if pending_scene_page_number > 0:
+                return pending_scene_page_number
+            highest_scene_number = 0
+            for page in pages:
+                highest_scene_number = max(highest_scene_number, int(page.get("scene_number", 0) or 0))
+            for point in points:
+                highest_scene_number = max(highest_scene_number, int(point.get("scene_number", 0) or 0))
+            replacement_phase = _pending_scene_replacement_phase(state)
+            if replacement_phase in {
+                _PENDING_SCENE_REPLACEMENT_PHASE_ACK,
+                _PENDING_SCENE_REPLACEMENT_PHASE_RENDER,
+            }:
+                return max(highest_scene_number, 1) if highest_scene_number else 1
+            if (
+                str(state.get("pending_scene_description", "") or "").strip()
+                or str(state.get("pending_scene_base_description", "") or "").strip()
+            ):
+                return max(highest_scene_number + 1, 1)
+
+    if pages:
+        return max(1, int(pages[-1].get("scene_number", len(pages)) or len(pages) or 1))
+    if points:
+        return max(1, int(points[-1].get("scene_number", len(points)) or len(points) or 1))
+    return None
 
 
 def _story_pages_payload(state: dict[str, Any]) -> list[dict[str, Any]]:
@@ -2764,16 +2865,21 @@ def _story_pages_payload(state: dict[str, Any]) -> list[dict[str, Any]]:
 
 def _storybook_scene_state_payload(state: dict[str, Any]) -> dict[str, Any]:
     public_points = _scene_branch_public_payload(state)
+    current_scene_description, current_scene_storybeat_text = _normalize_scene_texts(
+        state.get("current_scene_description", ""),
+        state.get("current_scene_storybeat_text", ""),
+    )
     return {
         "story_pages": _story_pages_payload(state),
         "scene_branch_points": public_points,
         "scene_branch_points_public": public_points,
+        "current_scene_page_number": _current_scene_page_number(state),
         "scene_asset_urls": list(state.get("scene_asset_urls", []) or []),
         "scene_asset_gcs_uris": list(state.get("scene_asset_gcs_uris", []) or []),
         "scene_descriptions": list(state.get("scene_descriptions", []) or []),
         "scene_storybeat_texts": list(state.get("scene_storybeat_texts", []) or []),
-        "current_scene_description": str(state.get("current_scene_description", "") or "").strip(),
-        "current_scene_storybeat_text": str(state.get("current_scene_storybeat_text", "") or "").strip(),
+        "current_scene_description": current_scene_description,
+        "current_scene_storybeat_text": current_scene_storybeat_text,
         "story_summary": str(state.get("story_summary", "") or "").strip(),
         "story_phase": str(state.get("story_phase", "") or "").strip(),
     }
@@ -2782,6 +2888,7 @@ def _storybook_scene_state_payload(state: dict[str, Any]) -> dict[str, Any]:
 def _clear_pending_scene_request_metadata(state: dict[str, Any]) -> None:
     state["pending_scene_description"] = ""
     state["pending_scene_base_description"] = ""
+    state["pending_scene_page_number"] = 0
     state["pending_scene_replacement_text"] = ""
     state["pending_scene_replacement_phase"] = ""
     state["pending_scene_replacement_armed_at_epoch_ms"] = 0
@@ -2794,15 +2901,22 @@ def _prime_pending_scene_request(
     request_id: str | None,
     description: str = "",
     base_description: str = "",
+    scene_number: int | None = None,
 ) -> None:
     normalized_request_id = str(request_id or "").strip()
-    normalized_description = str(description or "").strip()
-    normalized_base_description = str(base_description or "").strip()
+    normalized_description, _ = _normalize_scene_texts(description, "")
+    normalized_base_description = clean_story_text(base_description or normalized_description)
     if normalized_request_id:
         state["active_scene_request_id"] = normalized_request_id
     if normalized_description:
         state["pending_scene_description"] = normalized_description
         state["pending_scene_base_description"] = normalized_base_description or normalized_description
+    try:
+        normalized_scene_number = int(scene_number or 0)
+    except Exception:
+        normalized_scene_number = 0
+    if normalized_scene_number > 0:
+        state["pending_scene_page_number"] = normalized_scene_number
     state["pending_scene_replacement_text"] = ""
     state["pending_scene_replacement_phase"] = ""
     state["pending_scene_replacement_armed_at_epoch_ms"] = 0
@@ -2831,6 +2945,7 @@ def _promote_pending_scene_request_to_current(
 ) -> bool:
     if not _scene_request_matches_active_request(state, request_id=request_id):
         return False
+    description, storybeat_text = _normalize_scene_texts(description, storybeat_text)
 
     if description:
         state["current_scene_description"] = description
@@ -2856,6 +2971,7 @@ def _apply_nonpersistent_scene_ready_to_state(
     state: dict[str, Any],
     *,
     request_id: str | None,
+    scene_number: int | None,
     looks_like_image: bool,
     is_fallback: bool,
     description: str = "",
@@ -2891,6 +3007,7 @@ def _apply_nonpersistent_scene_ready_to_state(
             _apply_scene_asset_to_story_state(
                 state,
                 request_id=request_id,
+                scene_number=scene_number,
                 image_url="",
                 description=description,
                 storybeat_text=storybeat_text,
@@ -2905,13 +3022,19 @@ def _apply_scene_asset_to_story_state(
     state: dict[str, Any],
     *,
     request_id: str | None,
+    scene_number: int | None = None,
     image_url: str,
     description: str = "",
     storybeat_text: str = "",
     gcs_uri: str = "",
 ) -> None:
     ensure_story_continuity_state(state)
+    description, storybeat_text = _normalize_scene_texts(description, storybeat_text)
     normalized_request_id = str(request_id or "").strip()
+    try:
+        normalized_scene_number = int(scene_number or 0)
+    except Exception:
+        normalized_scene_number = 0
     pages = _story_pages_payload(state)
     target_index = -1
     if normalized_request_id:
@@ -2923,7 +3046,7 @@ def _apply_scene_asset_to_story_state(
         target_index = len(pages)
         pages.append(
             {
-                "scene_number": len(pages) + 1,
+                "scene_number": normalized_scene_number or (len(pages) + 1),
                 "request_id": normalized_request_id,
                 "scene_description": "",
                 "storybeat_text": "",
@@ -2937,7 +3060,7 @@ def _apply_scene_asset_to_story_state(
         target_index = 0
         pages.append(
             {
-                "scene_number": 1,
+                "scene_number": normalized_scene_number or 1,
                 "request_id": normalized_request_id,
                 "scene_description": "",
                 "storybeat_text": "",
@@ -2947,7 +3070,11 @@ def _apply_scene_asset_to_story_state(
         )
 
     target_page = dict(pages[target_index])
-    target_page["scene_number"] = max(1, int(target_page.get("scene_number", target_index + 1) or (target_index + 1)))
+    resolved_scene_number = normalized_scene_number or max(
+        1,
+        int(target_page.get("scene_number", target_index + 1) or (target_index + 1)),
+    )
+    target_page["scene_number"] = resolved_scene_number
     if normalized_request_id:
         target_page["request_id"] = normalized_request_id
     if description:
@@ -2969,12 +3096,11 @@ def _apply_scene_asset_to_story_state(
                 branch_target_index = idx
                 break
     if branch_target_index < 0 and normalized_request_id:
-        scene_number = max(1, int(target_page.get("scene_number", target_index + 1) or (target_index + 1)))
         points.append(
             {
-                "scene_number": scene_number,
+                "scene_number": resolved_scene_number,
                 "request_id": normalized_request_id,
-                "label": storybeat_text or description or f"Scene {scene_number}",
+                "label": storybeat_text or description or f"Scene {resolved_scene_number}",
                 "scene_description": description,
                 "storybeat_text": storybeat_text,
                 "image_url": image_url,
@@ -2986,6 +3112,7 @@ def _apply_scene_asset_to_story_state(
         branch_target_index = min(target_index, len(points) - 1)
     if branch_target_index >= 0:
         branch_point = dict(points[branch_target_index])
+        branch_point["scene_number"] = resolved_scene_number
         if normalized_request_id:
             branch_point["request_id"] = normalized_request_id
         if description:
@@ -3043,7 +3170,7 @@ def _apply_scene_asset_to_story_state(
         description=description,
         storybeat_text=storybeat_text,
         request_id=normalized_request_id,
-        scene_number=max(1, int(target_page.get("scene_number", target_index + 1) or (target_index + 1))),
+        scene_number=resolved_scene_number,
     )
 
 
@@ -3642,6 +3769,7 @@ def _record_scene_branch_point(
         or ""
     ).strip()
     storybeat_text = str(snapshot_state.get("current_scene_storybeat_text", "") or "").strip()
+    scene_description, storybeat_text = _normalize_scene_texts(scene_description, storybeat_text)
     image_url = str((matching_page or {}).get("image_url", "") or "").strip()
     gcs_uri = str((matching_page or {}).get("gcs_uri", "") or "").strip()
     point = {
@@ -3683,8 +3811,10 @@ def _sync_latest_scene_branch_point_from_state(state: dict[str, Any]) -> None:
                 matching_page = dict(page)
                 break
     latest = dict(points[target_index])
-    scene_description = str(state.get("current_scene_description", "") or "").strip()
-    storybeat_text = str(state.get("current_scene_storybeat_text", "") or "").strip()
+    scene_description, storybeat_text = _normalize_scene_texts(
+        state.get("current_scene_description", ""),
+        state.get("current_scene_storybeat_text", ""),
+    )
     image_url = str((matching_page or {}).get("image_url", "") or "").strip()
     gcs_uri = str((matching_page or {}).get("gcs_uri", "") or "").strip()
     if scene_description:
@@ -3705,8 +3835,16 @@ def _sync_latest_scene_branch_point_from_state(state: dict[str, Any]) -> None:
 
 def _restore_branch_scene_lists(state: dict[str, Any], points: list[dict[str, Any]]) -> None:
     scene_urls = [str(point.get("image_url", "") or "").strip() for point in points if str(point.get("image_url", "") or "").strip()]
-    scene_descriptions = [str(point.get("scene_description", "") or "").strip() for point in points if str(point.get("scene_description", "") or "").strip()]
-    storybeats = [str(point.get("storybeat_text", "") or "").strip() for point in points if str(point.get("storybeat_text", "") or "").strip()]
+    scene_descriptions = [
+        _normalize_scene_texts(point.get("scene_description", ""), point.get("storybeat_text", ""))[0]
+        for point in points
+        if _normalize_scene_texts(point.get("scene_description", ""), point.get("storybeat_text", ""))[0]
+    ]
+    storybeats = [
+        _normalize_scene_texts(point.get("scene_description", ""), point.get("storybeat_text", ""))[1]
+        for point in points
+        if _normalize_scene_texts(point.get("scene_description", ""), point.get("storybeat_text", ""))[1]
+    ]
     state["scene_asset_urls"] = scene_urls[-40:]
     state["scene_descriptions"] = scene_descriptions[-40:]
     state["scene_storybeat_texts"] = storybeats[-40:]
@@ -3876,6 +4014,7 @@ async def _branch_story_to_scene(
                         "url": target_image_url,
                         "media_type": "image",
                         "storybeat_text": target_storybeat_text,
+                        "scene_number": scene_number,
                         "scene_history": _scene_branch_public_payload(storage_session.state, selected_scene_number=scene_number),
                     },
                 }
@@ -3888,6 +4027,7 @@ async def _branch_story_to_scene(
             payload={
                 "scene_number": scene_number,
                 "scene_history": _scene_branch_public_payload(storage_session.state, selected_scene_number=scene_number),
+                "current_scene_page_number": scene_number,
                 "current_scene_image_url": target_image_url or None,
                 "current_scene_storybeat_text": target_storybeat_text,
                 "current_scene_description": target_scene_description,
@@ -3968,6 +4108,91 @@ def _upsert_character_fact(state: dict[str, Any], *, character_name: str, fact: 
     )
 
 
+def _stabilize_shared_toy_identity(state: dict[str, Any]) -> None:
+    preferred_name = _clean_shared_toy_name_hint(state.get("toy_reference_name_hint", ""))
+    toy_summary = str(state.get("toy_reference_visual_summary", "") or "").strip()
+    sidekick_description = str(state.get("sidekick_description", "") or "").strip()
+    toy_context = bool(
+        preferred_name
+        or toy_summary
+        or str(state.get("toy_reference_thumbnail_b64", "") or "").strip()
+        or bool(state.get("camera_received", False))
+        or (
+            sidekick_description
+            and any(
+                token in sidekick_description.lower()
+                for token in ("toy companion", "shared toy", "sidekick", "plush", "stuffed animal", "stuffie")
+            )
+        )
+    )
+    if not toy_context:
+        return
+
+    allowed_names = {_SHARED_TOY_COMPANION_NAME.lower()}
+    if preferred_name:
+        allowed_names.add(preferred_name.lower())
+
+    facts = list(state.get("character_facts_list", []) or [])
+    cleaned_facts: list[dict[str, str]] = []
+    removed_toy_aliases: set[str] = set()
+    seen: set[tuple[str, str]] = set()
+    for entry in facts:
+        if not isinstance(entry, dict):
+            continue
+        name = str(entry.get("character_name", "") or "").strip()
+        fact = str(entry.get("fact", "") or "").strip()
+        if not name or not fact:
+            continue
+        lowered_name = name.lower()
+        lowered_fact = fact.lower()
+        is_toy_fact = "shared toy" in lowered_fact or "toy companion" in lowered_fact
+        if is_toy_fact and preferred_name and lowered_name not in allowed_names:
+            removed_toy_aliases.add(lowered_name)
+            continue
+        if is_toy_fact and not preferred_name and lowered_name != _SHARED_TOY_COMPANION_NAME.lower():
+            removed_toy_aliases.add(lowered_name)
+            continue
+        dedupe_key = (lowered_name, lowered_fact)
+        if dedupe_key in seen:
+            continue
+        seen.add(dedupe_key)
+        cleaned_facts.append({"character_name": name, "fact": fact})
+
+    state["character_facts_list"] = cleaned_facts[-40:]
+    state["character_facts"] = "\n".join(
+        f"- {str(entry.get('character_name', '')).strip()}: {str(entry.get('fact', '')).strip()}"
+        for entry in cleaned_facts
+        if isinstance(entry, dict)
+        and str(entry.get("character_name", "")).strip()
+        and str(entry.get("fact", "")).strip()
+    )
+
+    if removed_toy_aliases:
+        world = state.get("continuity_world_state", {})
+        registry = state.get("continuity_entity_registry", {})
+        character_registry = registry.get("characters", {}) if isinstance(registry, Mapping) else {}
+        if isinstance(world, dict) and isinstance(character_registry, Mapping):
+            for field in ("active_character_keys", "pending_character_keys"):
+                keys = [
+                    str(item).strip()
+                    for item in list(world.get(field, []) or [])
+                    if str(item).strip()
+                ]
+                world[field] = [
+                    key
+                    for key in keys
+                    if _clean_text(character_registry.get(key, {}).get("label", "")).lower() not in removed_toy_aliases
+                ]
+
+        raw_bible = state.get("character_bible", {})
+        if isinstance(raw_bible, dict):
+            state["character_bible"] = {
+                key: value
+                for key, value in raw_bible.items()
+                if _clean_text((value or {}).get("label", "")).lower() not in removed_toy_aliases
+            }
+
+
 def _apply_shared_toy_story_state(
     state: dict[str, Any],
     *,
@@ -4002,6 +4227,7 @@ def _apply_shared_toy_story_state(
             character_name=normalized_name_hint,
             fact=f"shared toy helper; {normalized_summary}",
         )
+    _stabilize_shared_toy_identity(state)
     continuity_label = normalized_name_hint or _SHARED_TOY_COMPANION_NAME
     prime_character_carryover(
         state,
@@ -4515,6 +4741,7 @@ async def handle_storyteller_ws(websocket: WebSocket, runner: Runner) -> None:
                 "current_scene_image_url": rehydrated_scene_urls[-1] if rehydrated_scene_urls else None,
                 "current_scene_description": rehydrated_state_snapshot.get("current_scene_description", ""),
                 "current_scene_storybeat_text": rehydrated_state_snapshot.get("current_scene_storybeat_text", ""),
+                "current_scene_page_number": _current_scene_page_number(rehydrated_state_snapshot),
                 "scene_history": _scene_branch_public_payload(rehydrated_state_snapshot),
                 "story_started": bool(session.state.get("story_started", False)),
                 "story_phase": rehydrated_story_phase,
@@ -7917,12 +8144,10 @@ async def _handle_tool_response(
             name, fact = payload.split("|", 1)
 
             def _save_fact(state: dict[str, Any]) -> None:
-                facts = list(state.get("character_facts_list", []))
-                facts.append({"character_name": name, "fact": fact})
-                facts = facts[-40:]
-                state["character_facts_list"] = facts
-                state["character_facts"] = "\n".join(
-                    f"- {entry['character_name']}: {entry['fact']}" for entry in facts
+                _upsert_character_fact(
+                    state,
+                    character_name=name,
+                    fact=fact,
                 )
 
             await _mutate_state(runner, user_id, session_id, _save_fact)
@@ -8728,6 +8953,7 @@ async def _forward_session_events(
                     is_fallback = bool(payload.get("is_fallback"))
                     persist_asset = payload.get("persist_asset", True) is not False
                     request_id = str(payload.get("request_id", "") or "").strip()
+                    payload_scene_number = int(payload.get("scene_number", 0) or 0)
                     if not persist_asset:
                         storage_session = _get_storage_session(runner, user_id, session_id)
                         storage_state = storage_session.state if storage_session is not None else {}
@@ -8758,12 +8984,20 @@ async def _forward_session_events(
                         if not isinstance(urls, list):
                             urls = []
                         if looks_like_image:
-                            description = str(payload.get("description", "")).strip()
+                            description, storybeat_text = _normalize_scene_texts(
+                                payload.get("description", ""),
+                                payload.get("storybeat_text", ""),
+                            )
                             gcs_uri = str(payload.get("gcs_uri", "") or "").strip()
-                            storybeat_text = str(payload.get("storybeat_text", "") or "").strip()
+                            scene_number = resolve_incoming_story_page_number(
+                                state,
+                                request_id=request_id,
+                                proposed_scene_number=payload_scene_number or None,
+                            )
                             _apply_scene_asset_to_story_state(
                                 state,
                                 request_id=request_id,
+                                scene_number=scene_number or None,
                                 image_url=url,
                                 description=description,
                                 storybeat_text=storybeat_text,
@@ -8821,6 +9055,28 @@ async def _forward_session_events(
                             )
                     elif is_placeholder:
                         def _mark_scene_render_pending(state: dict[str, Any]) -> None:
+                            if looks_like_image and _should_ignore_nonpersistent_scene_ready(
+                                state,
+                                request_id=request_id,
+                            ):
+                                return
+                            if looks_like_image:
+                                description, _storybeat_text = _normalize_scene_texts(
+                                    payload.get("description", ""),
+                                    payload.get("storybeat_text", ""),
+                                )
+                                scene_number = resolve_incoming_story_page_number(
+                                    state,
+                                    request_id=request_id,
+                                    proposed_scene_number=payload_scene_number or None,
+                                )
+                                _prime_pending_scene_request(
+                                    state,
+                                    request_id=request_id,
+                                    description=description,
+                                    base_description=description,
+                                    scene_number=scene_number or None,
+                                )
                             state["scene_render_pending"] = True
                             _sync_story_phase(session_id, state)
 
@@ -8832,13 +9088,23 @@ async def _forward_session_events(
                         )
                     else:
                         def _clear_scene_render_pending(state: dict[str, Any]) -> None:
+                            description, storybeat_text = _normalize_scene_texts(
+                                payload.get("description", ""),
+                                payload.get("storybeat_text", ""),
+                            )
+                            scene_number = resolve_incoming_story_page_number(
+                                state,
+                                request_id=request_id,
+                                proposed_scene_number=payload_scene_number or None,
+                            )
                             _apply_nonpersistent_scene_ready_to_state(
                                 state,
                                 request_id=request_id,
+                                scene_number=scene_number or None,
                                 looks_like_image=looks_like_image,
                                 is_fallback=is_fallback,
-                                description=str(payload.get("description", "") or "").strip(),
-                                storybeat_text=str(payload.get("storybeat_text", "") or "").strip(),
+                                description=description,
+                                storybeat_text=storybeat_text,
                             )
                             _sync_story_phase(session_id, state)
 
@@ -8849,6 +9115,13 @@ async def _forward_session_events(
                             _clear_scene_render_pending,
                         )
                     outbound_payload = dict(payload)
+                    if looks_like_image:
+                        outbound_description, outbound_storybeat_text = _normalize_scene_texts(
+                            payload.get("description", ""),
+                            payload.get("storybeat_text", ""),
+                        )
+                        outbound_payload["description"] = outbound_description
+                        outbound_payload["storybeat_text"] = outbound_storybeat_text
                     if url.startswith("data:image"):
                         outbound_payload.pop("thumbnail_b64", None)
                         outbound_payload.pop("thumbnail_mime", None)
@@ -8857,6 +9130,18 @@ async def _forward_session_events(
                     storage_session = _get_storage_session(runner, user_id, session_id)
                     if storage_session is not None:
                         outbound_payload["scene_history"] = _scene_branch_public_payload(storage_session.state)
+                        outbound_scene_number = resolve_incoming_story_page_number(
+                            storage_session.state,
+                            request_id=request_id,
+                            proposed_scene_number=int(outbound_payload.get("scene_number", 0) or 0) or None,
+                        )
+                        if outbound_scene_number <= 0:
+                            outbound_scene_number = _current_scene_page_number(
+                                storage_session.state,
+                                request_id=request_id,
+                            ) or 0
+                        if outbound_scene_number > 0:
+                            outbound_payload["scene_number"] = outbound_scene_number
                     logger.debug("Sending video_ready event to websocket loop for session %s. Media type: %s", session_id, media_type)
                     await websocket.send_text(
                         json.dumps({"type": "video_ready", "payload": outbound_payload})
